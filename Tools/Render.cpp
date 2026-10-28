@@ -81,30 +81,51 @@ int main (int argc, char** argv)
         renderTo (p, dir.getChildFile ("01-default.wav"), 16.0, { { 45, 0.0, 15.0 } });
     }
 
-    // 2. Mono, deux séquenceurs (coupure + FM, et hauteur), RANDOM
+    // 2. Mono, RANDOM ALL, sur la hauteur + la coupure (séquence hi-tech type)
     {
         SequencesAudioProcessor p;
         p.setRandomSeed (2026);
         set (p, "voiceMode", 0.0f);
-        set (p, "drive", 35.0f);
-        p.randomizeSequence (0);
-        set (p, "seqBOn", 1.0f);
-        set (p, "seqBRate", 4.0f);
-        set (p, "seqBSteps", 7.0f);
-        set (p, "seqBDest1", (float) seqs::Dest::pitch);
-        set (p, "seqBAmt1", 50.0f);
-        p.randomizeSequence (1);
-        renderTo (p, dir.getChildFile ("02-mono-random.wav"), 16.0, { { 45, 0.0, 8.0 }, { 47, 7.9, 8.0 } });
+        set (p, "drive", 30.0f);
+        set (p, "seqDiv", 4.0f);        // 1/16
+        p.randomizeAll();
+        set (p, "mod3Src", 0.0f);
+        set (p, "mod3Dest", (float) seqs::Dest::pitch);
+        set (p, "mod3Amt", 25.0f);
+        renderTo (p, dir.getChildFile ("02-mono-random-all.wav"), 16.0, { { 45, 0.0, 8.0 }, { 47, 7.9, 8.0 } });
     }
 
-    // 3. Accord en polyphonique, gate sur l'ampli, lissé
+    // 3. Banque d'usine sur la hauteur seule : on entend chaque LFO tour à tour
     {
         SequencesAudioProcessor p;
-        set (p, "seqADest3", (float) seqs::Dest::amp);
-        set (p, "seqAAmt3", 100.0f);
-        set (p, "seqASmooth", 30.0f);
+        set (p, "mod1Dest", 0.0f);
+        set (p, "mod2Dest", 0.0f);
+        set (p, "mod3Dest", (float) seqs::Dest::pitch);
+        set (p, "mod3Amt", 30.0f);
+        set (p, "cutoff", 4000.0f);
+        set (p, "ampSustain", 100.0f);
+        renderTo (p, dir.getChildFile ("03-pitch-bank.wav"), 16.0, { { 45, 0.0, 15.0 } });
+    }
+
+    // 4. Hard sync piloté par le séquenceur
+    {
+        SequencesAudioProcessor p;
+        set (p, "fmLevel", 0.0f);
+        set (p, "oscLevel", 100.0f);
+        set (p, "mod2Dest", (float) seqs::Dest::sync);
+        set (p, "mod2Amt", 70.0f);
+        set (p, "cutoff", 3000.0f);
+        renderTo (p, dir.getChildFile ("04-sync.wav"), 16.0, { { 40, 0.0, 15.0 } });
+    }
+
+    // 5. Accord en polyphonique, gate sur l'ampli
+    {
+        SequencesAudioProcessor p;
+        set (p, "mod3Dest", (float) seqs::Dest::amp);
+        set (p, "mod3Amt", 100.0f);
         set (p, "ampRelease", 400.0f);
-        renderTo (p, dir.getChildFile ("03-poly-gate.wav"), 16.0, { { 57, 0.0, 14.0 }, { 60, 0.0, 14.0 }, { 64, 0.0, 14.0 } });
+        set (p, "modWave", 7.0f);       // RESO 2
+        renderTo (p, dir.getChildFile ("05-poly-gate-reso.wav"), 16.0, { { 57, 0.0, 14.0 }, { 60, 0.0, 14.0 }, { 64, 0.0, 14.0 } });
     }
 
     // Capture de l'interface

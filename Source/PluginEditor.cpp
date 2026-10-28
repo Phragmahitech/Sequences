@@ -151,210 +151,256 @@ void ui::LookAndFeel::positionComboBoxText (juce::ComboBox& box, juce::Label& la
 }
 
 //==============================================================================
-ui::StepGrid::StepGrid (SequencesAudioProcessor& p, int seqIndex) : processor (p), seq (seqIndex)
+ui::StepMatrix::StepMatrix (SequencesAudioProcessor& p) : processor (p)
 {
     for (int i = 0; i < SequencesAudioProcessor::numSteps; ++i)
-    {
-        valueParams[(size_t) i] = processor.apvts.getParameter (SequencesAudioProcessor::stepId (seq, i));
-        glideParams[(size_t) i] = processor.apvts.getParameter (SequencesAudioProcessor::glideId (seq, i));
-    }
-    stepsParam = processor.apvts.getParameter (SequencesAudioProcessor::seqId (seq, "Steps"));
-    setTitle (seq == 0 ? "Sequencer A steps" : "Sequencer B steps");
-    setMouseCursor (juce::MouseCursor::CrosshairCursor);
+        stepParams[(size_t) i] = processor.apvts.getParameter (SequencesAudioProcessor::stepId (i));
+    stepsParam = processor.apvts.getParameter ("seqSteps");
+    setTitle ("Sequencer steps");
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);
 }
 
-juce::Rectangle<float> ui::StepGrid::barsArea() const
+juce::Rectangle<float> ui::StepMatrix::gridArea() const
 {
-    return getLocalBounds().toFloat().withTrimmedBottom ((float) glideRowHeight + 6.0f);
+    return getLocalBounds().toFloat().withTrimmedLeft ((float) labelWidth);
 }
 
-juce::Rectangle<float> ui::StepGrid::glideArea() const
+int ui::StepMatrix::columnAt (float x) const
 {
-    return getLocalBounds().toFloat().removeFromBottom ((float) glideRowHeight);
+    const auto grid = gridArea();
+    const float w = grid.getWidth() / (float) SequencesAudioProcessor::numSteps;
+    return juce::jlimit (0, SequencesAudioProcessor::numSteps - 1, (int) std::floor ((x - grid.getX()) / w));
 }
 
-int ui::StepGrid::stepAtX (float x) const
+int ui::StepMatrix::rowAt (float y) const
 {
-    const float w = (float) getWidth() / (float) SequencesAudioProcessor::numSteps;
-    return juce::jlimit (0, SequencesAudioProcessor::numSteps - 1, (int) std::floor (x / w));
+    const float h = (float) getHeight() / (float) numRows;
+    return juce::jlimit (0, numRows - 1, (int) std::floor (y / h));
 }
 
-float ui::StepGrid::valueAtY (float y) const
+void ui::StepMatrix::setStep (int step, int source)
 {
-    const auto bars = barsArea();
-    return juce::jlimit (0.0f, 1.0f, 1.0f - (y - bars.getY()) / bars.getHeight());
-}
-
-void ui::StepGrid::touch (juce::RangedAudioParameter* param)
-{
+    auto* param = stepParams[(size_t) step];
     if (std::find (touched.begin(), touched.end(), param) == touched.end())
     {
         param->beginChangeGesture();
         touched.push_back (param);
     }
+    param->setValueNotifyingHost (param->convertTo0to1 ((float) source));
 }
 
-void ui::StepGrid::setStepValue (int step, float value)
+void ui::StepMatrix::mouseDown (const juce::MouseEvent& e)
 {
-    auto* param = valueParams[(size_t) step];
-    touch (param);
-    param->setValueNotifyingHost (param->convertTo0to1 (value));
-}
+    if (e.position.x < (float) labelWidth)
+        return;
 
-void ui::StepGrid::setGlide (int step, bool on)
-{
-    auto* param = glideParams[(size_t) step];
-    touch (param);
-    param->setValueNotifyingHost (on ? 1.0f : 0.0f);
-}
-
-void ui::StepGrid::mouseDown (const juce::MouseEvent& e)
-{
-    const auto pos = e.position;
-    const int step = stepAtX (pos.x);
-
-    if (pos.y >= glideArea().getY() - 3.0f)
-    {
-        draggingGlide = true;
-        glidePaintState = glideParams[(size_t) step]->getValue() < 0.5f;
-        setGlide (step, glidePaintState);
-    }
-    else
-    {
-        draggingGlide = false;
-        lastValue = valueAtY (pos.y);
-        setStepValue (step, lastValue);
-    }
-
-    lastStep = step;
+    const int column = columnAt (e.position.x);
+    setStep (column, e.mods.isPopupMenu() ? 0 : sourceForRow (rowAt (e.position.y)));
+    lastColumn = column;
     repaint();
 }
 
-void ui::StepGrid::mouseDrag (const juce::MouseEvent& e)
+void ui::StepMatrix::mouseDrag (const juce::MouseEvent& e)
 {
-    const auto pos = e.position;
-    const int step = stepAtX (pos.x);
+    if (lastColumn < 0)
+        return;
 
-    if (draggingGlide)
-    {
-        const int a = juce::jmin (step, lastStep), b = juce::jmax (step, lastStep);
-        for (int i = a; i <= b; ++i)
-            setGlide (i, glidePaintState);
-    }
-    else
-    {
-        // Tracé rapide : on remplit les pas sautés en ligne droite
-        const float value = valueAtY (pos.y);
-        if (step == lastStep)
-            setStepValue (step, value);
-        else
-        {
-            const int dir = step > lastStep ? 1 : -1;
-            const int count = std::abs (step - lastStep);
-            for (int k = 1; k <= count; ++k)
-                setStepValue (lastStep + dir * k, lastValue + (value - lastValue) * (float) k / (float) count);
-        }
-        lastValue = value;
-    }
-
-    lastStep = step;
+    // On peint la ligne sous la souris sur toutes les colonnes traversées
+    const int column = columnAt (e.position.x);
+    const int source = e.mods.isPopupMenu() ? 0 : sourceForRow (rowAt (e.position.y));
+    for (int c = juce::jmin (column, lastColumn); c <= juce::jmax (column, lastColumn); ++c)
+        setStep (c, source);
+    lastColumn = column;
     repaint();
 }
 
-void ui::StepGrid::mouseUp (const juce::MouseEvent&)
+void ui::StepMatrix::mouseUp (const juce::MouseEvent&)
 {
     for (auto* param : touched)
         param->endChangeGesture();
     touched.clear();
+    lastColumn = -1;
 }
 
-void ui::StepGrid::mouseDoubleClick (const juce::MouseEvent& e)
+void ui::StepMatrix::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    // Double-clic sur un pas : il revient à zéro
-    if (e.position.y < glideArea().getY() - 3.0f)
-    {
-        setStepValue (stepAtX (e.position.x), 0.0f);
-        mouseUp (e);
-        repaint();
-    }
+    if (e.position.x < (float) labelWidth)
+        return;
+    setStep (columnAt (e.position.x), 0);
+    mouseUp (e);
+    repaint();
 }
 
-void ui::StepGrid::paint (juce::Graphics& g)
+void ui::StepMatrix::paint (juce::Graphics& g)
 {
     const int numSteps = SequencesAudioProcessor::numSteps;
     const int active = juce::roundToInt (stepsParam->convertFrom0to1 (stepsParam->getValue()));
-    const int playhead = processor.getPlayheadStep (seq);
-    const auto bars = barsArea();
-    const auto glides = glideArea();
-    const float w = (float) getWidth() / (float) numSteps;
+    const int playhead = processor.getPlayheadStep();
+    const auto grid = gridArea();
+    const float cw = grid.getWidth() / (float) numSteps;
+    const float rh = (float) getHeight() / (float) numRows;
 
-    g.setColour (juce::Colours::white);
-    g.fillRect (bars);
-
-    for (int i = 0; i < numSteps; ++i)
+    // Étiquettes des lignes
+    for (int row = 0; row < numRows; ++row)
     {
-        const float x = (float) i * w;
-        const bool inLoop = i < active;
-        const auto column = juce::Rectangle<float> (x, bars.getY(), w, bars.getHeight());
-
-        // Repère toutes les 4 cases
-        if ((i / 4) % 2 == 1)
-        {
-            g.setColour (Palette::stepOff().withAlpha (0.6f));
-            g.fillRect (column);
-        }
-
-        if (i == playhead)
-        {
-            g.setColour (Palette::accent().withAlpha (0.12f));
-            g.fillRect (column);
-        }
-
-        const float value = valueParams[(size_t) i]->getValue();
-        const bool glide = glideParams[(size_t) i]->getValue() > 0.5f;
-        const float next = valueParams[(size_t) ((i + 1) % juce::jmax (1, active))]->getValue();
-        const auto inner = column.reduced (2.0f, 0.0f);
-        const float yLeft = bars.getBottom() - value * bars.getHeight();
-        const float yRight = glide && inLoop ? bars.getBottom() - next * bars.getHeight() : yLeft;
-
-        juce::Path bar;
-        bar.startNewSubPath (inner.getX(), bars.getBottom());
-        bar.lineTo (inner.getX(), yLeft);
-        bar.lineTo (inner.getRight(), yRight);
-        bar.lineTo (inner.getRight(), bars.getBottom());
-        bar.closeSubPath();
-
-        const auto colour = ! inLoop ? Palette::faint().withAlpha (0.6f) : i == playhead ? Palette::accent() : Palette::ink();
-        g.setColour (colour.withAlpha (inLoop ? 0.85f : 0.5f));
-        g.fillPath (bar);
-        g.setColour (colour);
-        g.drawLine (inner.getX(), yLeft, inner.getRight(), yRight, 2.0f);
-
-        // Glide
-        const auto cell = juce::Rectangle<float> (x, glides.getY(), w, glides.getHeight()).reduced (3.0f, 3.0f);
-        if (glide)
-        {
-            g.setColour (inLoop ? Palette::accent() : Palette::faint());
-            g.fillRoundedRectangle (cell, 2.0f);
-            g.setColour (juce::Colours::white);
-            g.drawLine (cell.getX() + 3.0f, cell.getBottom() - 3.0f, cell.getRight() - 3.0f, cell.getY() + 3.0f, 1.5f);
-        }
-        else
-        {
-            g.setColour (inLoop ? Palette::panelLine() : Palette::stepOff());
-            g.drawRoundedRectangle (cell, 2.0f, 1.0f);
-        }
+        const int source = sourceForRow (row);
+        const auto r = juce::Rectangle<float> (0.0f, (float) row * rh, (float) labelWidth - 6.0f, rh);
+        g.setColour (Palette::source (source));
+        if (source != 0)
+            g.fillRoundedRectangle (juce::Rectangle<float> (8.0f, 8.0f).withCentre ({ 6.0f, r.getCentreY() }), 1.5f);
+        g.setColour (source == 0 ? Palette::dim() : Palette::ink());
+        g.setFont (font (9.5f, true, 0.1f));
+        g.drawText (SequencesAudioProcessor::sourceNames()[source], r.withTrimmedLeft (14.0f), juce::Justification::centredLeft, false);
     }
 
-    // Fin de boucle
+    g.setColour (juce::Colours::white);
+    g.fillRect (grid);
+
+    for (int c = 0; c < numSteps; ++c)
+    {
+        const auto column = juce::Rectangle<float> (grid.getX() + (float) c * cw, 0.0f, cw, (float) getHeight());
+        const bool inLoop = c < active;
+
+        if ((c / 4) % 2 == 1)
+        {
+            g.setColour (Palette::stepOff().withAlpha (0.55f));
+            g.fillRect (column);
+        }
+        if (c == playhead)
+        {
+            g.setColour (Palette::accent().withAlpha (0.14f));
+            g.fillRect (column);
+        }
+
+        const int source = juce::roundToInt (stepParams[(size_t) c]->convertFrom0to1 (stepParams[(size_t) c]->getValue()));
+        const int row = rowForSource (source);
+        const auto cell = juce::Rectangle<float> (column.getX(), (float) row * rh, cw, rh).reduced (2.0f, 2.0f);
+        auto colour = Palette::source (source);
+        if (! inLoop)
+            colour = colour.withMultipliedSaturation (0.2f).withAlpha (0.35f);
+        g.setColour (colour);
+        if (source == 0)
+            g.drawRoundedRectangle (cell, 2.0f, 1.2f);
+        else
+            g.fillRoundedRectangle (cell, 2.0f);
+    }
+
+    // Lignes horizontales légères
+    g.setColour (Palette::stepOff());
+    for (int row = 1; row < numRows; ++row)
+        g.fillRect (grid.getX(), (float) row * rh - 0.5f, grid.getWidth(), 1.0f);
+
     if (active < numSteps)
     {
         g.setColour (Palette::ink());
-        g.fillRect (juce::Rectangle<float> ((float) active * w - 1.0f, bars.getY(), 2.0f, bars.getHeight()));
+        g.fillRect (juce::Rectangle<float> (grid.getX() + (float) active * cw - 1.0f, 0.0f, 2.0f, (float) getHeight()));
     }
 
     g.setColour (Palette::panelLine());
-    g.drawRect (bars, 1.0f);
+    g.drawRect (grid, 1.0f);
+}
+
+//==============================================================================
+void ui::CircuitView::paint (juce::Graphics& g)
+{
+    processor.readSettings (settings);
+    const auto& q = settings.seq;
+    const double bpm = processor.getBpm();
+    const double loopBeats = q.on ? (double) q.steps * q.stepBeats : 4.0;
+
+    const auto area = getLocalBounds().toFloat();
+    const auto plot = area.withTrimmedLeft ((float) StepMatrix::labelWidth);
+    g.setColour (juce::Colours::white);
+    g.fillRect (plot);
+
+    // Libellé
+    g.setColour (Palette::ink());
+    g.setFont (font (9.5f, true, 0.12f));
+    g.drawText ("LFO", area.withWidth ((float) StepMatrix::labelWidth - 6.0f).withHeight (area.getHeight() * 0.5f),
+                juce::Justification::bottomLeft, false);
+    g.drawText ("CIRCUIT", area.withWidth ((float) StepMatrix::labelWidth - 6.0f).withTrimmedTop (area.getHeight() * 0.5f).withHeight (14.0f),
+                juce::Justification::topLeft, false);
+
+    // Pas et ligne du zéro
+    if (q.on)
+    {
+        g.setColour (Palette::stepOff());
+        for (int s = 1; s < q.steps; ++s)
+        {
+            const auto pos = seqs::stepAt ((double) s * q.stepBeats + 1.0e-9, q.steps, q.stepBeats, q.swing);
+            const float x = plot.getX() + (float) (pos.start / loopBeats) * plot.getWidth();
+            g.fillRect (x, plot.getY(), 1.0f, plot.getHeight());
+        }
+    }
+
+    const float mid = plot.getCentreY();
+    const float amp = plot.getHeight() * 0.44f;
+    g.setColour (Palette::panelLine());
+    g.fillRect (plot.getX(), mid, plot.getWidth(), 1.0f);
+
+    // Courbe, colorée par source
+    const int n = juce::roundToInt (plot.getWidth());
+    juce::Point<float> prev;
+    for (int i = 0; i <= n; ++i)
+    {
+        const double t = loopBeats * (double) i / (double) n;
+        const auto out = seqs::Mod::seq (settings, t, bpm, 0x5EEDull);
+        const juce::Point<float> pt (plot.getX() + (float) i, mid - juce::jlimit (-1.1f, 1.1f, out.value) * amp);
+        if (i > 0)
+        {
+            g.setColour (Palette::source (out.source == 0 ? 0 : out.source));
+            g.drawLine ({ prev, pt }, 1.8f);
+        }
+        prev = pt;
+    }
+
+    // Tête de lecture
+    const double beats = processor.getPlayheadBeats();
+    if (beats >= 0.0 && loopBeats > 0.0)
+    {
+        const double inLoop = std::fmod (beats, loopBeats);
+        const float x = plot.getX() + (float) (inLoop / loopBeats) * plot.getWidth();
+        g.setColour (Palette::accent());
+        g.fillRect (x - 1.0f, plot.getY(), 2.0f, plot.getHeight());
+    }
+
+    if (! q.on)
+    {
+        g.setColour (Palette::dim());
+        g.setFont (font (9.5f, true, 0.12f));
+        g.drawText ("SEQ OFF : " + SequencesAudioProcessor::sourceNames()[q.manual],
+                    plot.reduced (8.0f, 4.0f), juce::Justification::topRight, false);
+    }
+
+    g.setColour (Palette::panelLine());
+    g.drawRect (plot, 1.0f);
+}
+
+//==============================================================================
+void ui::LfoPreview::paint (juce::Graphics& g)
+{
+    processor.readSettings (settings);
+    const auto& l = settings.lfo[(size_t) lfo];
+    const auto area = getLocalBounds().toFloat().reduced (1.0f);
+
+    g.setColour (juce::Colours::white);
+    g.fillRoundedRectangle (area, 2.0f);
+    g.setColour (Palette::stepOff());
+    g.fillRect (area.getX(), area.getCentreY(), area.getWidth(), 1.0f);
+
+    juce::Path path;
+    const int n = juce::roundToInt (area.getWidth());
+    for (int i = 0; i <= n; ++i)
+    {
+        const double t = l.periodBeats * (double) i / (double) n;
+        const float v = seqs::Mod::lfo (l, t * 0.9999);
+        const juce::Point<float> pt (area.getX() + (float) i, area.getCentreY() - v * area.getHeight() * 0.42f);
+        if (i == 0) path.startNewSubPath (pt); else path.lineTo (pt);
+    }
+    g.setColour (Palette::source (lfo + 1));
+    g.strokePath (path, juce::PathStrokeType (1.5f));
+    g.setColour (Palette::panelLine());
+    g.drawRoundedRectangle (area, 2.0f, 1.0f);
 }
 
 //==============================================================================
@@ -367,60 +413,59 @@ SequencesFacade::SequencesFacade (SequencesAudioProcessor& p)
 
     constexpr int margin = 16, gap = 12, pad = 12, titleHeight = 24, cellHeight = 112;
 
-    // --- Rangée 1 : VOICE, FM, OSC ---
+    auto makeRow = [&] (int top, int rowHeight, std::vector<std::pair<const char*, int>> layout)
     {
-        const int top = 64, rowHeight = 150, cells = 16, numPanels = 3;
-        const int cell = (width - 2 * margin - numPanels * 2 * pad - (numPanels - 1) * gap) / cells;
+        int cells = 0;
+        for (auto& [name, count] : layout) cells += count;
+        const int n = (int) layout.size();
+        const int cell = (width - 2 * margin - n * 2 * pad - (n - 1) * gap) / cells;
+        std::vector<juce::Rectangle<int>> rects;
         int x = margin;
-
-        auto panel = [&] (const juce::String& title, int numCells)
+        for (auto& [name, count] : layout)
         {
-            const juce::Rectangle<int> r (x, top, numCells * cell + 2 * pad, rowHeight);
-            panels.push_back ({ title, r });
+            const juce::Rectangle<int> r (x, top, count * cell + 2 * pad, rowHeight);
+            panels.push_back ({ name, r, {} });
+            rects.push_back (r);
             x += r.getWidth() + gap;
-            return r;
-        };
-        auto cellAt = [&] (juce::Rectangle<int> r, int i) { return juce::Rectangle<int> (r.getX() + pad + i * cell, r.getY() + titleHeight + 6, cell, cellHeight); };
+        }
+        return std::make_pair (rects, cell);
+    };
 
-        auto voice = panel ("VOICE", 5);
-        addChoice ("voiceMode", "MODE", cellAt (voice, 0));
-        addKnob ("glide", "GLIDE", cellAt (voice, 1));
-        addKnob ("velocity", "VELOCITY", cellAt (voice, 2));
-        addKnob ("transpose", "TRANSPOSE", cellAt (voice, 3), true);
-        addKnob ("level", "LEVEL", cellAt (voice, 4));
+    // --- Rangée 1 : FM, OSC, VOICE ---
+    {
+        auto [r, cell] = makeRow (56, 150, { { "FM", 7 }, { "OSC", 7 }, { "VOICE", 5 } });
+        auto at = [&, cell = cell] (juce::Rectangle<int> panel, int i)
+        { return juce::Rectangle<int> (panel.getX() + pad + i * cell, panel.getY() + titleHeight + 6, cell, cellHeight); };
 
-        auto fm = panel ("FM", 5);
-        addKnob ("fmLevel", "LEVEL", cellAt (fm, 0));
-        addKnob ("fmRatio", "RATIO", cellAt (fm, 1));
-        addKnob ("fmIndex", "INDEX", cellAt (fm, 2));
-        addKnob ("fmFeedback", "FEEDBACK", cellAt (fm, 3));
-        addKnob ("fmEnv", "MOD ENV", cellAt (fm, 4), true);
+        addKnob ("fmLevel", "LEVEL", at (r[0], 0));
+        addKnob ("fmRatio", "RATIO", at (r[0], 1));
+        addKnob ("fmIndex", "INDEX", at (r[0], 2));
+        addKnob ("fmFeedback", "FEEDBACK", at (r[0], 3));
+        addKnob ("fmEnv", "MOD ENV", at (r[0], 4), true);
+        addChoice ("modWave", "MOD WAVE", at (r[0], 5).withWidth (cell + 8));
+        addKnob ("timbre", "TIMBRE", at (r[0], 6).withTrimmedLeft (8).withWidth (cell));
 
-        auto osc = panel ("OSC", 6);
-        addChoice ("oscWave", "WAVE", cellAt (osc, 0));
-        addKnob ("oscLevel", "LEVEL", cellAt (osc, 1));
-        addKnob ("oscOctave", "OCTAVE", cellAt (osc, 2), true);
-        addKnob ("oscDetune", "DETUNE", cellAt (osc, 3), true);
-        addKnob ("oscPw", "PW", cellAt (osc, 4));
-        addKnob ("noise", "NOISE", cellAt (osc, 5));
+        addChoice ("oscWave", "WAVE", at (r[1], 0));
+        addKnob ("oscLevel", "LEVEL", at (r[1], 1));
+        addKnob ("oscOctave", "OCTAVE", at (r[1], 2), true);
+        addKnob ("oscDetune", "DETUNE", at (r[1], 3), true);
+        addKnob ("oscPw", "PW", at (r[1], 4));
+        addKnob ("oscSync", "SYNC", at (r[1], 5));
+        addKnob ("noise", "NOISE", at (r[1], 6));
+
+        addChoice ("voiceMode", "MODE", at (r[2], 0));
+        addKnob ("glide", "GLIDE", at (r[2], 1));
+        addKnob ("velocity", "VELOCITY", at (r[2], 2));
+        addKnob ("transpose", "TRANSP", at (r[2], 3), true);
+        addKnob ("level", "LEVEL", at (r[2], 4));
     }
 
     // --- Rangée 2 : FILTER, DRIVE, AMP ENV, MOD ENV ---
     {
-        const int top = 222, rowHeight = 150, cells = 15, numPanels = 4;
-        const int cell = (width - 2 * margin - numPanels * 2 * pad - (numPanels - 1) * gap) / cells;
-        int x = margin;
+        auto [r, cell] = makeRow (214, 150, { { "FILTER", 5 }, { "DRIVE", 2 }, { "AMP ENV", 4 }, { "MOD ENV", 4 } });
+        auto at = [&, cell = cell] (juce::Rectangle<int> panel, int i)
+        { return juce::Rectangle<int> (panel.getX() + pad + i * cell, panel.getY() + titleHeight + 6, cell, cellHeight); };
 
-        auto panel = [&] (const juce::String& title, int numCells)
-        {
-            const juce::Rectangle<int> r (x, top, numCells * cell + 2 * pad, rowHeight);
-            panels.push_back ({ title, r });
-            x += r.getWidth() + gap;
-            return r;
-        };
-        auto cellAt = [&] (juce::Rectangle<int> r, int i) { return juce::Rectangle<int> (r.getX() + pad + i * cell, r.getY() + titleHeight + 6, cell, cellHeight); };
-
-        // Deux menus empilés dans une case
         auto stacked = [&] (juce::Rectangle<int> c, const char* firstLabel, const char* firstId, const char* secondLabel, const char* secondId)
         {
             captions.push_back ({ firstLabel, c.withHeight (14) });
@@ -429,43 +474,37 @@ SequencesFacade::SequencesFacade (SequencesAudioProcessor& p)
             addInlineChoice (secondId, c.withTrimmedTop (74).withHeight (26).reduced (3, 0));
         };
 
-        auto filter = panel ("FILTER", 5);
-        stacked (cellAt (filter, 0), "TYPE", "filterType", "SLOPE", "filterSlope");
-        addKnob ("cutoff", "CUTOFF", cellAt (filter, 1));
-        addKnob ("resonance", "RESO", cellAt (filter, 2));
-        addKnob ("filterEnv", "MOD ENV", cellAt (filter, 3), true);
-        addKnob ("keyTrack", "KEY TRACK", cellAt (filter, 4));
+        stacked (at (r[0], 0), "TYPE", "filterType", "SLOPE", "filterSlope");
+        addKnob ("cutoff", "CUTOFF", at (r[0], 1));
+        addKnob ("resonance", "RESO", at (r[0], 2));
+        addKnob ("filterEnv", "MOD ENV", at (r[0], 3), true);
+        addKnob ("keyTrack", "KEY TRACK", at (r[0], 4));
 
-        auto drive = panel ("DRIVE", 2);
-        stacked (cellAt (drive, 0), "TYPE", "driveType", "POSITION", "drivePos");
-        addKnob ("drive", "AMOUNT", cellAt (drive, 1));
+        stacked (at (r[1], 0), "TYPE", "driveType", "POSITION", "drivePos");
+        addKnob ("drive", "AMOUNT", at (r[1], 1));
 
-        auto amp = panel ("AMP ENV", 4);
-        addKnob ("ampAttack", "ATTACK", cellAt (amp, 0));
-        addKnob ("ampDecay", "DECAY", cellAt (amp, 1));
-        addKnob ("ampSustain", "SUSTAIN", cellAt (amp, 2));
-        addKnob ("ampRelease", "RELEASE", cellAt (amp, 3));
+        addKnob ("ampAttack", "ATTACK", at (r[2], 0));
+        addKnob ("ampDecay", "DECAY", at (r[2], 1));
+        addKnob ("ampSustain", "SUSTAIN", at (r[2], 2));
+        addKnob ("ampRelease", "RELEASE", at (r[2], 3));
 
-        auto modEnv = panel ("MOD ENV", 4);
-        addKnob ("modAttack", "ATTACK", cellAt (modEnv, 0));
-        addKnob ("modDecay", "DECAY", cellAt (modEnv, 1));
-        addKnob ("modSustain", "SUSTAIN", cellAt (modEnv, 2));
-        addKnob ("modRelease", "RELEASE", cellAt (modEnv, 3));
-
+        addKnob ("modAttack", "ATTACK", at (r[3], 0));
+        addKnob ("modDecay", "DECAY", at (r[3], 1));
+        addKnob ("modSustain", "SUSTAIN", at (r[3], 2));
+        addKnob ("modRelease", "RELEASE", at (r[3], 3));
     }
 
-    // --- Séquenceurs ---
-    buildSequencer (0, { margin, 382, width - 2 * margin, 232 });
-    buildSequencer (1, { margin, 622, width - 2 * margin, 232 });
+    bankPanel = { margin, 372, width - 2 * margin, 216 };
+    seqPanel = { margin, 596, width - 2 * margin, 316 };
+    buildBank (bankPanel);
+    buildSequencer (seqPanel);
 
-    // --- En-tête : presets + taille ---
     addAndMakeVisible (presetBar);
-    presetBar.setBounds (width - 96 - phragma::PresetBar::idealWidth, 16, phragma::PresetBar::idealWidth, 28);
+    presetBar.setBounds (width - 96 - phragma::PresetBar::idealWidth, 14, phragma::PresetBar::idealWidth, 28);
     presetBar.attachSavePanelTo (*this);
 
     // Les enfants ont été créés avant d'être posés sur la façade : on leur applique son look
     sendLookAndFeelChange();
-
     startTimerHz (30);
 }
 
@@ -475,35 +514,129 @@ SequencesFacade::~SequencesFacade()
     setLookAndFeel (nullptr);
 }
 
-SequencesFacade::Knob& SequencesFacade::addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar)
+void SequencesFacade::buildBank (juce::Rectangle<int> area)
+{
+    const int columns = seqs::numSources;
+    const int colWidth = (area.getWidth() - 24) / columns;
+    const int y0 = area.getY() + 30;
+
+    for (int c = 0; c < columns; ++c)
+    {
+        const int x = area.getX() + 12 + c * colWidth;
+        const int w = colWidth - 12;
+        const bool isLfo = c < seqs::numLfos;
+        const juce::String name = SequencesAudioProcessor::sourceNames()[c + 1];
+        panels.push_back ({ name, { x, y0, w, 18 }, ui::Palette::source (c + 1) });   // en-tête de colonne
+
+        if (isLfo)
+        {
+            auto preview = std::make_unique<ui::LfoPreview> (audioProcessor, c);
+            preview->setBounds (x + w - 70, y0, 70, 18);
+            addAndMakeVisible (*preview);
+            previews.push_back (std::move (preview));
+
+            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Rate"), "RATE", { x, y0 + 24, w, 22 }, 40);
+            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Shape"), "SHAPE", { x, y0 + 50, w, 22 }, 40);
+            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Step"), "STEP", { x, y0 + 76, w / 2 + 14, 22 }, 40);
+            addInlineChoice (SequencesAudioProcessor::lfoId (c, "Pol"), { x + w / 2 + 18, y0 + 76, w - w / 2 - 18, 22 });
+            addKnob (SequencesAudioProcessor::lfoId (c, "Amt"), "AMT", { x, y0 + 102, w / 2, 82 }, false, true);
+            addKnob (SequencesAudioProcessor::lfoId (c, "Phase"), "PHASE", { x + w / 2, y0 + 102, w - w / 2, 82 }, false, true);
+        }
+        else
+        {
+            const int k = c - seqs::numLfos;
+            addLabelledChoice (SequencesAudioProcessor::chaosId (k, "Rate"), "RATE", { x, y0 + 24, w, 22 }, 40);
+            addKnob (SequencesAudioProcessor::chaosId (k, "Amt"), "AMT", { x, y0 + 64, w / 2, 112 });
+            addKnob (SequencesAudioProcessor::chaosId (k, "Smooth"), "SMOOTH", { x + w / 2, y0 + 64, w - w / 2, 112 });
+        }
+    }
+}
+
+void SequencesFacade::buildSequencer (juce::Rectangle<int> area)
+{
+    const int top = area.getY() + 10, h = 24;
+    int x = area.getX() + 116;
+
+    addToggle ("seqOn", "ON", { x, top, 44, h });                                   x += 44 + 8;
+    addBar ("seqSteps", "STEPS", { x, top, 112, h }, false);                       x += 112 + 8;
+    addLabelledChoice ("seqDiv", "DIV", { x, top, 92, h }, 30);                    x += 92 + 8;
+    addInlineChoice ("seqFeel", { x, top, 94, h });                                x += 94 + 8;
+    addLabelledChoice ("seqSync", "SYNC", { x, top, 106, h }, 36);                 x += 106 + 8;
+    addBar ("seqSwing", "SWING", { x, top, 112, h }, false);                       x += 112 + 8;
+    addToggle ("seqRestart", "RESTART", { x, top, 76, h });                         x += 76 + 8;
+    addBar ("seqXfade", "XFADE", { x, top, 124, h }, false);                        x += 124 + 8;
+    addLabelledChoice ("seqManual", "LFO SWITCH", { x, top, area.getRight() - 12 - x, h }, 76);
+
+    // Matrice + LFO CIRCUIT
+    const int gridWidth = ui::StepMatrix::labelWidth + SequencesAudioProcessor::numSteps * 25;
+    matrix = std::make_unique<ui::StepMatrix> (audioProcessor);
+    matrix->setBounds (area.getX() + 12, area.getY() + 46, gridWidth, ui::StepMatrix::numRows * 15);
+    addAndMakeVisible (*matrix);
+
+    circuit = std::make_unique<ui::CircuitView> (audioProcessor);
+    circuit->setBounds (area.getX() + 12, matrix->getBottom() + 10, gridWidth, area.getBottom() - 12 - (matrix->getBottom() + 10));
+    addAndMakeVisible (*circuit);
+
+    // Boutons et routages, à droite
+    const int rx = matrix->getRight() + 20, rw = area.getRight() - 12 - rx;
+    int bx = area.getRight() - 12;
+    auto placeRight = [&] (juce::TextButton& b, const juce::String& text, const juce::String& title, int w)
+    {
+        bx -= w;
+        addButton (b, text, title, { bx, area.getY() + 46, w, 26 });
+        bx -= 6;
+    };
+    randomAllButton.setComponentID ("random");
+    randomButton.setComponentID ("random");
+    placeRight (randomAllButton, "RANDOM ALL", "Random LFO bank and pattern", 100);
+    placeRight (randomButton, "RANDOM", "Random pattern", 86);
+    placeRight (clearButton, "CLEAR", "Clear pattern", 60);
+    placeRight (rightButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x96\xb6")), "Shift right", 30);
+    placeRight (leftButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x97\x80")), "Shift left", 30);
+
+    randomButton.onClick = [this] { audioProcessor.randomizePattern(); repaint(); };
+    randomAllButton.onClick = [this] { audioProcessor.randomizeAll(); repaint(); };
+    clearButton.onClick = [this] { audioProcessor.fillPattern (0); repaint(); };
+    leftButton.onClick = [this] { audioProcessor.rotatePattern (-1); repaint(); };
+    rightButton.onClick = [this] { audioProcessor.rotatePattern (+1); repaint(); };
+
+    for (int k = 0; k < seqs::numSlots; ++k)
+    {
+        const int y = area.getY() + 84 + k * 56;
+        leftCaptions.push_back ({ "MOD " + juce::String (k + 1), { rx, y, rw, 14 } });
+        addInlineChoice (SequencesAudioProcessor::slotId (k, "Src"), { rx, y + 16, 92, 26 });
+        addInlineChoice (SequencesAudioProcessor::slotId (k, "Dest"), { rx + 98, y + 16, 112, 26 });
+        addBar (SequencesAudioProcessor::slotId (k, "Amt"), "AMOUNT", { rx + 216, y + 16, rw - 216, 26 }, true);
+    }
+}
+
+void SequencesFacade::addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar, bool small)
 {
     auto k = std::make_unique<Knob>();
-    k->label = label;
     auto& s = k->slider;
+    const int captionHeight = small ? 12 : 16;
     s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
     s.setRotaryParameters (juce::degreesToRadians (225.0f), juce::degreesToRadians (495.0f), true);
-    s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, cell.getWidth(), 18);
+    s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, cell.getWidth(), small ? 14 : 18);
     s.setMouseDragSensitivity (220);
     s.setVelocityBasedMode (false);
     s.getProperties().set ("bipolar", bipolar);
     s.setTitle (label);
     s.setComponentID (id);
-    s.setBounds (cell.withTrimmedTop (16).withHeight (cell.getHeight() - 16));
+    s.setBounds (cell.withTrimmedTop (captionHeight));
     addAndMakeVisible (s);
     k->attachment = std::make_unique<SliderAttachment> (audioProcessor.apvts, id, s);
 
     if (auto* param = audioProcessor.apvts.getParameter (id))
         s.setDoubleClickReturnValue (true, param->convertFrom0to1 (param->getDefaultValue()));
 
-    captions.push_back ({ label, cell.withHeight (14) });
+    captions.push_back ({ label, cell.withHeight (captionHeight - 2) });
     knobs.push_back (std::move (k));
-    return *knobs.back();
 }
 
-SequencesFacade::Knob& SequencesFacade::addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar)
+void SequencesFacade::addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar)
 {
     auto k = std::make_unique<Knob>();
-    k->label = label;
     auto& s = k->slider;
     s.setSliderStyle (juce::Slider::LinearBar);
     s.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
@@ -520,10 +653,9 @@ SequencesFacade::Knob& SequencesFacade::addBar (const juce::String& id, const ju
         s.setDoubleClickReturnValue (true, param->convertFrom0to1 (param->getDefaultValue()));
 
     knobs.push_back (std::move (k));
-    return *knobs.back();
 }
 
-SequencesFacade::Choice& SequencesFacade::addInlineChoice (const juce::String& id, juce::Rectangle<int> area)
+juce::ComboBox& SequencesFacade::addInlineChoice (const juce::String& id, juce::Rectangle<int> area)
 {
     auto c = std::make_unique<Choice>();
     if (auto* param = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (id)))
@@ -534,117 +666,76 @@ SequencesFacade::Choice& SequencesFacade::addInlineChoice (const juce::String& i
     addAndMakeVisible (c->box);
     c->attachment = std::make_unique<ComboAttachment> (audioProcessor.apvts, id, c->box);
     choices.push_back (std::move (c));
-    return *choices.back();
+    return choices.back()->box;
 }
 
-SequencesFacade::Choice& SequencesFacade::addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell)
+void SequencesFacade::addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell)
 {
     captions.push_back ({ label, cell.withHeight (14) });
-    auto& c = addInlineChoice (id, cell.withTrimmedTop (34).withHeight (26).reduced (3, 0));
-    c.label = label;
-    return c;
+    addInlineChoice (id, cell.withTrimmedTop (34).withHeight (26).reduced (3, 0));
 }
 
-void SequencesFacade::buildSequencer (int seq, juce::Rectangle<int> area)
+void SequencesFacade::addLabelledChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth)
 {
-    auto u = std::make_unique<SeqUi>();
-    u->bounds = area;
-    const auto id = [seq] (const char* name) { return SequencesAudioProcessor::seqId (seq, name); };
+    leftCaptions.push_back ({ label, area.withWidth (labelWidth) });
+    addInlineChoice (id, area.withTrimmedLeft (labelWidth));
+}
 
-    const int top = area.getY() + 10, h = 24;
-    int x = area.getX() + 76;
+void SequencesFacade::addToggle (const juce::String& id, const juce::String& text, juce::Rectangle<int> area)
+{
+    auto t = std::make_unique<Toggle>();
+    t->button.setButtonText (text);
+    t->button.setClickingTogglesState (true);
+    t->button.setTitle (id);
+    t->button.setComponentID (id);
+    t->button.setWantsKeyboardFocus (false);
+    t->button.setBounds (area);
+    addAndMakeVisible (t->button);
+    t->attachment = std::make_unique<ButtonAttachment> (audioProcessor.apvts, id, t->button);
+    toggles.push_back (std::move (t));
+}
 
-    u->on.setButtonText ("ON");
-    u->on.setClickingTogglesState (true);
-    u->on.setTitle (seq == 0 ? "Sequencer A on" : "Sequencer B on");
-    u->on.setBounds (x, top, 44, h);
-    addAndMakeVisible (u->on);
-    u->onAttachment = std::make_unique<ButtonAttachment> (audioProcessor.apvts, id ("On"), u->on);
-    x += 44 + 10;
-
-    addBar (id ("Steps"), "STEPS", { x, top, 112, h }, false);             x += 112 + 10;
-    captions.push_back ({ "RATE", { x, top, 36, h } });
-    addInlineChoice (id ("Rate"), { x + 38, top, 70, h });                   x += 108 + 10;
-    addInlineChoice (id ("Feel"), { x, top, 100, h });                       x += 100 + 10;
-    captions.push_back ({ "SYNC", { x, top, 36, h } });
-    addInlineChoice (id ("Sync"), { x + 38, top, 76, h });                   x += 114 + 10;
-    addBar (id ("Swing"), "SWING", { x, top, 128, h }, false);              x += 128 + 10;
-    addBar (id ("Smooth"), "SMOOTH", { x, top, 136, h }, false);
-
-    // Boutons à droite
-    int right = area.getRight() - 12;
-    auto placeButton = [&] (juce::TextButton& b, const juce::String& text, int w)
-    {
-        right -= w;
-        b.setButtonText (text);
-        b.setBounds (right, top, w, h);
-        b.setWantsKeyboardFocus (false);
-        addAndMakeVisible (b);
-        right -= 6;
-    };
-
-    u->random.setComponentID ("random");
-    placeButton (u->random, "RANDOM", 92);
-    placeButton (u->clear, "CLEAR", 58);
-    placeButton (u->right, juce::String (juce::CharPointer_UTF8 ("\xe2\x96\xb6")), 30);
-    placeButton (u->left, juce::String (juce::CharPointer_UTF8 ("\xe2\x97\x80")), 30);
-    u->random.setTitle ("Random pattern");
-    u->clear.setTitle ("Clear pattern");
-    u->left.setTitle ("Shift left");
-    u->right.setTitle ("Shift right");
-
-    u->random.onClick = [this, seq] { audioProcessor.randomizeSequence (seq); repaint(); };
-    u->clear.onClick = [this, seq] { audioProcessor.clearSequence (seq, 0.0f); repaint(); };
-    u->left.onClick = [this, seq] { audioProcessor.rotateSequence (seq, -1); repaint(); };
-    u->right.onClick = [this, seq] { audioProcessor.rotateSequence (seq, +1); repaint(); };
-
-    // Grille
-    const int gridWidth = 32 * 26;
-    u->grid = std::make_unique<ui::StepGrid> (audioProcessor, seq);
-    u->grid->setBounds (area.getX() + 12, area.getY() + 46, gridWidth, area.getHeight() - 46 - 12);
-    addAndMakeVisible (*u->grid);
-
-    // Destinations
-    const int destX = area.getX() + 12 + gridWidth + 20;
-    const int destWidth = area.getRight() - 12 - destX;
-    for (int k = 0; k < seqs::numSlots; ++k)
-    {
-        const int y = area.getY() + 46 + k * 58;
-        captions.push_back ({ "DEST " + juce::String (k + 1), { destX, y, destWidth, 14 } });
-        addInlineChoice (SequencesAudioProcessor::destId (seq, k), { destX, y + 18, 120, 26 });
-        addBar (SequencesAudioProcessor::amountId (seq, k), "AMOUNT", { destX + 128, y + 18, destWidth - 128, 26 }, true);
-    }
-
-    seqUis[(size_t) seq] = std::move (u);
+void SequencesFacade::addButton (juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area)
+{
+    b.setButtonText (text);
+    b.setTitle (title);
+    b.setWantsKeyboardFocus (false);
+    b.setBounds (area);
+    addAndMakeVisible (b);
 }
 
 void SequencesFacade::timerCallback()
 {
-    for (int q = 0; q < seqs::numSeqs; ++q)
+    ++tick;
+    const int step = audioProcessor.getPlayheadStep();
+    if (step != shownStep || matrix->isMouseButtonDown())
     {
-        const int step = audioProcessor.getPlayheadStep (q);
-        if (step != shownPlayhead[(size_t) q] || seqUis[(size_t) q]->grid->isMouseButtonDown())
-        {
-            shownPlayhead[(size_t) q] = step;
-            seqUis[(size_t) q]->grid->repaint();
-        }
+        shownStep = step;
+        matrix->repaint();
     }
+
+    const bool playing = audioProcessor.getPlayheadBeats() >= 0.0;
+    if (playing || tick % 6 == 0)
+        circuit->repaint();
+
+    if (tick % 6 == 0)
+        for (auto& p : previews)
+            p->repaint();
 }
 
 void SequencesFacade::paint (juce::Graphics& g)
 {
+    using ui::Palette;
     g.fillAll (Palette::background());
 
-    // En-tête
     g.setColour (Palette::ink());
     g.setFont (ui::font (24.0f, true, 0.22f));
-    g.drawText ("SEQUENCES", juce::Rectangle<int> (16, 12, 300, 36), juce::Justification::centredLeft, false);
+    g.drawText ("SEQUENCES", juce::Rectangle<int> (16, 10, 300, 36), juce::Justification::centredLeft, false);
     g.setColour (Palette::dim());
     g.setFont (ui::font (10.0f, true, 0.3f));
-    g.drawText ("BY PHRAGMA", juce::Rectangle<int> (232, 12, 140, 36), juce::Justification::centredLeft, false);
-    g.drawText ("V" SEQUENCES_VERSION, juce::Rectangle<int> (width - 86, 12, 70, 36), juce::Justification::centredRight, false);
+    g.drawText ("BY PHRAGMA", juce::Rectangle<int> (232, 10, 140, 36), juce::Justification::centredLeft, false);
+    g.drawText ("V" SEQUENCES_VERSION, juce::Rectangle<int> (width - 86, 10, 70, 36), juce::Justification::centredRight, false);
 
-    // Panneaux
     auto drawPanel = [&g] (juce::Rectangle<int> r, const juce::String& title)
     {
         g.setColour (Palette::panel());
@@ -656,27 +747,43 @@ void SequencesFacade::paint (juce::Graphics& g)
         g.drawText (title, r.withTrimmedLeft (12).withTrimmedTop (8).withHeight (16), juce::Justification::centredLeft, false);
     };
 
-    for (const auto& p : panels)
-        drawPanel (p.bounds, p.title);
+    drawPanel (bankPanel, "LFO BANK");
+    drawPanel (seqPanel, "");
+    g.setColour (Palette::ink());
+    g.setFont (ui::font (13.0f, true, 0.22f));
+    g.drawText ("SEQUENCER", juce::Rectangle<int> (seqPanel.getX() + 12, seqPanel.getY() + 10, 104, 24), juce::Justification::centredLeft, false);
 
-    for (int q = 0; q < seqs::numSeqs; ++q)
+    for (const auto& p : panels)
     {
-        const auto& u = *seqUis[(size_t) q];
-        g.setColour (Palette::panel());
-        g.fillRoundedRectangle (u.bounds.toFloat(), 6.0f);
-        g.setColour (Palette::panelLine());
-        g.drawRoundedRectangle (u.bounds.toFloat().reduced (0.5f), 6.0f, 1.0f);
+        if (p.swatch.isTransparent())
+        {
+            drawPanel (p.bounds, p.title);
+            continue;
+        }
+
+        // En-tête d'une colonne de la banque : pastille + nom
+        g.setColour (p.swatch);
+        g.fillRoundedRectangle (juce::Rectangle<float> (10.0f, 10.0f).withCentre ({ (float) p.bounds.getX() + 5.0f, (float) p.bounds.getCentreY() }), 2.0f);
         g.setColour (Palette::ink());
-        g.setFont (ui::font (13.0f, true, 0.24f));
-        g.drawText (q == 0 ? "SEQ A" : "SEQ B", juce::Rectangle<int> (u.bounds.getX() + 12, u.bounds.getY() + 10, 64, 24),
-                    juce::Justification::centredLeft, false);
+        g.setFont (ui::font (11.0f, true, 0.2f));
+        g.drawText (p.title, p.bounds.withTrimmedLeft (16), juce::Justification::centredLeft, false);
     }
 
-    // Légendes
+    // Séparateurs de colonnes de la banque
+    g.setColour (Palette::panelLine());
+    const int colWidth = (bankPanel.getWidth() - 24) / seqs::numSources;
+    for (int c = 1; c < seqs::numSources; ++c)
+    {
+        const int x = bankPanel.getX() + 12 + c * colWidth - 6;
+        g.fillRect (x, bankPanel.getY() + 30, 1, bankPanel.getHeight() - 40);
+    }
+
     g.setFont (ui::font (9.5f, true, 0.16f));
     g.setColour (Palette::dim());
     for (const auto& [text, r] : captions)
-        g.drawText (text, r, r.getHeight() > 20 ? juce::Justification::centredLeft : juce::Justification::centred, false);
+        g.drawText (text, r, juce::Justification::centred, false);
+    for (const auto& [text, r] : leftCaptions)
+        g.drawText (text, r, juce::Justification::centredLeft, false);
 }
 
 //==============================================================================

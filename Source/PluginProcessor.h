@@ -5,8 +5,8 @@
 #include "SequencesEngine.h"
 
 /**
-    Sequences : synthé FM + analogique, polyphonique (8 voix) ou mono, avec deux séquenceurs de LFO.
-    Les pas des séquenceurs sont des paramètres (automatisables, gardés dans les presets).
+    Sequences : synthé FM + analogique (hard sync), polyphonique (8 voix) ou mono,
+    avec une banque de 6 LFO + 2 CHAOS et un séquenceur qui choisit la source à chaque pas.
 */
 class SequencesAudioProcessor final : public juce::AudioProcessor
 {
@@ -43,25 +43,33 @@ public:
     //==========================================================================
     static constexpr int numSteps = seqs::maxSteps;
 
-    /** Identifiant d'un paramètre de séquenceur : seqId (0, "on") -> "seqAOn". */
-    static juce::String seqId (int seq, const juce::String& name)  { return juce::String (seq == 0 ? "seqA" : "seqB") + name; }
-    static juce::String stepId (int seq, int step)                 { return seqId (seq, "Step" + juce::String (step + 1)); }
-    static juce::String glideId (int seq, int step)                { return seqId (seq, "Glide" + juce::String (step + 1)); }
-    static juce::String destId (int seq, int slot)                 { return seqId (seq, "Dest" + juce::String (slot + 1)); }
-    static juce::String amountId (int seq, int slot)               { return seqId (seq, "Amt" + juce::String (slot + 1)); }
+    static juce::String lfoId (int lfo, const char* name)     { return "lfo" + juce::String (lfo + 1) + name; }
+    static juce::String chaosId (int c, const char* name)     { return "chaos" + juce::String (c + 1) + name; }
+    static juce::String stepId (int step)                     { return "seqStep" + juce::String (step + 1); }
+    static juce::String slotId (int slot, const char* name)   { return "mod" + juce::String (slot + 1) + name; }
 
     static const juce::StringArray& destinationNames();
-    static const juce::StringArray& rateNames();
+    static const juce::StringArray& sourceNames();        // OFF, LFO 1..6, CHAOS 1..2
+    static const juce::StringArray& slotSourceNames();    // SEQ, LFO 1..6, CHAOS 1..2
+    static const juce::StringArray& lfoRateNames();
+    static double lfoRateBeats (int index);
 
-    /** RANDOM : nouveau motif (valeurs + glides) pour un séquenceur. Fil de l'interface. */
-    void randomizeSequence (int seq);
-    /** Décale le motif d'un pas (dir = +1 vers la droite, -1 vers la gauche), dans la longueur choisie. */
-    void rotateSequence (int seq, int dir);
-    /** Met les pas d'un séquenceur à une même valeur (et retire les glides). */
-    void clearSequence (int seq, float value);
+    /** Lit tous les paramètres (utilisable depuis l'interface pour l'aperçu). */
+    void readSettings (seqs::Settings& s) const;
 
-    /** Pour l'interface : pas en cours (-1 = rien ne joue). */
-    int getPlayheadStep (int seq) const noexcept         { return playhead[(size_t) juce::jlimit (0, 1, seq)].load (std::memory_order_relaxed); }
+    /** RANDOM : nouveau motif de sources (parmi les sources dont la quantité n'est pas nulle). */
+    void randomizePattern();
+    /** RANDOM ALL : nouvelle banque de LFO / CHAOS + nouveau motif. */
+    void randomizeAll();
+    /** Décale le motif d'un pas (+1 vers la droite, -1 vers la gauche), dans la longueur choisie. */
+    void rotatePattern (int dir);
+    /** Tous les pas sur une même source. */
+    void fillPattern (int source);
+
+    /** Pour l'interface. */
+    int getPlayheadStep() const noexcept                 { return playheadStep.load (std::memory_order_relaxed); }
+    double getPlayheadBeats() const noexcept             { return playheadBeats.load (std::memory_order_relaxed); }
+    double getBpm() const noexcept                       { return bpmNow.load (std::memory_order_relaxed); }
 
     /** Pour les tests : graine des tirages RANDOM. */
     void setRandomSeed (uint64_t seed)                   { randomRng.reseed (seed); }
@@ -71,34 +79,47 @@ public:
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    void readSettings (seqs::Settings& s) const;
     void setParam (const juce::String& id, float realValue);
+    float realValue (const juce::String& id) const;
 
     seqs::Engine engine;
     seqs::Settings settings;
     double currentSampleRate = 48000.0;
     double lastBpm = 120.0;
 
-    std::array<std::atomic<int>, seqs::numSeqs> playhead {};
+    std::atomic<int> playheadStep { -1 };
+    std::atomic<double> playheadBeats { -1.0 };
+    std::atomic<double> bpmNow { 120.0 };
     seqs::Rng randomRng { (uint64_t) juce::Time::getHighResolutionTicks() };
 
-    // Accès rapide aux paramètres (fil audio)
-    struct SeqParams
+    std::map<juce::String, std::atomic<float>*> raw;
+    std::atomic<float>* p (const juce::String& id) const   { return raw.at (id); }
+
+    /** Pointeurs vers les valeurs des paramètres, relevés une fois (lecture rapide à chaque bloc). */
+    struct Cache
     {
-        std::atomic<float>* on = nullptr;
-        std::atomic<float>* steps = nullptr;
-        std::atomic<float>* rate = nullptr;
-        std::atomic<float>* feel = nullptr;
-        std::atomic<float>* swing = nullptr;
-        std::atomic<float>* smooth = nullptr;
-        std::atomic<float>* sync = nullptr;
-        std::array<std::atomic<float>*, seqs::numSlots> dest {}, amount {};
-        std::array<std::atomic<float>*, seqs::maxSteps> value {}, glide {};
+        using P = std::atomic<float>*;
+        struct Lfo { P rate, shape, amount, step, phase, polarity; };
+        struct Chaos { P rate, amount, smooth; };
+        struct Slot { P source, dest, amount; };
+
+        std::map<juce::String, P> named;
+        P voiceMode {}, glide {}, velocity {}, transpose {}, level {};
+        P fmLevel {}, fmRatio {}, fmIndex {}, fmFeedback {}, fmEnv {}, modWave {}, timbre {};
+        P oscWave {}, oscLevel {}, oscOctave {}, oscDetune {}, oscPw {}, oscSync {}, noise {};
+        P filterType {}, filterSlope {}, cutoff {}, resonance {}, filterEnv {}, keyTrack {};
+        P ampAttack {}, ampDecay {}, ampSustain {}, ampRelease {}, modAttack {}, modDecay {}, modSustain {}, modRelease {};
+        P driveType {}, drive {}, drivePos {};
+        P seqOn {}, seqSteps {}, seqDiv {}, seqFeel {}, seqSwing {}, seqSync {}, seqRestart {}, seqXfade {}, seqManual {};
+        std::array<Lfo, seqs::numLfos> lfo {};
+        std::array<Chaos, seqs::numChaos> chaos {};
+        std::array<P, seqs::maxSteps> steps {};
+        std::array<Slot, seqs::numSlots> slots {};
+
+        void build (const SequencesAudioProcessor&);
     };
 
-    std::array<SeqParams, seqs::numSeqs> seqParams;
-    std::map<juce::String, std::atomic<float>*> raw;
-    std::atomic<float>* p (const char* id) const         { return raw.at (id); }
+    Cache cache;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SequencesAudioProcessor)
 };

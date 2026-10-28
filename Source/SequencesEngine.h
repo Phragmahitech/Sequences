@@ -4,53 +4,74 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <vector>
 
 /**
     Moteur de Sequences (sans JUCE, testable seul).
 
-    Une voix = opérateur FM (porteuse + modulante avec feedback) + oscillateur analogique (polyBLEP)
-    + bruit -> distorsion (avant ou après le filtre) -> filtre d'état (LP / BP / HP, 12 ou 24 dB)
-    -> ampli. Deux enveloppes ADSR (ampli, modulation).
+    Une voix = opérateur FM (porteuse sinus + modulante à 9 formes, dont 3 « Reso », avec feedback)
+    + oscillateur analogique avec hard sync (BLEP) + bruit -> distorsion (avant ou après le filtre)
+    -> filtre d'état (LP / BP / HP, 12 ou 24 dB) -> ampli. Deux enveloppes ADSR (ampli, modulation).
 
-    Deux séquenceurs de LFO : une rangée de 1 à 32 pas, chaque pas a une valeur (0..1) et un drapeau
-    « glide » (la valeur glisse vers celle du pas suivant pendant le pas). Le séquenceur avance au
-    tempo de l'hôte ; chaque séquenceur envoie sa valeur vers 3 destinations, avec une profondeur ±.
-    En mode NOTE, chaque voix a sa propre position, remise à zéro à chaque note (pas au legato).
-    En mode HOST, toutes les voix lisent la position du morceau (horloge libre quand l'hôte est arrêté).
+    Modulation, à la façon du LFO SEQUENCER d'Alaskan Bites :
+      - une banque de 6 LFO (période synchro au tempo, forme, quantité, STEP = LFO découpé en marches,
+        phase, bipolaire / unipolaire) et 2 CHAOS (aléatoire en marches ou lissé) ;
+      - un séquenceur de 1 à 32 pas : chaque pas choisit QUELLE source joue (ou OFF). À chaque pas,
+        la source peut repartir de sa phase (RESTART) ; un court fondu évite les clics (XFADE) ;
+      - 4 routages : source (SEQ ou une source de la banque) -> destination, profondeur ±.
+    En mode NOTE, le temps part de chaque note (pas au legato). En mode HOST, il suit le morceau.
 */
 namespace seqs
 {
 
 constexpr int maxSteps = 32;
 constexpr int maxVoices = 8;
-constexpr int numSeqs = 2;
-constexpr int numSlots = 3;
+constexpr int numLfos = 6;
+constexpr int numChaos = 2;
+constexpr int numSources = numLfos + numChaos;   // 1..6 = LFO, 7..8 = CHAOS (0 = OFF / SEQ)
+constexpr int numSlots = 4;
 constexpr double twoPi = 6.283185307179586;
 constexpr double pi = 3.141592653589793;
 
 enum class Dest : int
 {
-    off = 0, cutoff, resonance, fmIndex, fmRatio, pitch, fine, pulseWidth, drive, amp,
-    fmLevel, oscLevel, noise, pan, feedback, count
+    off = 0, cutoff, resonance, fmIndex, fmRatio, pitch, pulseWidth, drive, amp,
+    fmLevel, oscLevel, noise, pan, feedback, sync, timbre, count
 };
 
 enum class Wave : int { saw = 0, square, triangle, sine };
+enum class ModWave : int { sine = 0, dblSine, saw, square, pulse, sawPulse, reso1, reso2, reso3, count };
+enum class LfoShape : int { sine = 0, triangle, saw, ramp, square, pulse, expDown, expUp, count };
 enum class FilterType : int { lowpass = 0, bandpass, highpass };
 enum class DriveType : int { soft = 0, fold, crush };
 
+struct LfoSettings
+{
+    double periodBeats = 1.0;    // durée d'un cycle, en noires
+    LfoShape shape = LfoShape::sine;
+    float amount = 1.0f;         // 0..1
+    int steps = 0;               // 0 = continu, sinon nombre de marches par cycle
+    float phase = 0.0f;          // 0..1
+    bool unipolar = false;       // false : -1..1, true : 0..1
+};
+
+struct ChaosSettings
+{
+    double periodBeats = 0.25;   // une nouvelle valeur par période
+    float amount = 1.0f;
+    float smooth = 0.0f;         // 0 = marches nettes, 1 = glisse sur toute la période
+};
+
 struct SeqSettings
 {
-    bool on = false;
+    bool on = true;
     int steps = 16;
-    double stepBeats = 0.25;     // durée d'un pas en noires (triolet / pointé compris)
-    double swing = 0.0;          // 0..0.75 : le pas pair dure (1 + swing), l'impair (1 - swing)
-    float smooth = 0.0f;         // 0..1 : lissage, en fraction de la durée du pas
-    bool hostSync = false;       // false = NOTE (repart à chaque note), true = HOST (position du morceau)
-    std::array<Dest, numSlots> dest { Dest::off, Dest::off, Dest::off };
-    std::array<float, numSlots> amount {};
-    std::array<float, maxSteps> value {};
-    std::array<bool, maxSteps> glide {};
+    double stepBeats = 0.5;      // durée d'un pas en noires (triolet / pointé compris)
+    double swing = 0.0;          // 0..0.75
+    bool hostSync = false;       // false = NOTE, true = HOST
+    bool restart = true;         // chaque pas fait repartir sa source de sa phase
+    float xfadeMs = 2.0f;        // fondu entre deux sources
+    int manual = 1;              // source jouée quand le séquenceur est éteint (1..8)
+    std::array<int, maxSteps> pattern {};   // 0 = OFF, 1..8 = source
 };
 
 struct Settings
@@ -58,11 +79,13 @@ struct Settings
     // Voix
     bool mono = false;
     float glideMs = 60.0f;
-    float velocity = 0.5f;       // 0 = la vélocité ne compte pas, 1 = pleine plage
+    float velocity = 0.5f;
     int transpose = 0;
 
     // FM
     float fmLevel = 0.7f, fmRatio = 2.0f, fmIndex = 3.0f, fmFeedback = 0.0f, fmEnv = 0.3f;
+    ModWave modWave = ModWave::sine;
+    float timbre = 0.3f;
 
     // Oscillateur
     float oscLevel = 0.4f;
@@ -70,15 +93,16 @@ struct Settings
     int oscOctave = 0;
     float oscDetune = 0.0f;      // centièmes
     float oscPw = 0.5f;
+    float oscSync = 0.0f;        // 0..1 -> l'oscillateur esclave monte jusqu'à 4 octaves
 
     float noise = 0.0f;
 
     // Filtre
     FilterType filterType = FilterType::lowpass;
     bool slope24 = true;
-    float cutoff = 1200.0f;      // Hz
-    float resonance = 0.35f;     // 0..1
-    float filterEnv = 0.3f;      // -1..1 -> ±6 octaves
+    float cutoff = 1200.0f;
+    float resonance = 0.35f;
+    float filterEnv = 0.3f;
     float keyTrack = 0.5f;
 
     // Enveloppes (secondes, sustain 0..1)
@@ -90,16 +114,23 @@ struct Settings
     float drive = 0.0f;
     bool drivePost = false;
 
-    float level = 1.0f;          // gain linéaire de sortie
+    float level = 1.0f;
 
-    std::array<SeqSettings, numSeqs> seq {};
+    // Modulation
+    std::array<LfoSettings, numLfos> lfo {};
+    std::array<ChaosSettings, numChaos> chaos {};
+    SeqSettings seq {};
+    std::array<int, numSlots> slotSource {};                  // 0 = SEQ, 1..8 = source de la banque
+    std::array<Dest, numSlots> slotDest { Dest::off, Dest::off, Dest::off, Dest::off };
+    std::array<float, numSlots> slotAmount {};                 // -1..1
 };
 
 //==============================================================================
-/** Position dans un séquenceur : pas en cours, avancée dans le pas (0..1) et durée du pas (noires). */
+/** Position dans le séquenceur : pas, début du pas (noires), avancée (0..1), durée du pas. */
 struct StepPos
 {
     int step = 0;
+    double start = 0.0;
     double frac = 0.0;
     double lengthBeats = 0.25;
 };
@@ -119,6 +150,7 @@ inline StepPos stepAt (double beats, int steps, double stepBeats, double swing)
 
     long long index = (long long) pair * 2;
     StepPos pos;
+    pos.start = pair * pairLength;
 
     if (r < first)
     {
@@ -129,6 +161,7 @@ inline StepPos stepAt (double beats, int steps, double stepBeats, double swing)
     {
         ++index;
         r -= first;
+        pos.start += first;
         pos.frac = second > 0.0 ? r / second : 0.0;
         pos.lengthBeats = second;
     }
@@ -136,18 +169,6 @@ inline StepPos stepAt (double beats, int steps, double stepBeats, double swing)
     pos.step = (int) (index % steps);
     pos.frac = std::clamp (pos.frac, 0.0, 1.0);
     return pos;
-}
-
-/** Valeur brute du séquenceur (avant lissage) : la valeur du pas, ou un glissement vers le suivant. */
-inline float rawSeqValue (const SeqSettings& s, const StepPos& p)
-{
-    const int n = std::clamp (s.steps, 1, maxSteps);
-    const float a = s.value[(size_t) p.step];
-    if (! s.glide[(size_t) p.step])
-        return a;
-
-    const float b = s.value[(size_t) ((p.step + 1) % n)];
-    return a + (b - a) * (float) p.frac;
 }
 
 //==============================================================================
@@ -181,122 +202,258 @@ struct Rng
     bool chance (double p)           { return uniform() < p; }
 };
 
+/** Valeur pseudo-aléatoire stable dans -1..1 pour un index (sert aux CHAOS). */
+inline float hashValue (uint64_t seed, int64_t index)
+{
+    uint64_t x = seed ^ ((uint64_t) index * 0x9E3779B97F4A7C15ull);
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27; x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return (float) ((double) (x >> 11) * (2.0 / 9007199254740992.0) - 1.0);
+}
+
 //==============================================================================
-/** Motifs aléatoires « musicaux » pour un séquenceur : valeurs + glides sur les 32 pas. */
+/** Sources de modulation et sortie du séquenceur : fonctions pures du temps (en noires). */
+struct Mod
+{
+    static float lfoShape (LfoShape shape, double p)
+    {
+        switch (shape)
+        {
+            case LfoShape::triangle: return (float) (p < 0.25 ? 4.0 * p : p < 0.75 ? 2.0 - 4.0 * p : 4.0 * p - 4.0);
+            case LfoShape::saw:      return (float) (2.0 * p - 1.0);
+            case LfoShape::ramp:     return (float) (1.0 - 2.0 * p);
+            case LfoShape::square:   return p < 0.5 ? 1.0f : -1.0f;
+            case LfoShape::pulse:    return p < 0.25 ? 1.0f : -1.0f;
+            case LfoShape::expDown:
+            {
+                // Chute rapide puis queue : le « pew » des lasers hi-tech
+                constexpr double k = 6.0, e = 0.0024787521766663585;   // exp (-6)
+                return (float) (2.0 * (std::exp (-k * p) - e) / (1.0 - e) - 1.0);
+            }
+            case LfoShape::expUp:
+            {
+                constexpr double k = 6.0, e = 0.0024787521766663585;
+                return (float) (2.0 * (std::exp (-k * (1.0 - p)) - e) / (1.0 - e) - 1.0);
+            }
+            case LfoShape::sine:
+            case LfoShape::count:
+            default:                 return (float) std::sin (twoPi * p);
+        }
+    }
+
+    static float lfo (const LfoSettings& l, double t)
+    {
+        const double period = std::max (l.periodBeats, 1.0e-4);
+        double p = t / period + (double) l.phase;
+        p -= std::floor (p);
+        if (l.steps > 1)
+            p = std::floor (p * l.steps) / l.steps;
+
+        float v = lfoShape (l.shape, p);
+        if (l.unipolar)
+            v = 0.5f * (v + 1.0f);
+        return v * l.amount;
+    }
+
+    static float chaos (const ChaosSettings& c, double t, uint64_t seed)
+    {
+        const double period = std::max (c.periodBeats, 1.0e-4);
+        const double x = std::max (0.0, t) / period;
+        const double index = std::floor (x);
+        const double f = x - index;
+        const float a = hashValue (seed, (int64_t) index);
+
+        float w = 0.0f;
+        if (c.smooth > 0.0f)
+        {
+            const double s = std::clamp ((double) c.smooth, 0.0, 1.0);
+            const double u = std::clamp ((f - (1.0 - s)) / s, 0.0, 1.0);
+            w = (float) (0.5 - 0.5 * std::cos (pi * u));
+        }
+
+        const float b = w > 0.0f ? hashValue (seed, (int64_t) index + 1) : a;
+        return (a + (b - a) * w) * c.amount;
+    }
+
+    /** src : 0 = rien, 1..6 = LFO (temps local), 7..8 = CHAOS (temps absolu). */
+    static float source (const Settings& s, int src, double tLocal, double tAbs, uint64_t chaosSeed)
+    {
+        if (src >= 1 && src <= numLfos)
+            return lfo (s.lfo[(size_t) (src - 1)], tLocal);
+        if (src > numLfos && src <= numSources)
+        {
+            const int c = src - numLfos - 1;
+            return chaos (s.chaos[(size_t) c], tAbs, chaosSeed + (uint64_t) c * 0x5851F42D4C957F2Dull);
+        }
+        return 0.0f;
+    }
+
+    struct SeqOut
+    {
+        float value = 0.0f;
+        int step = -1;
+        int source = 0;
+    };
+
+    /** Sortie du séquenceur au temps t (noires depuis la note, ou position du morceau). */
+    static SeqOut seq (const Settings& s, double t, double bpm, uint64_t chaosSeed)
+    {
+        const auto& q = s.seq;
+        SeqOut out;
+        t = std::max (0.0, t);
+
+        if (! q.on)
+        {
+            out.source = std::clamp (q.manual, 0, numSources);
+            out.value = source (s, out.source, t, t, chaosSeed);
+            return out;
+        }
+
+        const int n = std::clamp (q.steps, 1, maxSteps);
+        const auto pos = stepAt (t, n, q.stepBeats, q.swing);
+        out.step = pos.step;
+        out.source = std::clamp (q.pattern[(size_t) pos.step], 0, numSources);
+        out.value = source (s, out.source, q.restart ? t - pos.start : t, t, chaosSeed);
+
+        // Fondu depuis la source du pas précédent
+        const double secondsPerBeat = 60.0 / std::clamp (bpm, 20.0, 999.0);
+        const double xfade = 0.001 * (double) std::max (0.0f, q.xfadeMs);
+        const double sinceStart = (t - pos.start) * secondsPerBeat;
+
+        if (xfade > 0.0 && pos.start > 1.0e-9 && sinceStart < xfade)
+        {
+            const auto prev = stepAt (pos.start - 1.0e-7, n, q.stepBeats, q.swing);
+            const int prevSource = std::clamp (q.pattern[(size_t) prev.step], 0, numSources);
+            const float pv = source (s, prevSource, q.restart ? t - prev.start : t, t, chaosSeed);
+            double w = sinceStart / xfade;
+            w = w * w * (3.0 - 2.0 * w);
+            out.value = pv + (out.value - pv) * (float) w;
+        }
+
+        return out;
+    }
+};
+
+//==============================================================================
+/** Motifs aléatoires pour le séquenceur : quelle source joue sur chaque pas. */
 struct RandomPattern
 {
-    enum Style { levels = 0, walk, ramps, accents, mirror, chaos, numStyles };
+    enum Style { runs = 0, alternate, euclid, scatter, mirror, numStyles };
 
     static const char* styleName (int s)
     {
-        static const char* names[] = { "LEVELS", "WALK", "RAMPS", "ACCENTS", "MIRROR", "CHAOS" };
+        static const char* names[] = { "RUNS", "ALTERNATE", "EUCLID", "SCATTER", "MIRROR" };
         return names[std::clamp (s, 0, (int) numStyles - 1)];
     }
 
-    /** Remplit values / glides. steps = longueur actuelle (le motif est pensé pour elle,
-        les pas au-delà prolongent le motif). Renvoie le style tiré. */
-    static int generate (Rng& rng, int steps, std::array<float, maxSteps>& values, std::array<bool, maxSteps>& glides,
-                         int forcedStyle = -1)
+    /** available : sources utilisables (1..8). Remplit les 32 pas ; renvoie le style tiré. */
+    static int generate (Rng& rng, int steps, const std::array<bool, numSources + 1>& available,
+                         std::array<int, maxSteps>& pattern, int forcedStyle = -1)
     {
         steps = std::clamp (steps, 1, maxSteps);
+
+        std::array<int, numSources> pool {};
+        int poolSize = 0;
+        for (int i = 1; i <= numSources; ++i)
+            if (available[(size_t) i])
+                pool[(size_t) poolSize++] = i;
+        if (poolSize == 0)
+            for (int i = 1; i <= numSources; ++i)
+                pool[(size_t) poolSize++] = i;
+
+        // Mélange, puis on garde 2 à 5 sources pour que le motif ait une identité
+        for (int i = poolSize - 1; i > 0; --i)
+            std::swap (pool[(size_t) i], pool[(size_t) rng.range (0, i)]);
+        const int used = std::min (poolSize, rng.range (2, 5));
+        auto pick = [&] { return pool[(size_t) rng.range (0, std::max (0, used - 1))]; };
+
         const int style = forcedStyle >= 0 ? std::min (forcedStyle, (int) numStyles - 1) : rng.range (0, numStyles - 1);
-        double glideChance = 0.15;
 
         switch (style)
         {
-            case levels:
+            case runs:
             {
-                // Quelques niveaux bien distincts, sauts francs
-                const int numLevels = rng.range (3, 6);
-                for (int i = 0; i < maxSteps; ++i)
-                    values[(size_t) i] = (float) rng.range (0, numLevels - 1) / (float) (numLevels - 1);
-                glideChance = 0.1;
-                break;
-            }
-
-            case walk:
-            {
-                // Marche aléatoire : la valeur bouge un peu à chaque pas
-                float v = rng.uniformf();
-                const float stepSize = 0.12f + 0.3f * rng.uniformf();
-                for (int i = 0; i < maxSteps; ++i)
+                // Une source tenue 1 à 4 pas, puis une autre
+                int i = 0;
+                int last = -1;
+                while (i < maxSteps)
                 {
-                    values[(size_t) i] = v;
-                    v += (rng.uniformf() * 2.0f - 1.0f) * stepSize;
-                    if (v < 0.0f) v = -v;
-                    if (v > 1.0f) v = 2.0f - v;
-                    v = std::clamp (v, 0.0f, 1.0f);
+                    int src = pick();
+                    if (src == last && used > 1) src = pick();
+                    const int len = rng.range (1, 4);
+                    for (int k = 0; k < len && i < maxSteps; ++k)
+                        pattern[(size_t) i++] = src;
+                    last = src;
                 }
-                glideChance = 0.35;
                 break;
             }
 
-            case ramps:
+            case alternate:
             {
-                // Rampes qui montent ou descendent sur 2, 3, 4, 6 ou 8 pas (polyrythmie contre la mesure)
-                static const int periods[] = { 2, 3, 4, 6, 8 };
-                const int period = periods[rng.range (0, 4)];
-                const bool up = rng.chance (0.5);
-                const float lo = 0.1f * rng.uniformf(), hi = 0.7f + 0.3f * rng.uniformf();
+                // ABAB, ABAC, ABCB… sur une cellule de 2 à 4 pas
+                const int cell = rng.range (2, 4);
+                std::array<int, 4> motif {};
+                for (int k = 0; k < cell; ++k)
+                    motif[(size_t) k] = pool[(size_t) (k % std::max (1, used))];
+                if (cell >= 3 && rng.chance (0.5))
+                    motif[2] = motif[0];
                 for (int i = 0; i < maxSteps; ++i)
-                {
-                    float t = (float) (i % period) / (float) std::max (1, period - 1);
-                    if (! up) t = 1.0f - t;
-                    values[(size_t) i] = lo + (hi - lo) * t;
-                }
-                glideChance = 0.6;
+                    pattern[(size_t) i] = motif[(size_t) (i % cell)];
                 break;
             }
 
-            case accents:
+            case euclid:
             {
-                // Base basse + pics répartis à la façon d'un rythme euclidien
+                // Une source de fond, une autre répartie à la façon d'un rythme euclidien
+                const int base = pool[0];
+                const int hit = used > 1 ? pool[1] : pool[0];
+                const int third = used > 2 ? pool[2] : hit;
                 const int pulses = std::max (1, rng.range (std::max (1, steps / 5), std::max (1, steps / 2)));
                 const int rotation = rng.range (0, steps - 1);
-                const float base = 0.05f + 0.25f * rng.uniformf();
                 for (int i = 0; i < maxSteps; ++i)
                 {
                     const int k = (i + rotation) % steps;
-                    const bool hit = ((k * pulses) % steps) < pulses;
-                    values[(size_t) i] = hit ? 0.65f + 0.35f * rng.uniformf() : base + 0.1f * rng.uniformf();
+                    const bool on = ((k * pulses) % steps) < pulses;
+                    pattern[(size_t) i] = on ? (rng.chance (0.25) ? third : hit) : base;
                 }
-                glideChance = 0.08;
                 break;
             }
 
             case mirror:
             {
-                // Un motif court répété, la seconde moitié en miroir
                 const int half = std::max (2, (steps + 1) / 2);
-                std::array<float, maxSteps> motif {};
+                std::array<int, maxSteps> motif {};
                 for (int i = 0; i < half; ++i)
-                    motif[(size_t) i] = rng.uniformf();
+                    motif[(size_t) i] = pick();
                 for (int i = 0; i < maxSteps; ++i)
                 {
                     const int j = i % (2 * half);
-                    values[(size_t) i] = j < half ? motif[(size_t) j] : motif[(size_t) (2 * half - 1 - j)];
+                    pattern[(size_t) i] = j < half ? motif[(size_t) j] : motif[(size_t) (2 * half - 1 - j)];
                 }
-                glideChance = 0.2;
                 break;
             }
 
+            case scatter:
             default:
             {
-                // Suite logistique : chaotique mais pas un bruit blanc
-                double x = 0.1 + 0.8 * rng.uniform();
-                const double r = 3.6 + 0.399 * rng.uniform();
                 for (int i = 0; i < maxSteps; ++i)
-                {
-                    x = r * x * (1.0 - x);
-                    values[(size_t) i] = (float) std::clamp (x, 0.0, 1.0);
-                }
-                glideChance = 0.15;
+                    pattern[(size_t) i] = rng.chance (0.08) ? 0 : pick();
                 break;
             }
         }
 
-        for (int i = 0; i < maxSteps; ++i)
-            glides[(size_t) i] = rng.chance (glideChance);
+        // Jamais une boucle entièrement muette ou d'une seule source
+        bool varied = false, anySound = false;
+        for (int i = 0; i < steps; ++i)
+        {
+            anySound = anySound || pattern[(size_t) i] != 0;
+            varied = varied || pattern[(size_t) i] != pattern[0];
+        }
+        if (! anySound)
+            pattern[0] = pool[0];
+        if (! varied && steps > 1 && used > 1)
+            pattern[(size_t) (steps / 2)] = pattern[0] == pool[0] ? pool[1] : pool[0];
 
         return style;
     }
@@ -312,22 +469,34 @@ namespace detail
         return x * (27.0f + x2) / (27.0f + 9.0f * x2);
     }
 
-    inline double polyBlep (double t, double dt)
-    {
-        if (t < dt)
-        {
-            t /= dt;
-            return t + t - t * t - 1.0;
-        }
-        if (t > 1.0 - dt)
-        {
-            t = (t - 1.0) / dt;
-            return t * t + t + t + 1.0;
-        }
-        return 0.0;
-    }
-
     inline float noteToHz (double note)     { return (float) (440.0 * std::exp2 ((note - 69.0) / 12.0)); }
+
+    /** Formes de la modulante FM. p = phase 0..1, timbre 0..1. */
+    inline double modWave (ModWave w, double p, double timbre)
+    {
+        switch (w)
+        {
+            case ModWave::dblSine:  return 0.57 * (std::sin (twoPi * p) + std::sin (2.0 * twoPi * p));
+            case ModWave::saw:      return 2.0 * p - 1.0;
+            case ModWave::square:   return p < 0.5 ? 1.0 : -1.0;
+            case ModWave::pulse:    return p < 0.5 - 0.42 * timbre ? 1.0 : -1.0;
+            case ModWave::sawPulse: return p < 0.5 ? 4.0 * p - 1.0 : -1.0;
+            case ModWave::reso1:
+            case ModWave::reso2:
+            case ModWave::reso3:
+            {
+                // Résonance façon Casio CZ : un cosinus rapide dans une fenêtre qui se referme
+                const double r = 1.0 + 15.0 * timbre;
+                double window = 1.0 - p;                                          // RESO 1 : dent de scie
+                if (w == ModWave::reso2) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;   // RESO 2 : triangle
+                if (w == ModWave::reso3) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;      // RESO 3 : trapèze
+                return std::cos (twoPi * r * p) * window;
+            }
+            case ModWave::sine:
+            case ModWave::count:
+            default:                return std::sin (twoPi * p);
+        }
+    }
 }
 
 //==============================================================================
@@ -366,7 +535,6 @@ public:
     void reset()                                  { stage = idle; value = 0.0; }
     bool isActive() const noexcept                { return stage != idle; }
     bool isReleasing() const noexcept             { return stage == release; }
-    Stage getStage() const noexcept               { return stage; }
 
     float next()
     {
@@ -381,7 +549,6 @@ public:
                 if (std::abs (value - sustainLevel) < 1.0e-5) { value = sustainLevel; stage = sustain; }
                 break;
             case sustain:
-                // Le sustain peut bouger pendant que la note est tenue
                 value += (sustainLevel - value) * 0.002;
                 break;
             case release:
@@ -399,7 +566,6 @@ public:
 private:
     double coefFor (float seconds) const
     {
-        // -80 dB au bout de la durée choisie
         return std::exp (-9.21 / (std::max (0.0005, (double) seconds) * sampleRate));
     }
 
@@ -430,7 +596,7 @@ struct Svf
 
         switch (type)
         {
-            case FilterType::bandpass: return v1 * k;      // gain 1 à la fréquence de coupure
+            case FilterType::bandpass: return v1 * k;
             case FilterType::highpass: return x - k * v1 - v2;
             case FilterType::lowpass:
             default:                   return v2;
@@ -439,23 +605,130 @@ struct Svf
 };
 
 //==============================================================================
+/** Oscillateur avec hard sync, sauts corrigés par polyBLEP (sortie retardée d'un échantillon). */
+class SyncOscillator
+{
+public:
+    void reset()          { master = slave = 0.0; pending = 0.0; }
+
+    /** dtMaster : fréquence de l'oscillateur maître / fe ; dtSlave : celle de l'esclave (>= maître). */
+    double process (Wave wave, double dtMaster, double dtSlave, double pw, bool sync)
+    {
+        double current = 0.0;   // corrections pour l'échantillon qui sort au prochain appel
+        double tStart = 0.0;    // temps déjà parcouru dans cet échantillon (0..1)
+
+        if (sync)
+        {
+            const double masterNext = master + dtMaster;
+            if (masterNext >= 1.0)
+            {
+                const double ts = std::clamp ((1.0 - master) / dtMaster, 0.0, 1.0);
+                advance (wave, dtSlave, pw, tStart, ts, current);
+                // Saut vers la phase 0 au moment du sync
+                const double before = naive (wave, slave, pw), after = naive (wave, 0.0, pw);
+                addStep (after - before, 1.0 - ts, current);
+                slave = 0.0;
+                tStart = ts;
+                master = masterNext - 1.0;
+            }
+            else
+                master = masterNext;
+        }
+        else
+        {
+            master = slave;   // reste aligné pour un sync sans clic quand on l'allume
+        }
+
+        advance (wave, dtSlave, pw, tStart, 1.0, current);
+
+        const double value = naive (wave, slave, pw) + current;
+        const double out = pending;
+        pending = value;
+        return out;
+    }
+
+private:
+    static double naive (Wave wave, double p, double pw)
+    {
+        switch (wave)
+        {
+            case Wave::saw:      return 2.0 * p - 1.0;
+            case Wave::square:   return p < pw ? 1.0 : -1.0;
+            case Wave::triangle: return p < 0.5 ? 4.0 * p - 1.0 : 3.0 - 4.0 * p;
+            case Wave::sine:
+            default:             return std::sin (twoPi * p);
+        }
+    }
+
+    /** Saut de hauteur h ; d = avance de l'échantillon qui sort ensuite après le saut (0..1). */
+    void addStep (double h, double d, double& current)
+    {
+        d = std::clamp (d, 0.0, 1.0);
+        pending += 0.5 * h * d * d;
+        current -= 0.5 * h * (1.0 - d) * (1.0 - d);
+    }
+
+    /** Avance la phase esclave de t0 à t1 (fractions de l'échantillon), en corrigeant ses sauts. */
+    void advance (Wave wave, double dt, double pw, double t0, double t1, double& current)
+    {
+        double remaining = (t1 - t0) * dt;
+        double t = t0;
+
+        for (int guard = 0; guard < 4 && remaining > 0.0; ++guard)
+        {
+            // Prochain saut naturel : passage par pw (carré) ou fin de cycle
+            double edge = 1.0;
+            double h = 0.0;
+            bool wrap = true;
+
+            if (wave == Wave::square && slave < pw)
+            {
+                edge = pw;
+                wrap = false;
+            }
+
+            const double toEdge = edge - slave;
+            if (toEdge > remaining)
+            {
+                slave += remaining;
+                return;
+            }
+
+            t += toEdge / dt;
+            remaining -= toEdge;
+
+            if (wave == Wave::saw)              h = -2.0;
+            else if (wave == Wave::square)      h = wrap ? 2.0 : -2.0;
+
+            if (h != 0.0)
+                addStep (h, 1.0 - t, current);
+
+            slave = wrap ? 0.0 : edge;
+        }
+
+        slave = std::min (slave + remaining, 0.999999);
+    }
+
+    double master = 0.0, slave = 0.0, pending = 0.0;
+};
+
+//==============================================================================
 /** Valeurs lissées partagées par toutes les voix (évite les « escaliers » quand on tourne un potard). */
 struct Smoothed
 {
-    float fmLevel = 0, fmRatio = 1, fmIndex = 0, fmFeedback = 0, fmEnv = 0;
-    float oscLevel = 0, oscPw = 0.5f, oscDetune = 0, noise = 0;
+    float fmLevel = 0, fmRatio = 1, fmIndex = 0, fmFeedback = 0, fmEnv = 0, timbre = 0;
+    float oscLevel = 0, oscPw = 0.5f, oscDetune = 0, oscSync = 0, noise = 0;
     float logCutoff = 10, resonance = 0, filterEnv = 0, keyTrack = 0;
     float drive = 0, level = 1;
+    float logCutoffTarget = 10;
 
     void snap (const Settings& s)
     {
-        fmLevel = s.fmLevel; fmRatio = s.fmRatio; fmIndex = s.fmIndex; fmFeedback = s.fmFeedback; fmEnv = s.fmEnv;
-        oscLevel = s.oscLevel; oscPw = s.oscPw; oscDetune = s.oscDetune; noise = s.noise;
-        logCutoff = std::log2 (std::max (1.0f, s.cutoff)); resonance = s.resonance; filterEnv = s.filterEnv;
+        fmLevel = s.fmLevel; fmRatio = s.fmRatio; fmIndex = s.fmIndex; fmFeedback = s.fmFeedback; fmEnv = s.fmEnv; timbre = s.timbre;
+        oscLevel = s.oscLevel; oscPw = s.oscPw; oscDetune = s.oscDetune; oscSync = s.oscSync; noise = s.noise;
+        logCutoff = logCutoffTarget = std::log2 (std::max (1.0f, s.cutoff)); resonance = s.resonance; filterEnv = s.filterEnv;
         keyTrack = s.keyTrack; drive = s.drive; level = s.level;
     }
-
-    float logCutoffTarget = 10;
 
     void setTargets (const Settings& s)              { logCutoffTarget = std::log2 (std::max (1.0f, s.cutoff)); }
 
@@ -463,7 +736,8 @@ struct Smoothed
     {
         auto f = [c] (float& v, float target) { v += (target - v) * c; };
         f (fmLevel, s.fmLevel); f (fmRatio, s.fmRatio); f (fmIndex, s.fmIndex); f (fmFeedback, s.fmFeedback); f (fmEnv, s.fmEnv);
-        f (oscLevel, s.oscLevel); f (oscPw, s.oscPw); f (oscDetune, s.oscDetune); f (noise, s.noise);
+        f (timbre, s.timbre);
+        f (oscLevel, s.oscLevel); f (oscPw, s.oscPw); f (oscDetune, s.oscDetune); f (oscSync, s.oscSync); f (noise, s.noise);
         f (logCutoff, logCutoffTarget); f (resonance, s.resonance); f (filterEnv, s.filterEnv);
         f (keyTrack, s.keyTrack); f (drive, s.drive); f (level, s.level);
     }
@@ -478,6 +752,7 @@ public:
         sampleRate = sr;
         ampEnv.setSampleRate (sr);
         modEnv.setSampleRate (sr);
+        slotCoef = (float) (1.0 - std::exp (-1.0 / (0.0004 * sr)));   // anti-clic de 0,4 ms
         reset();
     }
 
@@ -487,21 +762,24 @@ public:
         modEnv.reset();
         note = -1;
         held = false;
-        carrierPhase = modPhase = oscPhase = 0.0;
+        carrierPhase = modPhase = 0.0;
         fbPrev1 = fbPrev2 = 0.0;
-        triState = -1.0;
+        osc.reset();
         for (auto& f : filters) f.reset();
         crushHold = 0.0f;
         crushCounter = 0.0;
-        for (auto& v : seqSmoothed) v = 0.0f;
+        slotValue.fill (0.0f);
         seqBeats = 0.0;
+        lastStep = -1;
+        lastSeqValue = 0.0f;
     }
 
     bool isActive() const noexcept           { return ampEnv.isActive(); }
     bool isReleasing() const noexcept        { return ampEnv.isReleasing(); }
 
-    /** retrigger = enveloppes et séquenceurs repartent ; sinon legato (seule la hauteur change). */
-    void start (int midiNote, float vel, const Settings& s, bool retrigger, bool glide, uint64_t order, float panPosition)
+    /** retrigger = enveloppes et séquenceur repartent ; sinon legato (seule la hauteur change). */
+    void start (int midiNote, float vel, const Settings& s, bool retrigger, bool glide, uint64_t order, float panPosition,
+                uint64_t newChaosSeed)
     {
         const bool wasActive = isActive();
         note = midiNote;
@@ -518,11 +796,9 @@ public:
             velocity = std::clamp (vel, 0.0f, 1.0f);
             if (! wasActive)
             {
-                // Voix au repos : phases à zéro -> attaques identiques d'une note à l'autre
                 carrierPhase = modPhase = 0.0;
-                oscPhase = 0.0;
                 fbPrev1 = fbPrev2 = 0.0;
-                triState = -1.0;
+                osc.reset();
                 for (auto& f : filters) f.reset();
             }
             ampEnv.noteOn (s.ampA, s.ampD, s.ampS);
@@ -530,6 +806,7 @@ public:
             ampEnv.setTimes (s.ampA, s.ampD, s.ampS, s.ampR);
             modEnv.setTimes (s.modA, s.modD, s.modS, s.modR);
             seqBeats = 0.0;
+            chaosSeed = newChaosSeed;
             firstSample = true;
         }
     }
@@ -543,7 +820,6 @@ public:
 
     void kill()                              { reset(); }
 
-    /** Durées des enveloppes : suivent les potards même pendant une note. */
     void updateTimes (const Settings& s)
     {
         ampEnv.setTimes (s.ampA, s.ampD, s.ampS, s.ampR);
@@ -552,58 +828,48 @@ public:
 
     void setGlideTarget (int midiNote)       { note = midiNote; targetNote = (double) midiNote; }
 
-    /** Rend un échantillon (stéréo, ajouté à l'entrée). beatsInc = noires par échantillon,
-        hostBeats = position commune (mode HOST). */
-    void render (const Settings& s, const Smoothed& sm, float& outL, float& outR, double beatsInc, double hostBeats,
-                 double glideCoef, float pitchBend, uint64_t& noiseState)
+    void render (const Settings& s, const Smoothed& sm, float& outL, float& outR, double beatsInc, double bpm,
+                 double hostBeats, double glideCoef, float pitchBend, uint64_t& noiseState, uint64_t hostChaosSeed)
     {
         if (! isActive())
             return;
 
-        // --- Hauteur (glide) ----------------------------------------------------
         currentNote += (targetNote - currentNote) * glideCoef;
 
-        // --- Séquenceurs de LFO -------------------------------------------------
+        // --- Modulation ---------------------------------------------------------
         std::array<float, (size_t) Dest::count> add {};
         float ampGain = 1.0f;
-
-        for (int q = 0; q < numSeqs; ++q)
         {
-            const auto& seq = s.seq[(size_t) q];
-            if (! seq.on)
-                continue;
+            const bool host = s.seq.hostSync;
+            const double t = host ? hostBeats : seqBeats;
+            const uint64_t seed = host ? hostChaosSeed : chaosSeed;
 
-            const double beats = seq.hostSync ? hostBeats : seqBeats;
-            const auto pos = stepAt (beats, seq.steps, seq.stepBeats, seq.swing);
-            lastStep[(size_t) q] = pos.step;
-            const float raw = rawSeqValue (seq, pos);
-
-            // Lissage : 0,5 ms minimum (pas de clic), jusqu'à la moitié d'un pas
-            const double stepSeconds = beatsInc > 0.0 ? pos.lengthBeats / (beatsInc * sampleRate) : 0.1;
-            const double tau = std::max (0.0005, (double) seq.smooth * 0.5 * stepSeconds);
-            if (std::abs (tau - lastTau[(size_t) q]) > 1.0e-12)
-            {
-                lastTau[(size_t) q] = tau;
-                seqCoef[(size_t) q] = (float) (1.0 - std::exp (-1.0 / (tau * sampleRate)));
-            }
-            const float coef = seqCoef[(size_t) q];
-            float& v = seqSmoothed[(size_t) q];
-            if (firstSample)
-                v = raw;
-            else
-                v += (raw - v) * coef;
+            // Le séquenceur tourne toujours (tête de lecture affichée même sans routage)
+            const auto out = Mod::seq (s, t, bpm, seed);
+            const float seqValue = out.value;
+            lastStep = out.step;
+            lastSeqValue = out.value;
 
             for (int k = 0; k < numSlots; ++k)
             {
-                const auto d = seq.dest[(size_t) k];
-                const float amt = seq.amount[(size_t) k];
-                if (d == Dest::off || std::abs (amt) < 1.0e-6f)
-                    continue;
+                const auto d = s.slotDest[(size_t) k];
+                const float amt = s.slotAmount[(size_t) k];
+                float target = 0.0f;
 
-                if (d == Dest::amp)
-                    ampGain *= amt > 0.0f ? 1.0f - amt * (1.0f - v) : 1.0f + amt * v;
-                else
-                    add[(size_t) d] += amt * v;
+                if (d != Dest::off && std::abs (amt) > 1.0e-6f)
+                {
+                    const int src = s.slotSource[(size_t) k];
+                    const float v = src == 0 ? seqValue : Mod::source (s, src, t, t, seed);
+                    target = amt * v;
+                }
+
+                float& sv = slotValue[(size_t) k];
+                sv = firstSample ? target : sv + (target - sv) * slotCoef;
+
+                if (d == Dest::amp && std::abs (amt) > 1.0e-6f)
+                    ampGain *= std::clamp (amt > 0.0f ? 1.0f - amt + sv : 1.0f + sv, 0.0f, 1.0f);
+                else if (d != Dest::off)
+                    add[(size_t) d] += sv;
             }
         }
 
@@ -612,17 +878,15 @@ public:
 
         auto mod = [&add] (Dest d) { return add[(size_t) d]; };
 
-        // --- Enveloppes ---------------------------------------------------------
         const float ampLevel = ampEnv.next();
         const float modLevel = modEnv.next();
 
-        // --- Hauteur finale -----------------------------------------------------
-        const double pitchMod = std::round (mod (Dest::pitch) * 24.0f) + mod (Dest::fine) * 12.0f;
-        const double playedNote = currentNote + s.transpose + pitchBend + pitchMod;
+        // --- Hauteur -------------------------------------------------------------
+        const double playedNote = currentNote + s.transpose + pitchBend + 24.0 * mod (Dest::pitch);
         const double nyquist = 0.5 * sampleRate;
         const double freq = std::min ((double) detail::noteToHz (playedNote), nyquist * 0.98);
 
-        // --- FM ----------------------------------------------------------------
+        // --- FM ------------------------------------------------------------------
         double fm = 0.0;
         const float fmLevel = std::clamp (sm.fmLevel + mod (Dest::fmLevel), 0.0f, 1.0f);
         if (fmLevel > 0.0f)
@@ -631,10 +895,15 @@ public:
             const double modFreq = freq * ratio;
             const double index = std::clamp ((double) sm.fmIndex + 10.0 * (sm.fmEnv * modLevel + mod (Dest::fmIndex)), 0.0, 20.0);
             const double fb = std::clamp ((double) sm.fmFeedback + mod (Dest::feedback), 0.0, 1.0);
+            const double timbre = std::clamp ((double) sm.timbre + mod (Dest::timbre), 0.0, 1.0);
 
             double modOut = 0.0;
             if (modFreq < nyquist)
-                modOut = std::sin (twoPi * modPhase + fb * 1.4 * 0.5 * (fbPrev1 + fbPrev2));
+            {
+                double p = modPhase + fb * 1.4 * 0.5 * (fbPrev1 + fbPrev2) / twoPi;
+                p -= std::floor (p);
+                modOut = detail::modWave (s.modWave, p, timbre);
+            }
             fbPrev2 = fbPrev1;
             fbPrev1 = modOut;
 
@@ -646,55 +915,19 @@ public:
         carrierPhase += freq / sampleRate;
         carrierPhase -= std::floor (carrierPhase);
 
-        // --- Oscillateur analogique ----------------------------------------------
-        double osc = 0.0;
+        // --- Oscillateur (hard sync) ---------------------------------------------------
+        double analog = 0.0;
         const float oscLevel = std::clamp (sm.oscLevel + mod (Dest::oscLevel), 0.0f, 1.0f);
         {
-            const double oscFreq = std::min (freq * std::exp2 ((double) s.oscOctave + sm.oscDetune / 1200.0), nyquist * 0.98);
-            const double dt = oscFreq / sampleRate;
-
-            if (oscLevel > 0.0f)
-            {
-                const double t = oscPhase;
-                switch (s.oscWave)
-                {
-                    case Wave::saw:
-                        osc = 2.0 * t - 1.0 - detail::polyBlep (t, dt);
-                        break;
-                    case Wave::square:
-                    case Wave::triangle:
-                    {
-                        const double pw = s.oscWave == Wave::triangle ? 0.5
-                                                                      : std::clamp ((double) sm.oscPw + 0.45 * mod (Dest::pulseWidth), 0.05, 0.95);
-                        double sq = t < pw ? 1.0 : -1.0;
-                        sq += detail::polyBlep (t, dt);
-                        double t2 = t - pw;
-                        if (t2 < 0.0) t2 += 1.0;
-                        sq -= detail::polyBlep (t2, dt);
-
-                        if (s.oscWave == Wave::square)
-                            osc = sq;
-                        else
-                        {
-                            // Triangle = carré intégré (fuite légère pour rester centré)
-                            triState = triState * 0.9995 + 4.0 * dt * sq;
-                            osc = triState;
-                        }
-                        break;
-                    }
-                    case Wave::sine:
-                    default:
-                        osc = std::sin (twoPi * t);
-                        break;
-                }
-                osc *= oscLevel;
-            }
-
-            oscPhase += dt;
-            oscPhase -= std::floor (oscPhase);
+            const double masterFreq = std::min (freq * std::exp2 ((double) s.oscOctave + sm.oscDetune / 1200.0), nyquist * 0.9);
+            const double syncAmount = std::clamp ((double) sm.oscSync + mod (Dest::sync), 0.0, 1.0);
+            const double slaveFreq = std::min (masterFreq * std::exp2 (4.0 * syncAmount), nyquist * 0.9);
+            const double pw = std::clamp ((double) sm.oscPw + 0.45 * mod (Dest::pulseWidth), 0.05, 0.95);
+            const double value = osc.process (s.oscWave, masterFreq / sampleRate, slaveFreq / sampleRate, pw, syncAmount > 1.0e-4);
+            analog = value * oscLevel;
         }
 
-        // --- Bruit ----------------------------------------------------------------
+        // --- Bruit ------------------------------------------------------------------
         double noise = 0.0;
         const float noiseLevel = std::clamp (sm.noise + mod (Dest::noise), 0.0f, 1.0f);
         if (noiseLevel > 0.0f)
@@ -705,9 +938,9 @@ public:
             noise = ((double) (noiseState >> 11) * (2.0 / 9007199254740992.0) - 1.0) * noiseLevel;
         }
 
-        double x = 0.6 * (fm + osc + noise);
+        double x = 0.6 * (fm + analog + noise);
 
-        // --- Distorsion / filtre ----------------------------------------------------
+        // --- Distorsion / filtre ------------------------------------------------------
         const float driveAmount = std::clamp (sm.drive + mod (Dest::drive), 0.0f, 1.0f);
         if (! s.drivePost)
             x = shape (x, s.driveType, driveAmount);
@@ -727,9 +960,9 @@ public:
         if (s.drivePost)
             x = shape (x, s.driveType, driveAmount);
 
-        // --- Ampli + panoramique -------------------------------------------------------
+        // --- Ampli + panoramique ------------------------------------------------------
         const float velGain = 1.0f - s.velocity * (1.0f - velocity);
-        const float gain = ampLevel * velGain * std::max (0.0f, ampGain);
+        const float gain = ampLevel * velGain * ampGain;
         const float p = std::clamp (pan + mod (Dest::pan), -1.0f, 1.0f);
         const float angle = (float) (0.25 * pi) * (p + 1.0f);
         const float y = (float) x * gain;
@@ -743,7 +976,9 @@ public:
     int note = -1;
     bool held = false;
     uint64_t startOrder = 0;
-    std::array<int, numSeqs> lastStep {};
+    int lastStep = -1;
+    float lastSeqValue = 0.0f;
+    double seqBeats = 0.0;
 
 private:
     double shape (double x, DriveType type, float amount)
@@ -762,7 +997,6 @@ private:
             }
             case DriveType::crush:
             {
-                // Décimation (jusqu'à ÷32) + réduction de bits (16 -> 3)
                 const double factor = 1.0 + (double) amount * amount * 31.0;
                 crushCounter += 1.0;
                 if (crushCounter >= factor)
@@ -786,14 +1020,15 @@ private:
     Envelope ampEnv, modEnv;
     double targetNote = 60.0, currentNote = 60.0;
     float velocity = 1.0f, pan = 0.0f;
-    double carrierPhase = 0.0, modPhase = 0.0, oscPhase = 0.0;
-    double fbPrev1 = 0.0, fbPrev2 = 0.0, triState = -1.0;
+    double carrierPhase = 0.0, modPhase = 0.0;
+    double fbPrev1 = 0.0, fbPrev2 = 0.0;
+    SyncOscillator osc;
     std::array<Svf, 2> filters {};
     float crushHold = 0.0f;
     double crushCounter = 0.0;
-    std::array<float, numSeqs> seqSmoothed {}, seqCoef {};
-    std::array<double, numSeqs> lastTau { -1.0, -1.0 };
-    double seqBeats = 0.0;
+    std::array<float, numSlots> slotValue {};
+    float slotCoef = 0.05f;
+    uint64_t chaosSeed = 1;
     bool firstSample = true;
 };
 
@@ -833,11 +1068,15 @@ public:
 
     const Settings& getSettings() const noexcept     { return settings; }
 
+    /** Graine des CHAOS en mode HOST (le même morceau rejoue le même chaos). */
+    void setHostChaosSeed (uint64_t seed) noexcept    { hostChaosSeed = seed; }
+
     //==========================================================================
     void noteOn (int midiNote, float velocity)
     {
         midiNote = std::clamp (midiNote, 0, 127);
         ++orderCounter;
+        const uint64_t seed = noteRng.next();
 
         if (settings.mono)
         {
@@ -848,11 +1087,10 @@ public:
             for (size_t i = 1; i < voices.size(); ++i)
                 if (voices[i].isActive()) voices[i].release (settings);
 
-            voices[0].start (midiNote, velocity, settings, ! legato, legato, orderCounter, 0.0f);
+            voices[0].start (midiNote, velocity, settings, ! legato, legato, orderCounter, 0.0f, seed);
             return;
         }
 
-        // Polyphonique : la même note rejoue sur sa voix, sinon une voix libre, sinon la plus ancienne
         Voice* chosen = nullptr;
         for (auto& v : voices)
             if (v.isActive() && v.note == midiNote) { chosen = &v; break; }
@@ -863,17 +1101,15 @@ public:
 
         if (chosen == nullptr)
         {
-            // La plus ancienne en relâchement, sinon la plus ancienne tout court
             for (int pass = 0; pass < 2 && chosen == nullptr; ++pass)
                 for (auto& v : voices)
                     if ((pass == 1 || v.isReleasing()) && (chosen == nullptr || v.startOrder < chosen->startOrder))
                         chosen = &v;
         }
 
-        // Petit étalement stéréo des voix
         static const float spread[] = { 0.0f, -0.18f, 0.18f, -0.09f, 0.09f, -0.27f, 0.27f, 0.0f };
         const auto index = (size_t) (chosen - voices.data());
-        chosen->start (midiNote, velocity, settings, true, false, orderCounter, spread[index % 8]);
+        chosen->start (midiNote, velocity, settings, true, false, orderCounter, spread[index % 8], seed);
     }
 
     void noteOff (int midiNote)
@@ -888,7 +1124,7 @@ public:
             if (heldNotes.empty())
                 v.release (settings);
             else if (v.note == midiNote)
-                v.setGlideTarget (heldNotes.back());   // legato vers la dernière note encore tenue
+                v.setGlideTarget (heldNotes.back());
             return;
         }
 
@@ -912,7 +1148,6 @@ public:
     void setPitchBend (float semitones)               { pitchBend = semitones; }
 
     //==========================================================================
-    /** Transport : tempo (BPM), lecture en cours, position (noires) au premier échantillon rendu. */
     struct Transport
     {
         double bpm = 120.0;
@@ -920,8 +1155,6 @@ public:
         double ppq = 0.0;
     };
 
-    /** Rend numSamples échantillons dans left/right (écrasés). sampleOffset : décalage depuis le début
-        du bloc pour lequel transport.ppq est donné. */
     void render (float* left, float* right, int numSamples, const Transport& transport, int sampleOffset = 0)
     {
         if (! prepared)
@@ -944,13 +1177,13 @@ public:
         {
             smoothed.step (settings, (float) smoothCoef);
 
-            const double hostBeats = transport.playing ? transport.ppq + (double) (sampleOffset + i) * beatsInc : freeBeats;
+            const double hostBeats = transport.playing ? std::max (0.0, transport.ppq + (double) (sampleOffset + i) * beatsInc)
+                                                       : freeBeats;
             float l = 0.0f, r = 0.0f;
 
             for (auto& v : voices)
-                v.render (settings, smoothed, l, r, beatsInc, hostBeats, glideCoef, pitchBend, noiseState);
+                v.render (settings, smoothed, l, r, beatsInc, bpm, hostBeats, glideCoef, pitchBend, noiseState, hostChaosSeed);
 
-            // Coupe le continu (FM avec feedback, distorsion) : passe-haut d'un pôle à ~8 Hz
             const float outL = l - dcInL + dcCoef * dcOutL;
             const float outR = r - dcInR + dcCoef * dcOutR;
             dcInL = l; dcInR = r;
@@ -960,13 +1193,16 @@ public:
             left[i] = dcOutL * smoothed.level;
             right[i] = dcOutR * smoothed.level;
             freeBeats += beatsInc;
+            lastHostBeats = hostBeats;
         }
 
         updatePlayhead();
     }
 
-    /** Pas en cours affiché pour un séquenceur (voix la plus récente ; -1 si rien ne joue). */
-    int getPlayheadStep (int seqIndex) const noexcept     { return playhead[(size_t) std::clamp (seqIndex, 0, numSeqs - 1)]; }
+    /** Pas en cours (voix la plus récente ; -1 si rien ne joue ou séquenceur éteint). */
+    int getPlayheadStep() const noexcept                  { return playheadStep; }
+    /** Temps du séquenceur de la voix la plus récente, en noires (-1 si rien ne joue). */
+    double getPlayheadBeats() const noexcept              { return playheadBeats; }
 
     int activeVoiceCount() const
     {
@@ -974,8 +1210,6 @@ public:
         for (auto& v : voices) n += v.isActive() ? 1 : 0;
         return n;
     }
-
-    double getSampleRate() const noexcept                 { return sampleRate; }
 
 private:
     void updatePlayhead()
@@ -985,8 +1219,8 @@ private:
             if (v.isActive() && (latest == nullptr || v.startOrder > latest->startOrder))
                 latest = &v;
 
-        for (int q = 0; q < numSeqs; ++q)
-            playhead[(size_t) q] = (latest != nullptr && settings.seq[(size_t) q].on) ? latest->lastStep[(size_t) q] : -1;
+        playheadStep = latest != nullptr && settings.seq.on ? latest->lastStep : -1;
+        playheadBeats = latest == nullptr ? -1.0 : (settings.seq.hostSync ? lastHostBeats : latest->seqBeats);
     }
 
     double sampleRate = 48000.0;
@@ -994,6 +1228,7 @@ private:
     Settings settings;
     Smoothed smoothed;
     std::array<Voice, maxVoices> voices {};
+
     struct NoteStack
     {
         std::array<int, 128> notes {};
@@ -1010,13 +1245,17 @@ private:
         }
         void push (int n) noexcept  { remove (n); if (count < 128) notes[(size_t) count++] = n; }
     };
+
     NoteStack heldNotes;
     uint64_t orderCounter = 0;
+    Rng noteRng { 0xC0FFEEull };
     uint64_t noiseState = 0x2545F4914F6CDD1Dull;
+    uint64_t hostChaosSeed = 0x1234567ull;
     float pitchBend = 0.0f;
-    double freeBeats = 0.0;
+    double freeBeats = 0.0, lastHostBeats = 0.0;
     float dcCoef = 0.999f, dcInL = 0.0f, dcInR = 0.0f, dcOutL = 0.0f, dcOutR = 0.0f;
-    std::array<int, numSeqs> playhead { -1, -1 };
+    int playheadStep = -1;
+    double playheadBeats = -1.0;
 };
 
 } // namespace seqs

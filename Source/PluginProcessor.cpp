@@ -63,25 +63,80 @@ namespace
         layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { id, 1 }, name, defaultValue));
     }
 
-    // Motifs de départ des deux séquenceurs (un rythme de coupure / FM, une rampe lente)
-    constexpr float defaultPatternA[16] = { 1.0f, 0.15f, 0.6f, 0.1f, 0.85f, 0.3f, 0.45f, 0.1f,
-                                            1.0f, 0.2f, 0.7f, 0.05f, 0.8f, 0.4f, 0.55f, 0.25f };
-    constexpr float rateBeats[] = { 4.0f, 2.0f, 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
+    // Périodes des LFO, de la plus courte à la plus longue (en noires)
+    struct Rate { const char* name; double beats; };
+    constexpr Rate lfoRates[] = {
+        { "1/64", 0.0625 }, { "1/32T", 1.0 / 12.0 }, { "1/32", 0.125 }, { "1/16T", 1.0 / 6.0 }, { "1/16", 0.25 },
+        { "1/8T", 1.0 / 3.0 }, { "1/16D", 0.375 }, { "1/8", 0.5 }, { "1/4T", 2.0 / 3.0 }, { "1/8D", 0.75 },
+        { "1/4", 1.0 }, { "1/2T", 4.0 / 3.0 }, { "1/4D", 1.5 }, { "1/2", 2.0 }, { "1 BAR", 4.0 },
+        { "2 BAR", 8.0 }, { "4 BAR", 16.0 }, { "8 BAR", 32.0 } };
+    constexpr int numLfoRates = (int) std::size (lfoRates);
+
+    int rateIndex (const char* name)
+    {
+        for (int i = 0; i < numLfoRates; ++i)
+            if (juce::String (lfoRates[i].name) == name)
+                return i;
+        return 10;
+    }
+
+    // Division du séquenceur
+    constexpr double divisionBeats[] = { 4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625 };
+    const juce::StringArray divisionNames { "1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64" };
+
+    const juce::StringArray lfoShapeNames { "SINE", "TRIANGLE", "SAW", "RAMP", "SQUARE", "PULSE", "EXP DOWN", "EXP UP" };
+    const juce::StringArray stepNames { "OFF", "2", "3", "4", "6", "8", "12", "16", "24", "32" };
+    constexpr int stepValues[] = { 0, 2, 3, 4, 6, 8, 12, 16, 24, 32 };
+    const juce::StringArray modWaveNames { "SINE", "DBL SINE", "SAW", "SQUARE", "PULSE", "SAW-PULSE", "RESO 1", "RESO 2", "RESO 3" };
+
+    // Banque de départ : des mouvements typiques de séquences hi-tech
+    struct LfoDefault { const char* rate; int shape; float amount; int steps; float phase; bool uni; };
+    constexpr LfoDefault lfoDefaults[seqs::numLfos] = {
+        { "1/16",  3, 100.0f, 0, 0.0f, false },   // RAMP rapide
+        { "1/32",  0, 100.0f, 0, 0.0f, false },   // SINE très rapide
+        { "1/8T",  6, 100.0f, 0, 0.0f, false },   // EXP DOWN : « pew »
+        { "1/4",   1, 100.0f, 5, 0.0f, false },   // TRIANGLE en 8 marches
+        { "1/64",  4, 100.0f, 0, 0.0f, false },   // SQUARE : trille
+        { "1 BAR", 2, 100.0f, 0, 0.0f, false } }; // SAW lente
+
+    constexpr int defaultPattern[16] = { 1, 1, 2, 3, 1, 4, 2, 5, 1, 1, 3, 7, 6, 2, 8, 3 };
 }
 
 //==============================================================================
 const juce::StringArray& SequencesAudioProcessor::destinationNames()
 {
     // Même ordre que seqs::Dest
-    static const juce::StringArray names { "OFF", "CUTOFF", "RESO", "FM INDEX", "FM RATIO", "PITCH", "FINE", "PW", "DRIVE",
-                                           "AMP", "FM LEVEL", "OSC LEVEL", "NOISE", "PAN", "FEEDBACK" };
+    static const juce::StringArray names { "OFF", "CUTOFF", "RESO", "FM INDEX", "FM RATIO", "PITCH", "PW", "DRIVE",
+                                           "AMP", "FM LEVEL", "OSC LEVEL", "NOISE", "PAN", "FEEDBACK", "SYNC", "TIMBRE" };
     return names;
 }
 
-const juce::StringArray& SequencesAudioProcessor::rateNames()
+const juce::StringArray& SequencesAudioProcessor::sourceNames()
 {
-    static const juce::StringArray names { "1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64" };
+    static const juce::StringArray names { "OFF", "LFO 1", "LFO 2", "LFO 3", "LFO 4", "LFO 5", "LFO 6", "CHAOS 1", "CHAOS 2" };
     return names;
+}
+
+const juce::StringArray& SequencesAudioProcessor::slotSourceNames()
+{
+    static const juce::StringArray names { "SEQ", "LFO 1", "LFO 2", "LFO 3", "LFO 4", "LFO 5", "LFO 6", "CHAOS 1", "CHAOS 2" };
+    return names;
+}
+
+const juce::StringArray& SequencesAudioProcessor::lfoRateNames()
+{
+    static const juce::StringArray names = []
+    {
+        juce::StringArray n;
+        for (const auto& r : lfoRates) n.add (r.name);
+        return n;
+    }();
+    return names;
+}
+
+double SequencesAudioProcessor::lfoRateBeats (int index)
+{
+    return lfoRates[juce::jlimit (0, numLfoRates - 1, index)].beats;
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::createParameterLayout()
@@ -106,6 +161,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     addFloat (layout, "fmIndex", "FM Index", { 0.0f, 10.0f, 0.01f }, 3.0f, [] (float v, int) { return juce::String (v, 2); });
     addPercent (layout, "fmFeedback", "FM Feedback", 0.0f);
     addPercent (layout, "fmEnv", "FM Env", 30.0f, true);
+    addChoice (layout, "modWave", "Mod Wave", modWaveNames, 0);
+    addPercent (layout, "timbre", "Timbre", 30.0f);
 
     // --- Oscillateur ---
     addChoice (layout, "oscWave", "Osc Wave", { "SAW", "SQUARE", "TRIANGLE", "SINE" }, 0);
@@ -114,6 +171,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     addFloat (layout, "oscDetune", "Osc Detune", { -100.0f, 100.0f, 0.1f }, 7.0f,
               [] (float v, int) { const int i = juce::roundToInt (v); return (i > 0 ? "+" : "") + juce::String (i) + " ct"; });
     addFloat (layout, "oscPw", "Osc PW", { 5.0f, 95.0f, 0.1f }, 50.0f, percentText);
+    addPercent (layout, "oscSync", "Osc Sync", 0.0f);
     addPercent (layout, "noise", "Noise", 0.0f);
 
     // --- Filtre ---
@@ -144,37 +202,53 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     addPercent (layout, "drive", "Drive", 0.0f);
     addChoice (layout, "drivePos", "Drive Position", { "PRE", "POST" }, 0);
 
-    // --- Séquenceurs de LFO ---
-    for (int q = 0; q < seqs::numSeqs; ++q)
+    // --- Banque de LFO ---
+    for (int i = 0; i < seqs::numLfos; ++i)
     {
-        const juce::String label = q == 0 ? "Seq A " : "Seq B ";
-        addBool (layout, seqId (q, "On"), label + "On", q == 0);
-        addInt (layout, seqId (q, "Steps"), label + "Steps", 1, numSteps, 16);
-        addChoice (layout, seqId (q, "Rate"), label + "Rate", rateNames(), q == 0 ? 4 : 3);
-        addChoice (layout, seqId (q, "Feel"), label + "Feel", { "STRAIGHT", "TRIPLET", "DOTTED" }, 0);
-        addFloat (layout, seqId (q, "Swing"), label + "Swing", { 0.0f, 75.0f, 0.1f }, 0.0f, percentText);
-        addPercent (layout, seqId (q, "Smooth"), label + "Smooth", 0.0f);
-        addChoice (layout, seqId (q, "Sync"), label + "Sync", { "NOTE", "HOST" }, 0);
+        const auto& d = lfoDefaults[i];
+        const juce::String name = "LFO " + juce::String (i + 1) + " ";
+        addChoice (layout, lfoId (i, "Rate"), name + "Rate", lfoRateNames(), rateIndex (d.rate));
+        addChoice (layout, lfoId (i, "Shape"), name + "Shape", lfoShapeNames, d.shape);
+        addPercent (layout, lfoId (i, "Amt"), name + "Amount", d.amount);
+        addChoice (layout, lfoId (i, "Step"), name + "Step", stepNames, d.steps);
+        addFloat (layout, lfoId (i, "Phase"), name + "Phase", { 0.0f, 360.0f, 1.0f }, d.phase,
+                  [] (float v, int) { return juce::String (juce::roundToInt (v)) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0")); });
+        addChoice (layout, lfoId (i, "Pol"), name + "Polarity", { "BI", "UNI" }, d.uni ? 1 : 0);
+    }
 
-        for (int k = 0; k < seqs::numSlots; ++k)
-        {
-            int dest = 0;
-            float amount = 0.0f;
-            if (q == 0 && k == 0) { dest = (int) seqs::Dest::cutoff;  amount = 60.0f; }
-            if (q == 0 && k == 1) { dest = (int) seqs::Dest::fmIndex; amount = 35.0f; }
-            addChoice (layout, destId (q, k), label + "Dest " + juce::String (k + 1), destinationNames(), dest);
-            addPercent (layout, amountId (q, k), label + "Amount " + juce::String (k + 1), amount, true);
-        }
+    for (int c = 0; c < seqs::numChaos; ++c)
+    {
+        const juce::String name = "Chaos " + juce::String (c + 1) + " ";
+        addChoice (layout, chaosId (c, "Rate"), name + "Rate", lfoRateNames(), rateIndex (c == 0 ? "1/16" : "1/32"));
+        addPercent (layout, chaosId (c, "Amt"), name + "Amount", 100.0f);
+        addPercent (layout, chaosId (c, "Smooth"), name + "Smooth", c == 0 ? 0.0f : 60.0f);
+    }
 
-        for (int i = 0; i < numSteps; ++i)
-        {
-            const float value = q == 0 ? defaultPatternA[i % 16] : (float) (i % 8) / 7.0f;
-            addFloat (layout, stepId (q, i), label + "Step " + juce::String (i + 1), { 0.0f, 1.0f, 0.0f }, value,
-                      [] (float v, int) { return juce::String (juce::roundToInt (v * 100.0f)) + " %"; });
-        }
+    // --- Séquenceur ---
+    addBool (layout, "seqOn", "Seq On", true);
+    addInt (layout, "seqSteps", "Seq Steps", 1, numSteps, 16);
+    addChoice (layout, "seqDiv", "Seq Division", divisionNames, 3);
+    addChoice (layout, "seqFeel", "Seq Feel", { "STRAIGHT", "TRIPLET", "DOTTED" }, 0);
+    addFloat (layout, "seqSwing", "Seq Swing", { 0.0f, 75.0f, 0.1f }, 0.0f, percentText);
+    addChoice (layout, "seqSync", "Seq Sync", { "NOTE", "HOST" }, 0);
+    addBool (layout, "seqRestart", "Seq Restart", true);
+    addFloat (layout, "seqXfade", "Seq Crossfade", { 0.0f, 50.0f, 0.1f }, 2.0f, msText);
+    addChoice (layout, "seqManual", "Seq Manual Source", sourceNames(), 1);
 
-        for (int i = 0; i < numSteps; ++i)
-            addBool (layout, glideId (q, i), label + "Glide " + juce::String (i + 1), q == 0 && (i % 16 == 2 || i % 16 == 13));
+    for (int i = 0; i < numSteps; ++i)
+        addChoice (layout, stepId (i), "Seq Step " + juce::String (i + 1), sourceNames(), defaultPattern[i % 16]);
+
+    // --- Routages ---
+    for (int k = 0; k < seqs::numSlots; ++k)
+    {
+        int dest = 0;
+        float amount = 0.0f;
+        if (k == 0) { dest = (int) seqs::Dest::cutoff;  amount = 45.0f; }
+        if (k == 1) { dest = (int) seqs::Dest::fmIndex; amount = 30.0f; }
+        const juce::String name = "Mod " + juce::String (k + 1) + " ";
+        addChoice (layout, slotId (k, "Src"), name + "Source", slotSourceNames(), 0);
+        addChoice (layout, slotId (k, "Dest"), name + "Destination", destinationNames(), dest);
+        addPercent (layout, slotId (k, "Amt"), name + "Amount", amount, true);
     }
 
     return layout;
@@ -186,34 +260,13 @@ SequencesAudioProcessor::SequencesAudioProcessor()
       apvts (*this, nullptr, "Sequences", createParameterLayout()),
       presets (apvts, "Sequences", ".seqpreset", PresetLibrary::defaultsOnly (*this, {}), {}, "UNTITLED")
 {
-    presets.restoreFromState();   // projet neuf : DEFAULT
+    presets.restoreFromState();
 
     for (auto* param : getParameters())
         if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (param))
             raw[ranged->getParameterID()] = apvts.getRawParameterValue (ranged->getParameterID());
 
-    for (int q = 0; q < seqs::numSeqs; ++q)
-    {
-        auto& sp = seqParams[(size_t) q];
-        sp.on = raw.at (seqId (q, "On"));
-        sp.steps = raw.at (seqId (q, "Steps"));
-        sp.rate = raw.at (seqId (q, "Rate"));
-        sp.feel = raw.at (seqId (q, "Feel"));
-        sp.swing = raw.at (seqId (q, "Swing"));
-        sp.smooth = raw.at (seqId (q, "Smooth"));
-        sp.sync = raw.at (seqId (q, "Sync"));
-        for (int k = 0; k < seqs::numSlots; ++k)
-        {
-            sp.dest[(size_t) k] = raw.at (destId (q, k));
-            sp.amount[(size_t) k] = raw.at (amountId (q, k));
-        }
-        for (int i = 0; i < numSteps; ++i)
-        {
-            sp.value[(size_t) i] = raw.at (stepId (q, i));
-            sp.glide[(size_t) i] = raw.at (glideId (q, i));
-        }
-        playhead[(size_t) q].store (-1);
-    }
+    cache.build (*this);
 }
 
 bool SequencesAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -235,72 +288,133 @@ void SequencesAudioProcessor::reset()
     engine.reset();
 }
 
+//==============================================================================
+void SequencesAudioProcessor::Cache::build (const SequencesAudioProcessor& proc)
+{
+    auto get = [&proc] (const juce::String& id) { return proc.raw.at (id); };
+
+    for (const char* id : { "voiceMode", "glide", "velocity", "transpose", "level", "fmLevel", "fmRatio", "fmIndex", "fmFeedback",
+                            "fmEnv", "modWave", "timbre", "oscWave", "oscLevel", "oscOctave", "oscDetune", "oscPw", "oscSync", "noise",
+                            "filterType", "filterSlope", "cutoff", "resonance", "filterEnv", "keyTrack", "ampAttack", "ampDecay",
+                            "ampSustain", "ampRelease", "modAttack", "modDecay", "modSustain", "modRelease", "driveType", "drive",
+                            "drivePos", "seqOn", "seqSteps", "seqDiv", "seqFeel", "seqSwing", "seqSync", "seqRestart", "seqXfade",
+                            "seqManual" })
+        named[id] = get (id);
+
+    for (int i = 0; i < seqs::numLfos; ++i)
+        lfo[(size_t) i] = { get (lfoId (i, "Rate")), get (lfoId (i, "Shape")), get (lfoId (i, "Amt")),
+                            get (lfoId (i, "Step")), get (lfoId (i, "Phase")), get (lfoId (i, "Pol")) };
+    for (int c = 0; c < seqs::numChaos; ++c)
+        chaos[(size_t) c] = { get (chaosId (c, "Rate")), get (chaosId (c, "Amt")), get (chaosId (c, "Smooth")) };
+    for (int i = 0; i < numSteps; ++i)
+        steps[(size_t) i] = get (stepId (i));
+    for (int k = 0; k < seqs::numSlots; ++k)
+        slots[(size_t) k] = { get (slotId (k, "Src")), get (slotId (k, "Dest")), get (slotId (k, "Amt")) };
+
+    voiceMode = named.at ("voiceMode"); glide = named.at ("glide"); velocity = named.at ("velocity");
+    transpose = named.at ("transpose"); level = named.at ("level");
+    fmLevel = named.at ("fmLevel"); fmRatio = named.at ("fmRatio"); fmIndex = named.at ("fmIndex");
+    fmFeedback = named.at ("fmFeedback"); fmEnv = named.at ("fmEnv"); modWave = named.at ("modWave"); timbre = named.at ("timbre");
+    oscWave = named.at ("oscWave"); oscLevel = named.at ("oscLevel"); oscOctave = named.at ("oscOctave");
+    oscDetune = named.at ("oscDetune"); oscPw = named.at ("oscPw"); oscSync = named.at ("oscSync"); noise = named.at ("noise");
+    filterType = named.at ("filterType"); filterSlope = named.at ("filterSlope"); cutoff = named.at ("cutoff");
+    resonance = named.at ("resonance"); filterEnv = named.at ("filterEnv"); keyTrack = named.at ("keyTrack");
+    ampAttack = named.at ("ampAttack"); ampDecay = named.at ("ampDecay"); ampSustain = named.at ("ampSustain");
+    ampRelease = named.at ("ampRelease"); modAttack = named.at ("modAttack"); modDecay = named.at ("modDecay");
+    modSustain = named.at ("modSustain"); modRelease = named.at ("modRelease");
+    driveType = named.at ("driveType"); drive = named.at ("drive"); drivePos = named.at ("drivePos");
+    seqOn = named.at ("seqOn"); seqSteps = named.at ("seqSteps"); seqDiv = named.at ("seqDiv"); seqFeel = named.at ("seqFeel");
+    seqSwing = named.at ("seqSwing"); seqSync = named.at ("seqSync"); seqRestart = named.at ("seqRestart");
+    seqXfade = named.at ("seqXfade"); seqManual = named.at ("seqManual");
+}
+
 void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
 {
     const auto v = [] (const std::atomic<float>* a) { return a->load (std::memory_order_relaxed); };
     const auto i = [&v] (const std::atomic<float>* a) { return juce::roundToInt (v (a)); };
     const auto pct = [&v] (const std::atomic<float>* a) { return 0.01f * v (a); };
     const auto sec = [&v] (const std::atomic<float>* a) { return 0.001f * v (a); };
+    const auto& c = cache;
 
-    s.mono = i (p ("voiceMode")) == 0;
-    s.glideMs = v (p ("glide"));
-    s.velocity = pct (p ("velocity"));
-    s.transpose = i (p ("transpose"));
-    s.level = juce::Decibels::decibelsToGain (v (p ("level")));
+    s.mono = i (c.voiceMode) == 0;
+    s.glideMs = v (c.glide);
+    s.velocity = pct (c.velocity);
+    s.transpose = i (c.transpose);
+    s.level = juce::Decibels::decibelsToGain (v (c.level));
 
-    s.fmLevel = pct (p ("fmLevel"));
-    s.fmRatio = v (p ("fmRatio"));
-    s.fmIndex = v (p ("fmIndex"));
-    s.fmFeedback = pct (p ("fmFeedback"));
-    s.fmEnv = pct (p ("fmEnv"));
+    s.fmLevel = pct (c.fmLevel);
+    s.fmRatio = v (c.fmRatio);
+    s.fmIndex = v (c.fmIndex);
+    s.fmFeedback = pct (c.fmFeedback);
+    s.fmEnv = pct (c.fmEnv);
+    s.modWave = (seqs::ModWave) juce::jlimit (0, (int) seqs::ModWave::count - 1, i (c.modWave));
+    s.timbre = pct (c.timbre);
 
-    s.oscWave = (seqs::Wave) juce::jlimit (0, 3, i (p ("oscWave")));
-    s.oscLevel = pct (p ("oscLevel"));
-    s.oscOctave = i (p ("oscOctave"));
-    s.oscDetune = v (p ("oscDetune"));
-    s.oscPw = pct (p ("oscPw"));
-    s.noise = pct (p ("noise"));
+    s.oscWave = (seqs::Wave) juce::jlimit (0, 3, i (c.oscWave));
+    s.oscLevel = pct (c.oscLevel);
+    s.oscOctave = i (c.oscOctave);
+    s.oscDetune = v (c.oscDetune);
+    s.oscPw = pct (c.oscPw);
+    s.oscSync = pct (c.oscSync);
+    s.noise = pct (c.noise);
 
-    s.filterType = (seqs::FilterType) juce::jlimit (0, 2, i (p ("filterType")));
-    s.slope24 = i (p ("filterSlope")) == 1;
-    s.cutoff = v (p ("cutoff"));
-    s.resonance = pct (p ("resonance"));
-    s.filterEnv = pct (p ("filterEnv"));
-    s.keyTrack = pct (p ("keyTrack"));
+    s.filterType = (seqs::FilterType) juce::jlimit (0, 2, i (c.filterType));
+    s.slope24 = i (c.filterSlope) == 1;
+    s.cutoff = v (c.cutoff);
+    s.resonance = pct (c.resonance);
+    s.filterEnv = pct (c.filterEnv);
+    s.keyTrack = pct (c.keyTrack);
 
-    s.ampA = sec (p ("ampAttack"));  s.ampD = sec (p ("ampDecay"));
-    s.ampS = pct (p ("ampSustain")); s.ampR = sec (p ("ampRelease"));
-    s.modA = sec (p ("modAttack"));  s.modD = sec (p ("modDecay"));
-    s.modS = pct (p ("modSustain")); s.modR = sec (p ("modRelease"));
+    s.ampA = sec (c.ampAttack);  s.ampD = sec (c.ampDecay);
+    s.ampS = pct (c.ampSustain); s.ampR = sec (c.ampRelease);
+    s.modA = sec (c.modAttack);  s.modD = sec (c.modDecay);
+    s.modS = pct (c.modSustain); s.modR = sec (c.modRelease);
 
-    s.driveType = (seqs::DriveType) juce::jlimit (0, 2, i (p ("driveType")));
-    s.drive = pct (p ("drive"));
-    s.drivePost = i (p ("drivePos")) == 1;
+    s.driveType = (seqs::DriveType) juce::jlimit (0, 2, i (c.driveType));
+    s.drive = pct (c.drive);
+    s.drivePost = i (c.drivePos) == 1;
 
-    for (int q = 0; q < seqs::numSeqs; ++q)
+    for (int n = 0; n < seqs::numLfos; ++n)
     {
-        const auto& sp = seqParams[(size_t) q];
-        auto& out = s.seq[(size_t) q];
-        out.on = v (sp.on) > 0.5f;
-        out.steps = juce::jlimit (1, numSteps, i (sp.steps));
-        const int rate = juce::jlimit (0, (int) std::size (rateBeats) - 1, i (sp.rate));
-        const int feel = i (sp.feel);
-        out.stepBeats = (double) rateBeats[rate] * (feel == 1 ? 2.0 / 3.0 : feel == 2 ? 1.5 : 1.0);
-        out.swing = 0.01 * (double) v (sp.swing);
-        out.smooth = pct (sp.smooth);
-        out.hostSync = i (sp.sync) == 1;
+        const auto& lp = c.lfo[(size_t) n];
+        auto& l = s.lfo[(size_t) n];
+        l.periodBeats = lfoRateBeats (i (lp.rate));
+        l.shape = (seqs::LfoShape) juce::jlimit (0, (int) seqs::LfoShape::count - 1, i (lp.shape));
+        l.amount = pct (lp.amount);
+        l.steps = stepValues[juce::jlimit (0, (int) std::size (stepValues) - 1, i (lp.step))];
+        l.phase = v (lp.phase) / 360.0f;
+        l.unipolar = i (lp.polarity) == 1;
+    }
 
-        for (int k = 0; k < seqs::numSlots; ++k)
-        {
-            out.dest[(size_t) k] = (seqs::Dest) juce::jlimit (0, (int) seqs::Dest::count - 1, i (sp.dest[(size_t) k]));
-            out.amount[(size_t) k] = pct (sp.amount[(size_t) k]);
-        }
+    for (int n = 0; n < seqs::numChaos; ++n)
+    {
+        const auto& cp = c.chaos[(size_t) n];
+        auto& ch = s.chaos[(size_t) n];
+        ch.periodBeats = lfoRateBeats (i (cp.rate));
+        ch.amount = pct (cp.amount);
+        ch.smooth = pct (cp.smooth);
+    }
 
-        for (int n = 0; n < numSteps; ++n)
-        {
-            out.value[(size_t) n] = juce::jlimit (0.0f, 1.0f, v (sp.value[(size_t) n]));
-            out.glide[(size_t) n] = v (sp.glide[(size_t) n]) > 0.5f;
-        }
+    auto& q = s.seq;
+    q.on = v (c.seqOn) > 0.5f;
+    q.steps = juce::jlimit (1, numSteps, i (c.seqSteps));
+    const int div = juce::jlimit (0, (int) std::size (divisionBeats) - 1, i (c.seqDiv));
+    const int feel = i (c.seqFeel);
+    q.stepBeats = divisionBeats[div] * (feel == 1 ? 2.0 / 3.0 : feel == 2 ? 1.5 : 1.0);
+    q.swing = 0.01 * (double) v (c.seqSwing);
+    q.hostSync = i (c.seqSync) == 1;
+    q.restart = v (c.seqRestart) > 0.5f;
+    q.xfadeMs = v (c.seqXfade);
+    q.manual = juce::jlimit (0, seqs::numSources, i (c.seqManual));
+    for (int n = 0; n < numSteps; ++n)
+        q.pattern[(size_t) n] = juce::jlimit (0, seqs::numSources, i (c.steps[(size_t) n]));
+
+    for (int k = 0; k < seqs::numSlots; ++k)
+    {
+        const auto& sp = c.slots[(size_t) k];
+        s.slotSource[(size_t) k] = juce::jlimit (0, seqs::numSources, i (sp.source));
+        s.slotDest[(size_t) k] = (seqs::Dest) juce::jlimit (0, (int) seqs::Dest::count - 1, i (sp.dest));
+        s.slotAmount[(size_t) k] = pct (sp.amount);
     }
 }
 
@@ -313,7 +427,6 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     readSettings (settings);
     engine.setSettings (settings);
 
-    // --- Transport ---
     seqs::Engine::Transport transport;
     if (auto* head = getPlayHead())
         if (const auto position = head->getPosition())
@@ -329,8 +442,8 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
             }
         }
     transport.bpm = lastBpm;
+    bpmNow.store (lastBpm, std::memory_order_relaxed);
 
-    // --- Rendu, coupé aux événements MIDI (précis à l'échantillon) ---
     float* left = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
     std::array<float, 512> scratch {};
@@ -368,80 +481,100 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
     renderUpTo (numSamples);
 
-    for (int q = 0; q < seqs::numSeqs; ++q)
-        playhead[(size_t) q].store (engine.getPlayheadStep (q), std::memory_order_relaxed);
+    playheadStep.store (engine.getPlayheadStep(), std::memory_order_relaxed);
+    playheadBeats.store (engine.getPlayheadBeats(), std::memory_order_relaxed);
 }
 
 //==============================================================================
-void SequencesAudioProcessor::setParam (const juce::String& id, float realValue)
+void SequencesAudioProcessor::setParam (const juce::String& id, float value)
 {
     if (auto* param = apvts.getParameter (id))
     {
         param->beginChangeGesture();
-        param->setValueNotifyingHost (param->convertTo0to1 (realValue));
+        param->setValueNotifyingHost (param->convertTo0to1 (value));
         param->endChangeGesture();
     }
 }
 
-void SequencesAudioProcessor::randomizeSequence (int seq)
+float SequencesAudioProcessor::realValue (const juce::String& id) const
 {
-    seq = juce::jlimit (0, seqs::numSeqs - 1, seq);
-    const int steps = juce::roundToInt (seqParams[(size_t) seq].steps->load());
+    return p (id)->load();
+}
 
-    std::array<float, seqs::maxSteps> values {};
-    std::array<bool, seqs::maxSteps> glides {};
-    seqs::RandomPattern::generate (randomRng, steps, values, glides);
+void SequencesAudioProcessor::randomizePattern()
+{
+    // Sources qui font quelque chose (quantité non nulle)
+    std::array<bool, seqs::numSources + 1> available {};
+    for (int i = 0; i < seqs::numLfos; ++i)
+        available[(size_t) (i + 1)] = realValue (lfoId (i, "Amt")) > 0.5f;
+    for (int c = 0; c < seqs::numChaos; ++c)
+        available[(size_t) (seqs::numLfos + 1 + c)] = realValue (chaosId (c, "Amt")) > 0.5f;
+
+    std::array<int, seqs::maxSteps> pattern {};
+    seqs::RandomPattern::generate (randomRng, juce::roundToInt (realValue ("seqSteps")), available, pattern);
 
     for (int i = 0; i < numSteps; ++i)
-    {
-        setParam (stepId (seq, i), values[(size_t) i]);
-        setParam (glideId (seq, i), glides[(size_t) i] ? 1.0f : 0.0f);
-    }
+        setParam (stepId (i), (float) pattern[(size_t) i]);
 
-    // Rien n'est branché : on branche la coupure, pour entendre le motif tout de suite
-    bool anyDestination = false;
+    if (realValue ("seqOn") < 0.5f)
+        setParam ("seqOn", 1.0f);
+
+    // Rien n'écoute le séquenceur : on le branche sur la coupure pour l'entendre tout de suite
+    bool listening = false;
     for (int k = 0; k < seqs::numSlots; ++k)
-        anyDestination = anyDestination || (juce::roundToInt (seqParams[(size_t) seq].dest[(size_t) k]->load()) != 0
-                                            && std::abs (seqParams[(size_t) seq].amount[(size_t) k]->load()) > 0.5f);
-    if (! anyDestination)
+        listening = listening || (juce::roundToInt (realValue (slotId (k, "Src"))) == 0
+                                  && juce::roundToInt (realValue (slotId (k, "Dest"))) != 0
+                                  && std::abs (realValue (slotId (k, "Amt"))) > 0.5f);
+    if (! listening)
     {
-        setParam (destId (seq, 0), (float) seqs::Dest::cutoff);
-        setParam (amountId (seq, 0), 60.0f);
-    }
-
-    if (seqParams[(size_t) seq].on->load() < 0.5f)
-        setParam (seqId (seq, "On"), 1.0f);
-}
-
-void SequencesAudioProcessor::rotateSequence (int seq, int dir)
-{
-    seq = juce::jlimit (0, seqs::numSeqs - 1, seq);
-    const auto& sp = seqParams[(size_t) seq];
-    const int n = juce::jlimit (1, numSteps, juce::roundToInt (sp.steps->load()));
-
-    std::vector<float> values ((size_t) n), glides ((size_t) n);
-    for (int i = 0; i < n; ++i)
-    {
-        values[(size_t) i] = sp.value[(size_t) i]->load();
-        glides[(size_t) i] = sp.glide[(size_t) i]->load();
-    }
-
-    for (int i = 0; i < n; ++i)
-    {
-        const int from = ((i - dir) % n + n) % n;
-        setParam (stepId (seq, i), values[(size_t) from]);
-        setParam (glideId (seq, i), glides[(size_t) from]);
+        setParam (slotId (0, "Src"), 0.0f);
+        setParam (slotId (0, "Dest"), (float) seqs::Dest::cutoff);
+        setParam (slotId (0, "Amt"), 45.0f);
     }
 }
 
-void SequencesAudioProcessor::clearSequence (int seq, float value)
+void SequencesAudioProcessor::randomizeAll()
 {
-    seq = juce::jlimit (0, seqs::numSeqs - 1, seq);
+    // Périodes : surtout entre 1/32 et 1 mesure, là où vivent les séquences hi-tech
+    static const int favouredRates[] = { 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11, 12, 13, 14 };
+    auto& rng = randomRng;
+
+    for (int i = 0; i < seqs::numLfos; ++i)
+    {
+        setParam (lfoId (i, "Rate"), (float) favouredRates[rng.range (0, (int) std::size (favouredRates) - 1)]);
+        setParam (lfoId (i, "Shape"), (float) rng.range (0, (int) seqs::LfoShape::count - 1));
+        setParam (lfoId (i, "Amt"), rng.chance (0.75) ? 100.0f : (float) rng.range (40, 100));
+        setParam (lfoId (i, "Step"), rng.chance (0.6) ? 0.0f : (float) rng.range (1, 7));
+        setParam (lfoId (i, "Phase"), rng.chance (0.7) ? 0.0f : (float) (rng.range (0, 7) * 45));
+        setParam (lfoId (i, "Pol"), rng.chance (0.8) ? 0.0f : 1.0f);
+    }
+
+    for (int c = 0; c < seqs::numChaos; ++c)
+    {
+        setParam (chaosId (c, "Rate"), (float) favouredRates[rng.range (0, 8)]);
+        setParam (chaosId (c, "Amt"), (float) rng.range (50, 100));
+        setParam (chaosId (c, "Smooth"), rng.chance (0.5) ? 0.0f : (float) rng.range (20, 100));
+    }
+
+    engine.setHostChaosSeed (rng.next());
+    randomizePattern();
+}
+
+void SequencesAudioProcessor::rotatePattern (int dir)
+{
+    const int n = juce::jlimit (1, numSteps, juce::roundToInt (realValue ("seqSteps")));
+    std::vector<float> values ((size_t) n);
+    for (int i = 0; i < n; ++i)
+        values[(size_t) i] = realValue (stepId (i));
+
+    for (int i = 0; i < n; ++i)
+        setParam (stepId (i), values[(size_t) (((i - dir) % n + n) % n)]);
+}
+
+void SequencesAudioProcessor::fillPattern (int source)
+{
     for (int i = 0; i < numSteps; ++i)
-    {
-        setParam (stepId (seq, i), value);
-        setParam (glideId (seq, i), 0.0f);
-    }
+        setParam (stepId (i), (float) juce::jlimit (0, seqs::numSources, source));
 }
 
 //==============================================================================

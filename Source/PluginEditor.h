@@ -16,6 +16,14 @@ namespace ui
         static juce::Colour faint()       { return juce::Colour (0xffb9bbc0); }
         static juce::Colour accent()      { return juce::Colour (0xffff5a1f); }
         static juce::Colour stepOff()     { return juce::Colour (0xffe9eaec); }
+
+        /** Couleur d'une source : 1..6 = LFO, 7..8 = CHAOS, 0 = OFF. */
+        static juce::Colour source (int s)
+        {
+            static const juce::uint32 colours[] = { 0xffb9bbc0, 0xffff5a1f, 0xff1f8fff, 0xff16a874, 0xffa64bf0,
+                                                     0xffe0a800, 0xffff3d8b, 0xff17181a, 0xff6b6e73 };
+            return juce::Colour (colours[juce::jlimit (0, 8, s)]);
+        }
     };
 
     juce::Font font (float height, bool bold = false, float tracking = 0.0f);
@@ -40,11 +48,11 @@ namespace ui
     };
 
     //==========================================================================
-    /** Grille de pas d'un séquenceur : on dessine les valeurs à la souris, glides en dessous. */
-    class StepGrid final : public juce::Component
+    /** Matrice du séquenceur : une ligne par source (et OFF), une colonne par pas. */
+    class StepMatrix final : public juce::Component
     {
     public:
-        StepGrid (SequencesAudioProcessor&, int seqIndex);
+        explicit StepMatrix (SequencesAudioProcessor&);
 
         void paint (juce::Graphics&) override;
         void mouseDown (const juce::MouseEvent&) override;
@@ -52,25 +60,51 @@ namespace ui
         void mouseUp (const juce::MouseEvent&) override;
         void mouseDoubleClick (const juce::MouseEvent&) override;
 
-        static constexpr int glideRowHeight = 18;
+        static constexpr int labelWidth = 74;
+        static constexpr int numRows = seqs::numSources + 1;   // LFO 1..6, CHAOS 1..2, OFF
+
+        /** Ligne -> source (ligne du bas = OFF). */
+        static int sourceForRow (int row)          { return row == numRows - 1 ? 0 : row + 1; }
+        static int rowForSource (int source)       { return source == 0 ? numRows - 1 : source - 1; }
 
     private:
-        juce::Rectangle<float> barsArea() const;
-        juce::Rectangle<float> glideArea() const;
-        int stepAtX (float x) const;
-        float valueAtY (float y) const;
-        void setStepValue (int step, float value);
-        void setGlide (int step, bool on);
-        void touch (juce::RangedAudioParameter*);
+        juce::Rectangle<float> gridArea() const;
+        int columnAt (float x) const;
+        int rowAt (float y) const;
+        void setStep (int step, int source);
 
         SequencesAudioProcessor& processor;
-        int seq;
-        std::array<juce::RangedAudioParameter*, SequencesAudioProcessor::numSteps> valueParams {}, glideParams {};
+        std::array<juce::RangedAudioParameter*, SequencesAudioProcessor::numSteps> stepParams {};
         juce::RangedAudioParameter* stepsParam = nullptr;
         std::vector<juce::RangedAudioParameter*> touched;
-        bool draggingGlide = false, glidePaintState = false;
-        int lastStep = -1;
-        float lastValue = 0.0f;
+        int lastColumn = -1;
+    };
+
+    //==========================================================================
+    /** LFO CIRCUIT : la courbe que sort le séquenceur sur une boucle, colorée par source. */
+    class CircuitView final : public juce::Component
+    {
+    public:
+        explicit CircuitView (SequencesAudioProcessor& p) : processor (p) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        seqs::Settings settings;
+    };
+
+    //==========================================================================
+    /** Petit dessin d'un cycle de LFO, dans l'en-tête de sa colonne. */
+    class LfoPreview final : public juce::Component
+    {
+    public:
+        LfoPreview (SequencesAudioProcessor& p, int index) : processor (p), lfo (index) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        int lfo;
+        seqs::Settings settings;
     };
 }
 
@@ -80,7 +114,7 @@ class SequencesFacade final : public juce::Component,
                               private juce::Timer
 {
 public:
-    static constexpr int width = 1240, height = 860;
+    static constexpr int width = 1320, height = 920;
 
     explicit SequencesFacade (SequencesAudioProcessor&);
     ~SequencesFacade() override;
@@ -90,9 +124,10 @@ public:
 
     phragma::PresetBar& getPresetBar() noexcept       { return presetBar; }
 
-    /** Pour les tests : boutons d'un séquenceur. */
-    juce::TextButton& getRandomButton (int seq)       { return seqUis[(size_t) seq]->random; }
-    ui::StepGrid& getGrid (int seq)                   { return *seqUis[(size_t) seq]->grid; }
+    /** Pour les tests. */
+    juce::TextButton& getRandomButton()               { return randomButton; }
+    juce::TextButton& getRandomAllButton()            { return randomAllButton; }
+    ui::StepMatrix& getMatrix()                       { return *matrix; }
 
 private:
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
@@ -102,38 +137,40 @@ private:
     struct Knob
     {
         juce::Slider slider;
-        juce::String label;
         std::unique_ptr<SliderAttachment> attachment;
     };
 
     struct Choice
     {
         juce::ComboBox box;
-        juce::String label;
         std::unique_ptr<ComboAttachment> attachment;
+    };
+
+    struct Toggle
+    {
+        juce::TextButton button;
+        std::unique_ptr<ButtonAttachment> attachment;
     };
 
     struct Panel
     {
         juce::String title;
         juce::Rectangle<int> bounds;
-    };
-
-    struct SeqUi
-    {
-        std::unique_ptr<ui::StepGrid> grid;
-        juce::TextButton on, random, left, right, clear;
-        std::unique_ptr<ButtonAttachment> onAttachment;
-        juce::Rectangle<int> bounds;
+        juce::Colour swatch;
     };
 
     void timerCallback() override;
 
-    Knob& addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar = false);
-    Choice& addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell);
-    Choice& addInlineChoice (const juce::String& id, juce::Rectangle<int> area);
-    Knob& addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar);
-    void buildSequencer (int seq, juce::Rectangle<int> area);
+    void addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar = false, bool small = false);
+    void addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell);
+    juce::ComboBox& addInlineChoice (const juce::String& id, juce::Rectangle<int> area);
+    void addLabelledChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth);
+    void addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar);
+    void addToggle (const juce::String& id, const juce::String& text, juce::Rectangle<int> area);
+    void addButton (juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area);
+
+    void buildBank (juce::Rectangle<int> area);
+    void buildSequencer (juce::Rectangle<int> area);
 
     SequencesAudioProcessor& audioProcessor;
     ui::LookAndFeel lookAndFeel;
@@ -141,16 +178,22 @@ private:
 
     std::vector<std::unique_ptr<Knob>> knobs;
     std::vector<std::unique_ptr<Choice>> choices;
+    std::vector<std::unique_ptr<Toggle>> toggles;
     std::vector<Panel> panels;
-    std::vector<std::pair<juce::String, juce::Rectangle<int>>> captions;
-    std::array<std::unique_ptr<SeqUi>, seqs::numSeqs> seqUis;
-    std::array<int, seqs::numSeqs> shownPlayhead { -2, -2 };
+    std::vector<std::pair<juce::String, juce::Rectangle<int>>> captions, leftCaptions;
+
+    std::unique_ptr<ui::StepMatrix> matrix;
+    std::unique_ptr<ui::CircuitView> circuit;
+    std::vector<std::unique_ptr<ui::LfoPreview>> previews;
+    juce::TextButton leftButton, rightButton, clearButton, randomButton, randomAllButton;
+    juce::Rectangle<int> seqPanel, bankPanel;
+
+    int shownStep = -2, tick = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SequencesFacade)
 };
 
 //==============================================================================
-/** L'éditeur : la façade, mise à l'échelle de la fenêtre (redimensionnable, proportions gardées). */
 class SequencesAudioProcessorEditor final : public juce::AudioProcessorEditor
 {
 public:

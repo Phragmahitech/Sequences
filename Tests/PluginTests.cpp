@@ -71,7 +71,7 @@ static void testParameters()
 {
     SequencesAudioProcessor p;
     const auto& params = p.getParameters();
-    CHECK (params.size() == 187, "nombre de paramètres : %d", params.size());
+    CHECK (params.size() == 131, "nombre de paramètres : %d", params.size());
 
     juce::StringArray ids;
     for (auto* param : params)
@@ -94,10 +94,23 @@ static void testParameters()
             }
 
     CHECK (value (p, "voiceMode") == 1.0f, "POLY par défaut");
-    CHECK (value (p, "seqAOn") == 1.0f && value (p, "seqBOn") == 0.0f, "SEQ A allumé, B éteint");
-    CHECK (value (p, "seqASteps") == 16.0f, "16 pas");
-    CHECK (juce::roundToInt (value (p, "seqADest1")) == (int) seqs::Dest::cutoff, "SEQ A -> CUTOFF");
+    CHECK (value (p, "seqOn") == 1.0f && value (p, "seqSteps") == 16.0f, "séquenceur allumé, 16 pas");
+    CHECK (juce::roundToInt (value (p, "mod1Src")) == 0 && juce::roundToInt (value (p, "mod1Dest")) == (int) seqs::Dest::cutoff,
+           "MOD 1 : SEQ -> CUTOFF");
     CHECK (SequencesAudioProcessor::destinationNames().size() == (int) seqs::Dest::count, "noms des destinations");
+    CHECK (SequencesAudioProcessor::sourceNames().size() == seqs::numSources + 1, "noms des sources");
+    CHECK (SequencesAudioProcessor::lfoRateNames()[4] == "1/16" && SequencesAudioProcessor::lfoRateBeats (4) == 0.25, "périodes");
+    CHECK (p.apvts.getParameter ("lfo1Rate")->getCurrentValueAsText() == "1/16", "LFO 1 en 1/16");
+    CHECK (p.apvts.getParameter ("lfo3Shape")->getCurrentValueAsText() == "EXP DOWN", "LFO 3 en EXP DOWN");
+    CHECK (p.apvts.getParameter ("seqStep12")->getCurrentValueAsText() == "CHAOS 1", "pas 12 : CHAOS 1");
+
+    // Les réglages lus correspondent aux paramètres
+    seqs::Settings s;
+    p.readSettings (s);
+    CHECK (s.seq.on && s.seq.steps == 16 && std::abs (s.seq.stepBeats - 0.5) < 1e-9, "séquenceur lu");
+    CHECK (s.seq.pattern[0] == 1 && s.seq.pattern[11] == 7 && s.seq.pattern[14] == 8, "motif lu");
+    CHECK (s.lfo[3].steps == 8 && s.lfo[3].shape == seqs::LfoShape::triangle, "LFO 4 lu");
+    CHECK (s.slotDest[0] == seqs::Dest::cutoff && std::abs (s.slotAmount[0] - 0.45f) < 1e-4f, "routage lu");
     CHECK (p.apvts.getParameter ("cutoff")->getCurrentValueAsText() == "900 Hz", "texte de la coupure : %s",
            p.apvts.getParameter ("cutoff")->getCurrentValueAsText().toRawUTF8());
 }
@@ -154,72 +167,102 @@ static void testAudio()
         head.playing = true;
         head.ppq = 2.0;
         s.setPlayHead (&head);
-        set (s, "seqASync", 1.0f);   // HOST
+        set (s, "seqSync", 1.0f);   // HOST
+        set (s, "seqDiv", 4.0f);    // 1/16
         s.prepareToPlay (48000.0, 128);
         juce::MidiBuffer midi;
         midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
         juce::AudioBuffer<float> buffer (2, 128);
         s.processBlock (buffer, midi);
-        CHECK (s.getPlayheadStep (0) == 8, "HOST : pas 8 à la noire 2 : %d", s.getPlayheadStep (0));
-        CHECK (s.getPlayheadStep (1) == -1, "SEQ B éteint : pas de tête");
+        CHECK (s.getPlayheadStep() == 8, "HOST : pas 8 à la noire 2 : %d", s.getPlayheadStep());
+        CHECK (s.getPlayheadBeats() >= 2.0 && s.getPlayheadBeats() < 2.1, "position : %f", s.getPlayheadBeats());
         head.playing = false;
         head.ppq = 0.0;
     }
 }
+
+static int stepSource (SequencesAudioProcessor& p, int i)   { return juce::roundToInt (value (p, SequencesAudioProcessor::stepId (i))); }
 
 static void testRandomAndTools()
 {
     SequencesAudioProcessor p;
     p.setRandomSeed (42);
 
-    std::vector<float> before;
-    for (int i = 0; i < 32; ++i) before.push_back (value (p, SequencesAudioProcessor::stepId (0, i)));
+    std::vector<int> before;
+    for (int i = 0; i < 32; ++i) before.push_back (stepSource (p, i));
 
-    p.randomizeSequence (0);
+    p.randomizePattern();
     int changed = 0;
     for (int i = 0; i < 32; ++i)
     {
-        const float v = value (p, SequencesAudioProcessor::stepId (0, i));
-        CHECK (v >= 0.0f && v <= 1.0f, "valeur aléatoire bornée");
-        changed += std::abs (v - before[(size_t) i]) > 1e-4f ? 1 : 0;
+        const int v = stepSource (p, i);
+        CHECK (v >= 0 && v <= seqs::numSources, "source valide");
+        changed += v != before[(size_t) i] ? 1 : 0;
     }
-    CHECK (changed > 8, "RANDOM change le motif : %d pas", changed);
+    CHECK (changed > 6, "RANDOM change le motif : %d pas", changed);
 
-    // SEQ B éteint et sans destination : RANDOM l'allume et le branche sur la coupure
-    p.randomizeSequence (1);
-    CHECK (value (p, "seqBOn") == 1.0f, "RANDOM allume SEQ B");
-    CHECK (juce::roundToInt (value (p, "seqBDest1")) == (int) seqs::Dest::cutoff && value (p, "seqBAmt1") > 50.0f, "RANDOM branche SEQ B");
+    // Une source à quantité nulle n'est jamais tirée
+    for (int i = 0; i < seqs::numLfos; ++i)
+        set (p, SequencesAudioProcessor::lfoId (i, "Amt"), i == 1 || i == 4 ? 100.0f : 0.0f);
+    for (int c = 0; c < seqs::numChaos; ++c)
+        set (p, SequencesAudioProcessor::chaosId (c, "Amt"), 0.0f);
+    bool onlyAudible = true;
+    for (int run = 0; run < 30; ++run)
+    {
+        p.randomizePattern();
+        for (int i = 0; i < 32; ++i)
+        {
+            const int v = stepSource (p, i);
+            onlyAudible = onlyAudible && (v == 0 || v == 2 || v == 5);
+        }
+    }
+    CHECK (onlyAudible, "RANDOM ne tire que les sources audibles");
+
+    // Séquenceur éteint et sans routage : RANDOM l'allume et le branche
+    set (p, "seqOn", 0.0f);
+    set (p, "mod1Dest", 0.0f);
+    set (p, "mod2Src", 3.0f);
+    p.randomizePattern();
+    CHECK (value (p, "seqOn") == 1.0f, "RANDOM allume le séquenceur");
+    CHECK (juce::roundToInt (value (p, "mod1Dest")) == (int) seqs::Dest::cutoff && juce::roundToInt (value (p, "mod1Src")) == 0,
+           "RANDOM branche MOD 1 sur la coupure");
+
+    // RANDOM ALL change la banque
+    std::vector<float> bank;
+    for (int i = 0; i < seqs::numLfos; ++i)
+        for (const char* n : { "Rate", "Shape", "Step" })
+            bank.push_back (value (p, SequencesAudioProcessor::lfoId (i, n)));
+    p.randomizeAll();
+    int bankChanged = 0;
+    size_t k = 0;
+    for (int i = 0; i < seqs::numLfos; ++i)
+        for (const char* n : { "Rate", "Shape", "Step" })
+            bankChanged += std::abs (value (p, SequencesAudioProcessor::lfoId (i, n)) - bank[k++]) > 1e-3f ? 1 : 0;
+    CHECK (bankChanged > 6, "RANDOM ALL change la banque : %d", bankChanged);
 
     // Décalage dans la longueur choisie
-    set (p, "seqASteps", 4.0f);
-    for (int i = 0; i < 4; ++i) set (p, SequencesAudioProcessor::stepId (0, i), 0.1f * (float) (i + 1));
-    set (p, SequencesAudioProcessor::glideId (0, 0), 1.0f);
-    set (p, SequencesAudioProcessor::glideId (0, 1), 0.0f);
-    set (p, SequencesAudioProcessor::glideId (0, 2), 0.0f);
-    set (p, SequencesAudioProcessor::glideId (0, 3), 0.0f);
-    const float outside = value (p, SequencesAudioProcessor::stepId (0, 10));
-    p.rotateSequence (0, +1);
-    CHECK (std::abs (value (p, SequencesAudioProcessor::stepId (0, 0)) - 0.4f) < 1e-3f, "décalage : le dernier pas passe devant");
-    CHECK (std::abs (value (p, SequencesAudioProcessor::stepId (0, 1)) - 0.1f) < 1e-3f, "décalage : pas 1");
-    CHECK (value (p, SequencesAudioProcessor::glideId (0, 1)) == 1.0f, "décalage : le glide suit");
-    CHECK (value (p, SequencesAudioProcessor::stepId (0, 10)) == outside, "décalage : hors de la boucle, rien ne bouge");
-    p.rotateSequence (0, -1);
-    CHECK (std::abs (value (p, SequencesAudioProcessor::stepId (0, 0)) - 0.1f) < 1e-3f, "décalage aller-retour");
+    set (p, "seqSteps", 4.0f);
+    for (int i = 0; i < 4; ++i) set (p, SequencesAudioProcessor::stepId (i), (float) (i + 1));
+    const int outside = stepSource (p, 10);
+    p.rotatePattern (+1);
+    CHECK (stepSource (p, 0) == 4 && stepSource (p, 1) == 1 && stepSource (p, 3) == 3, "décalage à droite");
+    CHECK (stepSource (p, 10) == outside, "hors de la boucle, rien ne bouge");
+    p.rotatePattern (-1);
+    CHECK (stepSource (p, 0) == 1 && stepSource (p, 3) == 4, "décalage aller-retour");
 
-    p.clearSequence (0, 0.0f);
-    bool allZero = true;
-    for (int i = 0; i < 32; ++i)
-        allZero = allZero && value (p, SequencesAudioProcessor::stepId (0, i)) == 0.0f && value (p, SequencesAudioProcessor::glideId (0, i)) == 0.0f;
-    CHECK (allZero, "CLEAR");
+    p.fillPattern (0);
+    bool allOff = true;
+    for (int i = 0; i < 32; ++i) allOff = allOff && stepSource (p, i) == 0;
+    CHECK (allOff, "CLEAR");
 }
 
 static void testState()
 {
     SequencesAudioProcessor a;
     a.setRandomSeed (7);
-    a.randomizeSequence (0);
+    a.randomizeAll();
     set (a, "cutoff", 2500.0f);
-    set (a, "seqBRate", 5.0f);
+    set (a, "lfo2Rate", 5.0f);
     set (a, "voiceMode", 0.0f);
     a.apvts.state.setProperty ("editorWidth", 930, nullptr);
 
@@ -250,7 +293,7 @@ static void testPresets()
     CHECK (p.presets.getDisplayName() == "DEFAULT", "nom au départ : %s", p.presets.getDisplayName().toRawUTF8());
 
     set (p, "fmIndex", 7.5f);
-    set (p, SequencesAudioProcessor::stepId (1, 5), 0.33f);
+    set (p, SequencesAudioProcessor::stepId (5), 7.0f);
     CHECK (p.presets.isModified(), "modifié");
     CHECK (p.presets.save ("Hitech Seq"), "enregistré");
     CHECK (! p.presets.isModified(), "plus modifié après SAVE");
@@ -260,7 +303,7 @@ static void testPresets()
 
     CHECK (p.presets.load (dir.getChildFile ("Hitech Seq.seqpreset")), "rechargé");
     CHECK (std::abs (value (p, "fmIndex") - 7.5f) < 1e-3f, "valeur du preset");
-    CHECK (std::abs (value (p, SequencesAudioProcessor::stepId (1, 5)) - 0.33f) < 1e-3f, "pas du preset");
+    CHECK (stepSource (p, 5) == 7, "pas du preset");
 
     dir.deleteRecursively();
 }
@@ -277,37 +320,41 @@ static void testEditor()
 
     auto* e = dynamic_cast<SequencesAudioProcessorEditor*> (editor.get());
     e->setUiScale (0.75f);
-    CHECK (editor->getWidth() == 930, "75 %% : %d", editor->getWidth());
-    CHECK ((int) p.apvts.state.getProperty ("editorWidth") == 930, "taille enregistrée");
+    CHECK (editor->getWidth() == 990, "75 %% : %d", editor->getWidth());
+    CHECK ((int) p.apvts.state.getProperty ("editorWidth") == 990, "taille enregistrée");
 
     // RANDOM depuis l'interface
     p.setRandomSeed (99);
-    std::vector<float> before;
-    for (int i = 0; i < 32; ++i) before.push_back (value (p, SequencesAudioProcessor::stepId (0, i)));
-    e->getFacade().getRandomButton (0).triggerClick();
+    std::vector<int> before;
+    for (int i = 0; i < 32; ++i) before.push_back (stepSource (p, i));
+    e->getFacade().getRandomButton().triggerClick();
     juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
     int changedSteps = 0;
     for (int i = 0; i < 32; ++i)
-        changedSteps += std::abs (value (p, SequencesAudioProcessor::stepId (0, i)) - before[(size_t) i]) > 1e-4f ? 1 : 0;
-    CHECK (changedSteps > 8, "bouton RANDOM : %d pas changés", changedSteps);
+        changedSteps += stepSource (p, i) != before[(size_t) i] ? 1 : 0;
+    CHECK (changedSteps > 6, "bouton RANDOM : %d pas changés", changedSteps);
 
-    // Dessin dans la grille : un clic en haut d'une case met le pas au maximum
-    auto& grid = e->getFacade().getGrid (1);
-    const auto local = juce::Point<float> ((float) grid.getWidth() / 32.0f * 6.5f, 2.0f);
-    juce::MouseEvent down (juce::Desktop::getInstance().getMainMouseSource(), local, juce::ModifierKeys(), 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                           &grid, &grid, juce::Time::getCurrentTime(), local, juce::Time::getCurrentTime(), 1, false);
-    grid.mouseDown (down);
-    grid.mouseUp (down);
-    CHECK (value (p, SequencesAudioProcessor::stepId (1, 6)) > 0.95f, "dessin d'un pas : %.3f", value (p, SequencesAudioProcessor::stepId (1, 6)));
-
-    // Clic sur la rangée des glides
-    const auto glidePoint = juce::Point<float> ((float) grid.getWidth() / 32.0f * 9.5f, (float) grid.getHeight() - 5.0f);
-    const float glideBefore = value (p, SequencesAudioProcessor::glideId (1, 9));
-    juce::MouseEvent glideClick (juce::Desktop::getInstance().getMainMouseSource(), glidePoint, juce::ModifierKeys(), 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                 &grid, &grid, juce::Time::getCurrentTime(), glidePoint, juce::Time::getCurrentTime(), 1, false);
-    grid.mouseDown (glideClick);
-    grid.mouseUp (glideClick);
-    CHECK (value (p, SequencesAudioProcessor::glideId (1, 9)) != glideBefore, "glide basculé");
+    // Matrice : un clic sur la ligne CHAOS 2, colonne 6
+    auto& m = e->getFacade().getMatrix();
+    auto click = [&m] (int column, int row, bool right = false)
+    {
+        const float cw = (float) (m.getWidth() - ui::StepMatrix::labelWidth) / 32.0f;
+        const float rh = (float) m.getHeight() / (float) ui::StepMatrix::numRows;
+        const juce::Point<float> pt ((float) ui::StepMatrix::labelWidth + cw * ((float) column + 0.5f), rh * ((float) row + 0.5f));
+        const auto mods = right ? juce::ModifierKeys (juce::ModifierKeys::rightButtonModifier) : juce::ModifierKeys();
+        juce::MouseEvent ev (juce::Desktop::getInstance().getMainMouseSource(), pt, mods, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                             &m, &m, juce::Time::getCurrentTime(), pt, juce::Time::getCurrentTime(), 1, false);
+        m.mouseDown (ev);
+        m.mouseUp (ev);
+    };
+    click (6, ui::StepMatrix::rowForSource (8));
+    CHECK (stepSource (p, 6) == 8, "matrice : pas 7 sur CHAOS 2 (%d)", stepSource (p, 6));
+    click (6, ui::StepMatrix::rowForSource (3));
+    CHECK (stepSource (p, 6) == 3, "matrice : pas 7 sur LFO 3");
+    click (6, 0, true);
+    CHECK (stepSource (p, 6) == 0, "clic droit : OFF");
+    click (9, ui::StepMatrix::rowForSource (0));
+    CHECK (stepSource (p, 9) == 0, "ligne OFF");
 
     // Rendu de la façade sans erreur
     juce::Image image (juce::Image::ARGB, SequencesFacade::width, SequencesFacade::height, true);
