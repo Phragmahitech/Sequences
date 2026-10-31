@@ -5,20 +5,23 @@
 #include <cmath>
 #include <cstdint>
 
+#include "Wavetable.h"
+
 /**
     Moteur de Sequences (sans JUCE, testable seul).
 
-    Une voix = opérateur FM (porteuse sinus + modulante à 9 formes, dont 3 « Reso », avec feedback)
-    + oscillateur analogique avec hard sync (BLEP) + bruit -> distorsion (avant ou après le filtre)
-    -> filtre d'état (LP / BP / HP, 12 ou 24 dB) -> ampli. Deux enveloppes ADSR (ampli, modulation).
+    Une voix = 2 oscillateurs wavetable (A et B) calculés en suréchantillonnage x2, chacun avec
+    OCT (octaves), COARSE (demi-tons, continu : il glisse quand on le tourne ou le module), FINE,
+    POS (position dans la table) et un WARP à la façon de Serum : SYNC, FM / AM / RM depuis l'autre
+    oscillateur (A est modulé par B, B par A). + bruit -> distorsion (avant ou après le filtre)
+    -> filtre d'état (LP / BP / HP, 12 ou 24 dB) -> volume. Deux enveloppes ADSR (ENV 1 = ampli, ENV 2).
 
-    Modulation, à la façon du LFO SEQUENCER d'Alaskan Bites :
-      - une banque de 6 LFO (période synchro au tempo, forme, quantité, STEP = LFO découpé en marches,
-        phase, bipolaire / unipolaire) et 2 CHAOS (aléatoire en marches ou lissé) ;
-      - un séquenceur de 1 à 32 pas : chaque pas choisit QUELLE source joue (ou OFF). À chaque pas,
-        la source peut repartir de sa phase (RESTART) ; un court fondu évite les clics (XFADE) ;
-      - 4 routages : source (SEQ ou une source de la banque) -> destination, profondeur ±.
-    En mode NOTE, le temps part de chaque note (pas au legato). En mode HOST, il suit le morceau.
+    Modulation :
+      - une banque de 6 LFO et 2 CHAOS, un séquenceur qui choisit la source à chaque pas (SEQ),
+        plus ENV 2 et la vélocité ;
+      - 16 routages source -> destination. Une modulation s'ajoute à la position du potard
+        (0..1, sur toute sa course), comme dans Serum : +100 % = toute la course vers la droite.
+    En mode NOTE, le temps des LFO part de chaque note (pas au legato). En mode HOST, il suit le morceau.
 */
 namespace seqs
 {
@@ -27,22 +30,60 @@ constexpr int maxSteps = 32;
 constexpr int maxVoices = 8;
 constexpr int numLfos = 6;
 constexpr int numChaos = 2;
-constexpr int numSources = numLfos + numChaos;   // 1..6 = LFO, 7..8 = CHAOS (0 = OFF / SEQ)
-constexpr int numSlots = 4;
+constexpr int numSources = numLfos + numChaos;   // sources du séquenceur : 1..6 = LFO, 7..8 = CHAOS (0 = OFF)
+constexpr int numSlots = 16;
+constexpr int numOscs = 2;
 constexpr double twoPi = 6.283185307179586;
 constexpr double pi = 3.141592653589793;
 
+/** Sources d'un routage. */
+enum ModSource : int { srcSeq = 0, srcLfo1 = 1, srcChaos1 = 7, srcEnv2 = 9, srcVelocity = 10, numModSources = 11 };
+
+/** Destinations : chacune correspond à un potard de l'interface. */
 enum class Dest : int
 {
-    off = 0, cutoff, resonance, fmIndex, fmRatio, pitch, pulseWidth, drive, amp,
-    fmLevel, oscLevel, noise, pan, feedback, sync, timbre, count
+    off = 0,
+    aLevel, aPos, aCoarse, aFine, aWarp,
+    bLevel, bPos, bCoarse, bFine, bWarp,
+    noise, pitch, pan, volume,
+    cutoff, resonance, drive,
+    count
 };
+constexpr int numDests = (int) Dest::count;
 
-enum class Wave : int { saw = 0, square, triangle, sine };
-enum class ModWave : int { sine = 0, dblSine, saw, square, pulse, sawPulse, reso1, reso2, reso3, count };
+enum class Warp : int { off = 0, sync, fm, am, rm, count };
 enum class LfoShape : int { sine = 0, triangle, saw, ramp, square, pulse, expDown, expUp, count };
 enum class FilterType : int { lowpass = 0, bandpass, highpass };
 enum class DriveType : int { soft = 0, fold, crush };
+
+/** Position du potard (0..1) -> valeur réelle, pour chaque destination. */
+struct DestRange
+{
+    static float toReal (Dest d, float n)
+    {
+        if (d == Dest::aCoarse || d == Dest::bCoarse)   return -48.0f + 96.0f * n;          // demi-tons
+        if (d == Dest::aFine || d == Dest::bFine)       return -100.0f + 200.0f * n;        // centièmes
+        if (d == Dest::pitch)                           return -24.0f + 48.0f * n;          // demi-tons
+        if (d == Dest::pan)                             return -1.0f + 2.0f * n;
+        if (d == Dest::volume)                          { const float g = n / 0.8f; return g * g; }   // gain, 0.8 = 0 dB
+        if (d == Dest::cutoff)                          return 20.0f * std::pow (1000.0f, n);  // Hz
+        return n;
+    }
+
+    static float toNorm (Dest d, float v)
+    {
+        if (d == Dest::aCoarse || d == Dest::bCoarse)   return (v + 48.0f) / 96.0f;
+        if (d == Dest::aFine || d == Dest::bFine)       return (v + 100.0f) / 200.0f;
+        if (d == Dest::pitch)                           return (v + 24.0f) / 48.0f;
+        if (d == Dest::pan)                             return (v + 1.0f) * 0.5f;
+        if (d == Dest::volume)                          return 0.8f * std::sqrt (std::max (0.0f, v));
+        if (d == Dest::cutoff)                          return std::log (std::max (20.0f, v) / 20.0f) / std::log (1000.0f);
+        return v;
+    }
+
+    /** Hauteurs : lissage plus long, pour que COARSE glisse quand on le tourne. */
+    static bool isPitch (Dest d)  { return d == Dest::aCoarse || d == Dest::bCoarse || d == Dest::pitch; }
+};
 
 struct LfoSettings
 {
@@ -74,55 +115,53 @@ struct SeqSettings
     std::array<int, maxSteps> pattern {};   // 0 = OFF, 1..8 = source
 };
 
+struct OscSettings
+{
+    const Wavetable* table = nullptr;   // nullptr = table intégrée BASIC SHAPES
+    int octave = 0;
+    Warp warp = Warp::off;
+};
+
 struct Settings
 {
-    // Voix
+    /** Position (0..1) de chaque potard modulable. */
+    std::array<float, numDests> base {};
+
+    std::array<OscSettings, numOscs> osc {};
+
     bool mono = false;
     float glideMs = 60.0f;
-    float velocity = 0.5f;
-    int transpose = 0;
+    float velocity = 0.5f;       // sensibilité à la vélocité
 
-    // FM
-    float fmLevel = 0.7f, fmRatio = 2.0f, fmIndex = 3.0f, fmFeedback = 0.0f, fmEnv = 0.3f;
-    ModWave modWave = ModWave::sine;
-    float timbre = 0.3f;
-
-    // Oscillateur
-    float oscLevel = 0.4f;
-    Wave oscWave = Wave::saw;
-    int oscOctave = 0;
-    float oscDetune = 0.0f;      // centièmes
-    float oscPw = 0.5f;
-    float oscSync = 0.0f;        // 0..1 -> l'oscillateur esclave monte jusqu'à 4 octaves
-
-    float noise = 0.0f;
-
-    // Filtre
     FilterType filterType = FilterType::lowpass;
     bool slope24 = true;
-    float cutoff = 1200.0f;
-    float resonance = 0.35f;
-    float filterEnv = 0.3f;
     float keyTrack = 0.5f;
 
-    // Enveloppes (secondes, sustain 0..1)
     float ampA = 0.001f, ampD = 0.3f, ampS = 0.8f, ampR = 0.08f;
     float modA = 0.001f, modD = 0.18f, modS = 0.0f, modR = 0.1f;
 
-    // Distorsion
     DriveType driveType = DriveType::soft;
-    float drive = 0.0f;
     bool drivePost = false;
 
-    float level = 1.0f;
-
-    // Modulation
     std::array<LfoSettings, numLfos> lfo {};
     std::array<ChaosSettings, numChaos> chaos {};
     SeqSettings seq {};
-    std::array<int, numSlots> slotSource {};                  // 0 = SEQ, 1..8 = source de la banque
-    std::array<Dest, numSlots> slotDest { Dest::off, Dest::off, Dest::off, Dest::off };
-    std::array<float, numSlots> slotAmount {};                 // -1..1
+
+    std::array<int, numSlots> slotSource {};
+    std::array<Dest, numSlots> slotDest {};
+    std::array<float, numSlots> slotAmount {};   // -1..1
+
+    Settings()
+    {
+        slotDest.fill (Dest::off);
+        auto set = [this] (Dest d, float real) { base[(size_t) d] = DestRange::toNorm (d, real); };
+        set (Dest::aLevel, 0.8f);  set (Dest::aPos, 0.0f); set (Dest::aCoarse, 0.0f); set (Dest::aFine, 0.0f); set (Dest::aWarp, 0.0f);
+        set (Dest::bLevel, 0.0f);  set (Dest::bPos, 0.0f); set (Dest::bCoarse, 0.0f); set (Dest::bFine, 0.0f); set (Dest::bWarp, 0.0f);
+        set (Dest::noise, 0.0f);   set (Dest::pitch, 0.0f); set (Dest::pan, 0.0f);    set (Dest::volume, 1.0f);
+        set (Dest::cutoff, 20000.0f); set (Dest::resonance, 0.0f); set (Dest::drive, 0.0f);
+    }
+
+    float real (Dest d) const     { return DestRange::toReal (d, base[(size_t) d]); }
 };
 
 //==============================================================================
@@ -238,7 +277,7 @@ struct Mod
             }
             case LfoShape::sine:
             case LfoShape::count:
-            default:                 return (float) std::sin (twoPi * p);
+            default:                 return std::sin ((float) (twoPi * p));
         }
     }
 
@@ -284,7 +323,7 @@ struct Mod
         if (src > numLfos && src <= numSources)
         {
             const int c = src - numLfos - 1;
-            return chaos (s.chaos[(size_t) c], tAbs, chaosSeed + (uint64_t) c * 0x5851F42D4C957F2Dull);
+            return chaos (s.chaos[(size_t) c], tAbs, chaosSeed + (uint64_t) c * (uint64_t) 0x5851F42D4C957F2Dull);
         }
         return 0.0f;
     }
@@ -469,35 +508,83 @@ namespace detail
         return x * (27.0f + x2) / (27.0f + 9.0f * x2);
     }
 
-    inline float noteToHz (double note)     { return (float) (440.0 * std::exp2 ((note - 69.0) / 12.0)); }
-
-    /** Formes de la modulante FM. p = phase 0..1, timbre 0..1. */
-    inline double modWave (ModWave w, double p, double timbre)
-    {
-        switch (w)
-        {
-            case ModWave::dblSine:  return 0.57 * (std::sin (twoPi * p) + std::sin (2.0 * twoPi * p));
-            case ModWave::saw:      return 2.0 * p - 1.0;
-            case ModWave::square:   return p < 0.5 ? 1.0 : -1.0;
-            case ModWave::pulse:    return p < 0.5 - 0.42 * timbre ? 1.0 : -1.0;
-            case ModWave::sawPulse: return p < 0.5 ? 4.0 * p - 1.0 : -1.0;
-            case ModWave::reso1:
-            case ModWave::reso2:
-            case ModWave::reso3:
-            {
-                // Résonance façon Casio CZ : un cosinus rapide dans une fenêtre qui se referme
-                const double r = 1.0 + 15.0 * timbre;
-                double window = 1.0 - p;                                          // RESO 1 : dent de scie
-                if (w == ModWave::reso2) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;   // RESO 2 : triangle
-                if (w == ModWave::reso3) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;      // RESO 3 : trapèze
-                return std::cos (twoPi * r * p) * window;
-            }
-            case ModWave::sine:
-            case ModWave::count:
-            default:                return std::sin (twoPi * p);
-        }
-    }
+    inline double noteToHz (double note)     { return 440.0 * std::exp2 ((note - 69.0) / 12.0); }
 }
+
+//==============================================================================
+/** Décimateur ÷2 : filtre demi-bande à phase linéaire (95 coefficients, fenêtre de Kaiser).
+    Bande passante jusqu'à 0,44 fe, coupure au-delà de 0,56 fe (fe = fréquence de sortie). */
+class HalfbandDecimator
+{
+public:
+    static constexpr int taps = 95;
+    static constexpr int centre = taps / 2;
+
+    void reset()                       { history.fill (0.0f); pos = 0; }
+
+    /** Deux échantillons à 2 fe -> un échantillon à fe. */
+    float process (float a, float b)
+    {
+        push (a);
+        push (b);
+
+        const auto& h = coefficients();
+        // Coefficients non nuls : le centre et les décalages impairs
+        // Coefficients non nuls : le centre et les décalages impairs (symétriques)
+        const float* x = history.data() + pos + taps - centre;   // x[0] = l'échantillon du centre
+        float sum = h[centre] * x[0];
+        for (int k = 1; k <= centre; k += 2)
+            sum += h[(size_t) (centre - k)] * (x[k] + x[-k]);
+        return sum;
+    }
+
+    static const std::array<float, taps>& coefficients()
+    {
+        static const std::array<float, taps> h = []
+        {
+            std::array<float, taps> c {};
+            const double beta = 9.0;
+            auto bessel = [] (double x)
+            {
+                double sum = 1.0, term = 1.0;
+                for (int k = 1; k < 40; ++k)
+                {
+                    term *= (x / (2.0 * k)) * (x / (2.0 * k));
+                    sum += term;
+                }
+                return sum;
+            };
+            double total = 0.0;
+            for (int n = 0; n < taps; ++n)
+            {
+                const double m = n - centre;
+                const double sinc = n == centre ? 0.5 : std::sin (pi * m / 2.0) / (pi * m);
+                const double r = m / centre;
+                const double window = bessel (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / bessel (beta);
+                c[(size_t) n] = (float) (sinc * window);
+                total += c[(size_t) n];
+            }
+            for (auto& v : c)
+                v = (float) (v / total);
+            return c;
+        }();
+        return h;
+    }
+
+private:
+    void push (float x)
+    {
+        pos = (pos + 1) % taps;
+        history[(size_t) pos] = x;
+        history[(size_t) (pos + taps)] = x;
+    }
+
+    /** k = 0 : le plus récent. */
+    float at (int k) const             { return history[(size_t) (pos + taps - k)]; }
+
+    std::array<float, 2 * taps> history {};
+    int pos = 0;
+};
 
 //==============================================================================
 class Envelope
@@ -605,141 +692,20 @@ struct Svf
 };
 
 //==============================================================================
-/** Oscillateur avec hard sync, sauts corrigés par polyBLEP (sortie retardée d'un échantillon). */
-class SyncOscillator
-{
-public:
-    void reset()          { master = slave = 0.0; pending = 0.0; }
-
-    /** dtMaster : fréquence de l'oscillateur maître / fe ; dtSlave : celle de l'esclave (>= maître). */
-    double process (Wave wave, double dtMaster, double dtSlave, double pw, bool sync)
-    {
-        double current = 0.0;   // corrections pour l'échantillon qui sort au prochain appel
-        double tStart = 0.0;    // temps déjà parcouru dans cet échantillon (0..1)
-
-        if (sync)
-        {
-            const double masterNext = master + dtMaster;
-            if (masterNext >= 1.0)
-            {
-                const double ts = std::clamp ((1.0 - master) / dtMaster, 0.0, 1.0);
-                advance (wave, dtSlave, pw, tStart, ts, current);
-                // Saut vers la phase 0 au moment du sync
-                const double before = naive (wave, slave, pw), after = naive (wave, 0.0, pw);
-                addStep (after - before, 1.0 - ts, current);
-                slave = 0.0;
-                tStart = ts;
-                master = masterNext - 1.0;
-            }
-            else
-                master = masterNext;
-        }
-        else
-        {
-            master = slave;   // reste aligné pour un sync sans clic quand on l'allume
-        }
-
-        advance (wave, dtSlave, pw, tStart, 1.0, current);
-
-        const double value = naive (wave, slave, pw) + current;
-        const double out = pending;
-        pending = value;
-        return out;
-    }
-
-private:
-    static double naive (Wave wave, double p, double pw)
-    {
-        switch (wave)
-        {
-            case Wave::saw:      return 2.0 * p - 1.0;
-            case Wave::square:   return p < pw ? 1.0 : -1.0;
-            case Wave::triangle: return p < 0.5 ? 4.0 * p - 1.0 : 3.0 - 4.0 * p;
-            case Wave::sine:
-            default:             return std::sin (twoPi * p);
-        }
-    }
-
-    /** Saut de hauteur h ; d = avance de l'échantillon qui sort ensuite après le saut (0..1). */
-    void addStep (double h, double d, double& current)
-    {
-        d = std::clamp (d, 0.0, 1.0);
-        pending += 0.5 * h * d * d;
-        current -= 0.5 * h * (1.0 - d) * (1.0 - d);
-    }
-
-    /** Avance la phase esclave de t0 à t1 (fractions de l'échantillon), en corrigeant ses sauts. */
-    void advance (Wave wave, double dt, double pw, double t0, double t1, double& current)
-    {
-        double remaining = (t1 - t0) * dt;
-        double t = t0;
-
-        for (int guard = 0; guard < 4 && remaining > 0.0; ++guard)
-        {
-            // Prochain saut naturel : passage par pw (carré) ou fin de cycle
-            double edge = 1.0;
-            double h = 0.0;
-            bool wrap = true;
-
-            if (wave == Wave::square && slave < pw)
-            {
-                edge = pw;
-                wrap = false;
-            }
-
-            const double toEdge = edge - slave;
-            if (toEdge > remaining)
-            {
-                slave += remaining;
-                return;
-            }
-
-            t += toEdge / dt;
-            remaining -= toEdge;
-
-            if (wave == Wave::saw)              h = -2.0;
-            else if (wave == Wave::square)      h = wrap ? 2.0 : -2.0;
-
-            if (h != 0.0)
-                addStep (h, 1.0 - t, current);
-
-            slave = wrap ? 0.0 : edge;
-        }
-
-        slave = std::min (slave + remaining, 0.999999);
-    }
-
-    double master = 0.0, slave = 0.0, pending = 0.0;
-};
-
-//==============================================================================
-/** Valeurs lissées partagées par toutes les voix (évite les « escaliers » quand on tourne un potard). */
+/** Valeurs lissées partagées par toutes les voix (positions de potards, 0..1). */
 struct Smoothed
 {
-    float fmLevel = 0, fmRatio = 1, fmIndex = 0, fmFeedback = 0, fmEnv = 0, timbre = 0;
-    float oscLevel = 0, oscPw = 0.5f, oscDetune = 0, oscSync = 0, noise = 0;
-    float logCutoff = 10, resonance = 0, filterEnv = 0, keyTrack = 0;
-    float drive = 0, level = 1;
-    float logCutoffTarget = 10;
+    std::array<float, numDests> base {};
 
-    void snap (const Settings& s)
+    void snap (const Settings& s)       { base = s.base; }
+
+    void step (const Settings& s, float fast, float slow)
     {
-        fmLevel = s.fmLevel; fmRatio = s.fmRatio; fmIndex = s.fmIndex; fmFeedback = s.fmFeedback; fmEnv = s.fmEnv; timbre = s.timbre;
-        oscLevel = s.oscLevel; oscPw = s.oscPw; oscDetune = s.oscDetune; oscSync = s.oscSync; noise = s.noise;
-        logCutoff = logCutoffTarget = std::log2 (std::max (1.0f, s.cutoff)); resonance = s.resonance; filterEnv = s.filterEnv;
-        keyTrack = s.keyTrack; drive = s.drive; level = s.level;
-    }
-
-    void setTargets (const Settings& s)              { logCutoffTarget = std::log2 (std::max (1.0f, s.cutoff)); }
-
-    void step (const Settings& s, float c)
-    {
-        auto f = [c] (float& v, float target) { v += (target - v) * c; };
-        f (fmLevel, s.fmLevel); f (fmRatio, s.fmRatio); f (fmIndex, s.fmIndex); f (fmFeedback, s.fmFeedback); f (fmEnv, s.fmEnv);
-        f (timbre, s.timbre);
-        f (oscLevel, s.oscLevel); f (oscPw, s.oscPw); f (oscDetune, s.oscDetune); f (oscSync, s.oscSync); f (noise, s.noise);
-        f (logCutoff, logCutoffTarget); f (resonance, s.resonance); f (filterEnv, s.filterEnv);
-        f (keyTrack, s.keyTrack); f (drive, s.drive); f (level, s.level);
+        for (int d = 1; d < numDests; ++d)
+        {
+            const float c = DestRange::isPitch ((Dest) d) ? slow : fast;
+            base[(size_t) d] += (s.base[(size_t) d] - base[(size_t) d]) * c;
+        }
     }
 };
 
@@ -762,22 +728,21 @@ public:
         modEnv.reset();
         note = -1;
         held = false;
-        carrierPhase = modPhase = 0.0;
-        fbPrev1 = fbPrev2 = 0.0;
-        osc.reset();
+        phase.fill (0.0);
+        lastOut.fill (0.0f);
+        decimator.reset();
         for (auto& f : filters) f.reset();
         crushHold = 0.0f;
         crushCounter = 0.0;
         slotValue.fill (0.0f);
+        offsets.fill (0.0f);
         seqBeats = 0.0;
         lastStep = -1;
-        lastSeqValue = 0.0f;
     }
 
     bool isActive() const noexcept           { return ampEnv.isActive(); }
     bool isReleasing() const noexcept        { return ampEnv.isReleasing(); }
 
-    /** retrigger = enveloppes et séquenceur repartent ; sinon legato (seule la hauteur change). */
     void start (int midiNote, float vel, const Settings& s, bool retrigger, bool glide, uint64_t order, float panPosition,
                 uint64_t newChaosSeed)
     {
@@ -789,16 +754,17 @@ public:
 
         held = true;
         startOrder = order;
-        pan = panPosition;
+        spread = panPosition;
 
         if (retrigger || ! wasActive)
         {
             velocity = std::clamp (vel, 0.0f, 1.0f);
             if (! wasActive)
             {
-                carrierPhase = modPhase = 0.0;
-                fbPrev1 = fbPrev2 = 0.0;
-                osc.reset();
+                // Voix au repos : phases à zéro -> attaques identiques d'une note à l'autre
+                phase.fill (0.0);
+                lastOut.fill (0.0f);
+                decimator.reset();
                 for (auto& f : filters) f.reset();
             }
             ampEnv.noteOn (s.ampA, s.ampD, s.ampS);
@@ -828,130 +794,167 @@ public:
 
     void setGlideTarget (int midiNote)       { note = midiNote; targetNote = (double) midiNote; }
 
+    /** neededSources : bit k = la source k sert dans un routage. */
     void render (const Settings& s, const Smoothed& sm, float& outL, float& outR, double beatsInc, double bpm,
-                 double hostBeats, double glideCoef, float pitchBend, uint64_t& noiseState, uint64_t hostChaosSeed)
+                 double hostBeats, double glideCoef, float pitchBend, uint64_t& noiseState, uint64_t hostChaosSeed,
+                 uint32_t neededSources)
     {
         if (! isActive())
             return;
 
         currentNote += (targetNote - currentNote) * glideCoef;
 
+        const float ampLevel = ampEnv.next();
+        const float modLevel = modEnv.next();
+
         // --- Modulation ---------------------------------------------------------
-        std::array<float, (size_t) Dest::count> add {};
-        float ampGain = 1.0f;
+        offsets.fill (0.0f);
         {
             const bool host = s.seq.hostSync;
             const double t = host ? hostBeats : seqBeats;
             const uint64_t seed = host ? hostChaosSeed : chaosSeed;
 
-            // Le séquenceur tourne toujours (tête de lecture affichée même sans routage)
-            const auto out = Mod::seq (s, t, bpm, seed);
-            const float seqValue = out.value;
-            lastStep = out.step;
-            lastSeqValue = out.value;
+            std::array<float, numModSources> value {};
+            {
+                // Le séquenceur tourne toujours (tête de lecture affichée même sans routage)
+                const auto out = Mod::seq (s, t, bpm, seed);
+                value[srcSeq] = out.value;
+                lastStep = out.step;
+            }
+            for (int k = srcLfo1; k < srcEnv2; ++k)
+                if (neededSources & (1u << k))
+                    value[(size_t) k] = Mod::source (s, k, t, t, seed);
+            value[srcEnv2] = modLevel;
+            value[srcVelocity] = velocity;
 
             for (int k = 0; k < numSlots; ++k)
             {
                 const auto d = s.slotDest[(size_t) k];
-                const float amt = s.slotAmount[(size_t) k];
-                float target = 0.0f;
-
-                if (d != Dest::off && std::abs (amt) > 1.0e-6f)
+                float& sv = slotValue[(size_t) k];
+                if (d == Dest::off)
                 {
-                    const int src = s.slotSource[(size_t) k];
-                    const float v = src == 0 ? seqValue : Mod::source (s, src, t, t, seed);
-                    target = amt * v;
+                    sv = 0.0f;
+                    continue;
                 }
 
-                float& sv = slotValue[(size_t) k];
+                const int src = std::clamp (s.slotSource[(size_t) k], 0, numModSources - 1);
+                const float target = s.slotAmount[(size_t) k] * value[(size_t) src];
                 sv = firstSample ? target : sv + (target - sv) * slotCoef;
-
-                if (d == Dest::amp && std::abs (amt) > 1.0e-6f)
-                    ampGain *= std::clamp (amt > 0.0f ? 1.0f - amt + sv : 1.0f + sv, 0.0f, 1.0f);
-                else if (d != Dest::off)
-                    add[(size_t) d] += sv;
+                offsets[(size_t) d] += sv;
             }
         }
 
         firstSample = false;
         seqBeats += beatsInc;
 
-        auto mod = [&add] (Dest d) { return add[(size_t) d]; };
+        auto norm = [&] (Dest d) { return std::clamp (sm.base[(size_t) d] + offsets[(size_t) d], 0.0f, 1.0f); };
+        auto real = [&] (Dest d) { return DestRange::toReal (d, norm (d)); };
 
-        const float ampLevel = ampEnv.next();
-        const float modLevel = modEnv.next();
+        // --- Oscillateurs (suréchantillonnés x2) -----------------------------------
+        const double osRate = 2.0 * sampleRate;
+        const double baseNote = currentNote + pitchBend + real (Dest::pitch);
 
-        // --- Hauteur -------------------------------------------------------------
-        const double playedNote = currentNote + s.transpose + pitchBend + 24.0 * mod (Dest::pitch);
-        const double nyquist = 0.5 * sampleRate;
-        const double freq = std::min ((double) detail::noteToHz (playedNote), nyquist * 0.98);
-
-        // --- FM ------------------------------------------------------------------
-        double fm = 0.0;
-        const float fmLevel = std::clamp (sm.fmLevel + mod (Dest::fmLevel), 0.0f, 1.0f);
-        if (fmLevel > 0.0f)
+        struct OscFrame
         {
-            const double ratio = std::clamp ((double) sm.fmRatio * std::exp2 (3.0 * mod (Dest::fmRatio)), 0.0625, 32.0);
-            const double modFreq = freq * ratio;
-            const double index = std::clamp ((double) sm.fmIndex + 10.0 * (sm.fmEnv * modLevel + mod (Dest::fmIndex)), 0.0, 20.0);
-            const double fb = std::clamp ((double) sm.fmFeedback + mod (Dest::feedback), 0.0, 1.0);
-            const double timbre = std::clamp ((double) sm.timbre + mod (Dest::timbre), 0.0, 1.0);
+            const Wavetable* table;
+            double hz, inc, framePos, levelPos, syncRatio;
+            float warp, level;
+            Warp mode;
+        };
+        std::array<OscFrame, numOscs> o {};
 
-            double modOut = 0.0;
-            if (modFreq < nyquist)
+        for (int i = 0; i < numOscs; ++i)
+        {
+            const auto& os = s.osc[(size_t) i];
+            const Dest coarse = i == 0 ? Dest::aCoarse : Dest::bCoarse;
+            const Dest fine = i == 0 ? Dest::aFine : Dest::bFine;
+            const Dest pos = i == 0 ? Dest::aPos : Dest::bPos;
+            const Dest warp = i == 0 ? Dest::aWarp : Dest::bWarp;
+            const Dest level = i == 0 ? Dest::aLevel : Dest::bLevel;
+
+            auto& f = o[(size_t) i];
+            f.table = os.table != nullptr ? os.table : BuiltinTables::get (0);
+            f.mode = os.warp;
+            f.warp = norm (warp);
+            f.level = real (level);
+
+            f.hz = std::min (detail::noteToHz (baseNote + 12.0 * os.octave + real (coarse) + real (fine) * 0.01), osRate * 0.45);
+            f.inc = f.hz / osRate;
+            f.syncRatio = f.mode == Warp::sync ? std::exp2 (4.0 * f.warp) : 1.0;
+            f.framePos = (double) norm (pos) * (double) (f.table->numFrames - 1);
+        }
+
+        for (int i = 0; i < numOscs; ++i)
+        {
+            // Niveau de la table : harmoniques jusqu'à ~0,75 fe (le décimateur coupe au-dessus de 0,5 fe).
+            // En FM, chaque harmonique h balaie jusqu'à h × (f + 2π·D·fm) : on prend moins d'harmoniques.
+            auto& f = o[(size_t) i];
+            double effective = f.hz * f.syncRatio;
+            if (f.mode == Warp::fm && f.warp > 0.0f)
             {
-                double p = modPhase + fb * 1.4 * 0.5 * (fbPrev1 + fbPrev2) / twoPi;
-                p -= std::floor (p);
-                modOut = detail::modWave (s.modWave, p, timbre);
+                const double fm = o[(size_t) (1 - i)].hz;
+                effective = f.hz + twoPi * fmDepth * (double) f.warp * fm + fm;
             }
-            fbPrev2 = fbPrev1;
-            fbPrev1 = modOut;
-
-            fm = std::sin (twoPi * carrierPhase + index * modOut) * fmLevel;
-
-            modPhase += modFreq / sampleRate;
-            modPhase -= std::floor (modPhase);
+            f.levelPos = std::clamp (std::log2 (std::max (1.0e-9, effective * 1024.0 / (0.75 * sampleRate))), 0.0, (double) (wt::numLevels - 1));
         }
-        carrierPhase += freq / sampleRate;
-        carrierPhase -= std::floor (carrierPhase);
 
-        // --- Oscillateur (hard sync) ---------------------------------------------------
-        double analog = 0.0;
-        const float oscLevel = std::clamp (sm.oscLevel + mod (Dest::oscLevel), 0.0f, 1.0f);
+        std::array<float, 2> sub {};
+        for (int n = 0; n < 2; ++n)
         {
-            const double masterFreq = std::min (freq * std::exp2 ((double) s.oscOctave + sm.oscDetune / 1200.0), nyquist * 0.9);
-            const double syncAmount = std::clamp ((double) sm.oscSync + mod (Dest::sync), 0.0, 1.0);
-            const double slaveFreq = std::min (masterFreq * std::exp2 (4.0 * syncAmount), nyquist * 0.9);
-            const double pw = std::clamp ((double) sm.oscPw + 0.45 * mod (Dest::pulseWidth), 0.05, 0.95);
-            const double value = osc.process (s.oscWave, masterFreq / sampleRate, slaveFreq / sampleRate, pw, syncAmount > 1.0e-4);
-            analog = value * oscLevel;
+            // B d'abord (il lit la dernière sortie de A), puis A (il lit la sortie de B qui vient d'être calculée)
+            float outs[numOscs] {};
+            for (int i = numOscs - 1; i >= 0; --i)
+            {
+                const auto& f = o[(size_t) i];
+                const float other = i == 0 ? outs[1] : lastOut[0];
+
+                double p = phase[(size_t) i];
+                if (f.mode == Warp::sync)
+                    p = p * f.syncRatio;
+                else if (f.mode == Warp::fm)
+                    p += fmDepth * f.warp * other;
+                p -= std::floor (p);
+
+                float v = f.table->read (f.framePos, f.levelPos, p);
+                if (f.mode == Warp::am)
+                    v *= 1.0f - f.warp * 0.5f * (1.0f - other);
+                else if (f.mode == Warp::rm)
+                    v *= (1.0f - f.warp) + f.warp * other;
+
+                outs[i] = v;
+                phase[(size_t) i] += f.inc;
+                phase[(size_t) i] -= std::floor (phase[(size_t) i]);
+            }
+
+            lastOut[0] = outs[0];
+            lastOut[1] = outs[1];
+            sub[(size_t) n] = outs[0] * o[0].level + outs[1] * o[1].level;
         }
+
+        double x = decimator.process (sub[0], sub[1]);
 
         // --- Bruit ------------------------------------------------------------------
-        double noise = 0.0;
-        const float noiseLevel = std::clamp (sm.noise + mod (Dest::noise), 0.0f, 1.0f);
+        const float noiseLevel = real (Dest::noise);
         if (noiseLevel > 0.0f)
         {
             noiseState ^= noiseState << 13;
             noiseState ^= noiseState >> 7;
             noiseState ^= noiseState << 17;
-            noise = ((double) (noiseState >> 11) * (2.0 / 9007199254740992.0) - 1.0) * noiseLevel;
+            x += ((double) (noiseState >> 11) * (2.0 / 9007199254740992.0) - 1.0) * noiseLevel;
         }
 
-        double x = 0.6 * (fm + analog + noise);
+        x *= 0.5;
 
         // --- Distorsion / filtre ------------------------------------------------------
-        const float driveAmount = std::clamp (sm.drive + mod (Dest::drive), 0.0f, 1.0f);
+        const float driveAmount = real (Dest::drive);
         if (! s.drivePost)
             x = shape (x, s.driveType, driveAmount);
 
         {
-            const double octaves = 6.0 * (sm.filterEnv * modLevel + mod (Dest::cutoff))
-                                 + sm.keyTrack * (currentNote + s.transpose - 60.0) / 12.0;
-            const double cutoff = std::clamp (std::exp2 ((double) sm.logCutoff + octaves), 16.0, sampleRate * 0.45);
+            const double tracked = (double) real (Dest::cutoff) * std::exp2 (s.keyTrack * (currentNote - 60.0) / 12.0);
+            const double cutoff = std::clamp (tracked, 16.0, sampleRate * 0.45);
             const double g = std::tan (pi * cutoff / sampleRate);
-            const double res = std::clamp ((double) sm.resonance + mod (Dest::resonance), 0.0, 1.0);
-            const double k = 2.0 - 1.96 * res;
+            const double k = 2.0 - 1.96 * (double) real (Dest::resonance);
             x = filters[0].process (x, g, k, s.filterType);
             if (s.slope24)
                 x = filters[1].process (x, g, s.filterType == FilterType::bandpass ? std::max (k, 0.7) : std::max (k, 1.0), s.filterType);
@@ -960,25 +963,34 @@ public:
         if (s.drivePost)
             x = shape (x, s.driveType, driveAmount);
 
-        // --- Ampli + panoramique ------------------------------------------------------
+        // --- Volume + panoramique ------------------------------------------------------
         const float velGain = 1.0f - s.velocity * (1.0f - velocity);
-        const float gain = ampLevel * velGain * ampGain;
-        const float p = std::clamp (pan + mod (Dest::pan), -1.0f, 1.0f);
-        const float angle = (float) (0.25 * pi) * (p + 1.0f);
+        const float gain = ampLevel * velGain * real (Dest::volume);
+        const float p = std::clamp (spread + real (Dest::pan), -1.0f, 1.0f);
+        if (std::abs (p - cachedPan) > 1.0e-7f)
+        {
+            cachedPan = p;
+            const float angle = (float) (0.25 * pi) * (p + 1.0f);
+            panL = std::cos (angle) * 1.41421356f;
+            panR = std::sin (angle) * 1.41421356f;
+        }
         const float y = (float) x * gain;
-        outL += y * std::cos (angle) * 1.41421356f;
-        outR += y * std::sin (angle) * 1.41421356f;
+        outL += y * panL;
+        outR += y * panR;
 
         if (! std::isfinite (y))
             reset();
     }
 
+    /** FM : excursion de phase maximale, en cycles, à WARP = 100 %. */
+    static constexpr double fmDepth = 3.0;
+
     int note = -1;
     bool held = false;
     uint64_t startOrder = 0;
     int lastStep = -1;
-    float lastSeqValue = 0.0f;
     double seqBeats = 0.0;
+    std::array<float, numDests> offsets {};   // décalage de modulation de chaque potard (dernier échantillon)
 
 private:
     double shape (double x, DriveType type, float amount)
@@ -1019,10 +1031,11 @@ private:
     double sampleRate = 48000.0;
     Envelope ampEnv, modEnv;
     double targetNote = 60.0, currentNote = 60.0;
-    float velocity = 1.0f, pan = 0.0f;
-    double carrierPhase = 0.0, modPhase = 0.0;
-    double fbPrev1 = 0.0, fbPrev2 = 0.0;
-    SyncOscillator osc;
+    float velocity = 1.0f, spread = 0.0f;
+    float cachedPan = 2.0f, panL = 1.0f, panR = 1.0f;
+    std::array<double, numOscs> phase {};
+    std::array<float, numOscs> lastOut {};
+    HalfbandDecimator decimator;
     std::array<Svf, 2> filters {};
     float crushHold = 0.0f;
     double crushCounter = 0.0;
@@ -1068,7 +1081,6 @@ public:
 
     const Settings& getSettings() const noexcept     { return settings; }
 
-    /** Graine des CHAOS en mode HOST (le même morceau rejoue le même chaos). */
     void setHostChaosSeed (uint64_t seed) noexcept    { hostChaosSeed = seed; }
 
     //==========================================================================
@@ -1107,9 +1119,9 @@ public:
                         chosen = &v;
         }
 
-        static const float spread[] = { 0.0f, -0.18f, 0.18f, -0.09f, 0.09f, -0.27f, 0.27f, 0.0f };
+        static const float spreads[] = { 0.0f, -0.18f, 0.18f, -0.09f, 0.09f, -0.27f, 0.27f, 0.0f };
         const auto index = (size_t) (chosen - voices.data());
-        chosen->start (midiNote, velocity, settings, true, false, orderCounter, spread[index % 8], seed);
+        chosen->start (midiNote, velocity, settings, true, false, orderCounter, spreads[index % 8], seed);
     }
 
     void noteOff (int midiNote)
@@ -1162,27 +1174,31 @@ public:
 
         const double bpm = std::clamp (transport.bpm > 0.0 ? transport.bpm : 120.0, 20.0, 999.0);
         const double beatsInc = bpm / 60.0 / sampleRate;
-        const double smoothCoef = 1.0 - std::exp (-1.0 / (0.005 * sampleRate));
+        const float fast = (float) (1.0 - std::exp (-1.0 / (0.005 * sampleRate)));
+        const float slow = (float) (1.0 - std::exp (-1.0 / (0.015 * sampleRate)));
         const double glideCoef = settings.mono && settings.glideMs > 0.0f
                                      ? 1.0 - std::exp (-1.0 / (settings.glideMs * 0.001 * 0.4 * sampleRate))
                                      : 1.0;
+
+        uint32_t needed = 0;
+        for (int k = 0; k < numSlots; ++k)
+            if (settings.slotDest[(size_t) k] != Dest::off)
+                needed |= 1u << std::clamp (settings.slotSource[(size_t) k], 0, numModSources - 1);
 
         for (auto& v : voices)
             if (v.isActive())
                 v.updateTimes (settings);
 
-        smoothed.setTargets (settings);
-
         for (int i = 0; i < numSamples; ++i)
         {
-            smoothed.step (settings, (float) smoothCoef);
+            smoothed.step (settings, fast, slow);
 
             const double hostBeats = transport.playing ? std::max (0.0, transport.ppq + (double) (sampleOffset + i) * beatsInc)
                                                        : freeBeats;
             float l = 0.0f, r = 0.0f;
 
             for (auto& v : voices)
-                v.render (settings, smoothed, l, r, beatsInc, bpm, hostBeats, glideCoef, pitchBend, noiseState, hostChaosSeed);
+                v.render (settings, smoothed, l, r, beatsInc, bpm, hostBeats, glideCoef, pitchBend, noiseState, hostChaosSeed, needed);
 
             const float outL = l - dcInL + dcCoef * dcOutL;
             const float outR = r - dcInR + dcCoef * dcOutR;
@@ -1190,8 +1206,8 @@ public:
             dcOutL = std::isfinite (outL) ? outL : 0.0f;
             dcOutR = std::isfinite (outR) ? outR : 0.0f;
 
-            left[i] = dcOutL * smoothed.level;
-            right[i] = dcOutR * smoothed.level;
+            left[i] = dcOutL;
+            right[i] = dcOutR;
             freeBeats += beatsInc;
             lastHostBeats = hostBeats;
         }
@@ -1199,10 +1215,10 @@ public:
         updatePlayhead();
     }
 
-    /** Pas en cours (voix la plus récente ; -1 si rien ne joue ou séquenceur éteint). */
     int getPlayheadStep() const noexcept                  { return playheadStep; }
-    /** Temps du séquenceur de la voix la plus récente, en noires (-1 si rien ne joue). */
     double getPlayheadBeats() const noexcept              { return playheadBeats; }
+    /** Décalage de modulation actuel d'un potard (voix la plus récente ; 0 si rien ne joue). */
+    float getLiveOffset (Dest d) const noexcept           { return liveOffsets[(size_t) d]; }
 
     int activeVoiceCount() const
     {
@@ -1221,6 +1237,10 @@ private:
 
         playheadStep = latest != nullptr && settings.seq.on ? latest->lastStep : -1;
         playheadBeats = latest == nullptr ? -1.0 : (settings.seq.hostSync ? lastHostBeats : latest->seqBeats);
+        if (latest != nullptr)
+            liveOffsets = latest->offsets;
+        else
+            liveOffsets.fill (0.0f);
     }
 
     double sampleRate = 48000.0;
@@ -1256,6 +1276,7 @@ private:
     float dcCoef = 0.999f, dcInL = 0.0f, dcInR = 0.0f, dcOutL = 0.0f, dcOutR = 0.0f;
     int playheadStep = -1;
     double playheadBeats = -1.0;
+    std::array<float, numDests> liveOffsets {};
 };
 
 } // namespace seqs

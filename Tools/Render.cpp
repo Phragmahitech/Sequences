@@ -73,65 +73,75 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI gui;
     const juce::File dir (argc > 1 ? juce::File::getCurrentWorkingDirectory().getChildFile (argv[1]) : juce::File::getCurrentWorkingDirectory());
+    const juce::File serumTable (argc > 2 ? juce::String (argv[2]) : juce::String());
     dir.createDirectory();
 
-    // 1. Réglages par défaut, une note tenue
+    // 1. Réglages par défaut, une note tenue (A sinus en FM depuis B, ENV 2 + SEQ sur la coupure et le warp)
     {
         SequencesAudioProcessor p;
         renderTo (p, dir.getChildFile ("01-default.wav"), 16.0, { { 45, 0.0, 15.0 } });
     }
 
-    // 2. Mono, RANDOM ALL, sur la hauteur + la coupure (séquence hi-tech type)
+    // 2. Mono, RANDOM ALL, SEQ -> COARSE A (+12) : séquence hi-tech
     {
         SequencesAudioProcessor p;
         p.setRandomSeed (2026);
         set (p, "voiceMode", 0.0f);
         set (p, "drive", 30.0f);
-        set (p, "seqDiv", 4.0f);        // 1/16
+        set (p, "seqDiv", 4.0f);
         p.randomizeAll();
-        set (p, "mod3Src", 0.0f);
-        set (p, "mod3Dest", (float) seqs::Dest::pitch);
-        set (p, "mod3Amt", 25.0f);
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aCoarse), 12.0f / 96.0f);
         renderTo (p, dir.getChildFile ("02-mono-random-all.wav"), 16.0, { { 45, 0.0, 8.0 }, { 47, 7.9, 8.0 } });
     }
 
-    // 3. Banque d'usine sur la hauteur seule : on entend chaque LFO tour à tour
+    // 3. Table Serum importée, SEQ -> POS A
+    if (serumTable.existsAsFile())
     {
         SequencesAudioProcessor p;
-        set (p, "mod1Dest", 0.0f);
-        set (p, "mod2Dest", 0.0f);
-        set (p, "mod3Dest", (float) seqs::Dest::pitch);
-        set (p, "mod3Amt", 30.0f);
-        set (p, "cutoff", 4000.0f);
-        set (p, "ampSustain", 100.0f);
-        renderTo (p, dir.getChildFile ("03-pitch-bank.wav"), 16.0, { { 45, 0.0, 15.0 } });
+        std::printf ("import : %s\n", p.loadTableFile (0, serumTable).toRawUTF8());
+        set (p, "aWarpMode", 0.0f);
+        set (p, "cutoff", 6000.0f);
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aPos), 0.6f);
+        renderTo (p, dir.getChildFile ("03-serum-table.wav"), 16.0, { { 45, 0.0, 15.0 } });
     }
 
-    // 4. Hard sync piloté par le séquenceur
+    // 4. FM depuis B, LFO 6 (scie lente) sur le WARP A, B COARSE glissé par LFO 4
     {
         SequencesAudioProcessor p;
-        set (p, "fmLevel", 0.0f);
-        set (p, "oscLevel", 100.0f);
-        set (p, "mod2Dest", (float) seqs::Dest::sync);
-        set (p, "mod2Amt", 70.0f);
-        set (p, "cutoff", 3000.0f);
-        renderTo (p, dir.getChildFile ("04-sync.wav"), 16.0, { { 40, 0.0, 15.0 } });
+        for (int k = 0; k < seqs::numSlots; ++k) p.removeModulation (k);
+        set (p, "cutoff", 8000.0f);
+        set (p, "aWarp", 10.0f);
+        p.setModulationAmount (p.addModulation (6, seqs::Dest::aWarp), 0.5f);
+        p.setModulationAmount (p.addModulation (4, seqs::Dest::bCoarse), 7.0f / 96.0f);
+        renderTo (p, dir.getChildFile ("04-fm-sweep.wav"), 16.0, { { 40, 0.0, 15.0 } });
     }
 
-    // 5. Accord en polyphonique, gate sur l'ampli
+    // 5. Accord en polyphonique, SEQ -> VOLUME -100 % (gate), table RESO TRI
     {
         SequencesAudioProcessor p;
-        set (p, "mod3Dest", (float) seqs::Dest::amp);
-        set (p, "mod3Amt", 100.0f);
+        p.setBuiltinTable (0, seqs::BuiltinTables::indexOf ("RESO TRI"));
+        set (p, "aWarpMode", 0.0f);
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::volume), -1.0f);
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aPos), 0.7f);
         set (p, "ampRelease", 400.0f);
-        set (p, "modWave", 7.0f);       // RESO 2
         renderTo (p, dir.getChildFile ("05-poly-gate-reso.wav"), 16.0, { { 57, 0.0, 14.0 }, { 60, 0.0, 14.0 }, { 64, 0.0, 14.0 } });
     }
 
-    // Capture de l'interface
+    // Capture de l'interface (une note en cours, pour voir les modulations bouger)
     {
         SequencesAudioProcessor p;
+        if (serumTable.existsAsFile())
+            p.loadTableFile (1, serumTable);
+        p.addModulation (2, seqs::Dest::bPos);
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aCoarse), 12.0f / 96.0f);
         p.prepareToPlay (48000.0, 256);
+        juce::AudioBuffer<float> buffer (2, 256);
+        for (int b = 0; b < 30; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 100), 0);
+            p.processBlock (buffer, midi);
+        }
         std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
         juce::Image image (juce::Image::ARGB, editor->getWidth(), editor->getHeight(), true);
         juce::Graphics g (image);

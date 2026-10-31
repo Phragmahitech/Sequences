@@ -87,7 +87,6 @@ namespace
     const juce::StringArray lfoShapeNames { "SINE", "TRIANGLE", "SAW", "RAMP", "SQUARE", "PULSE", "EXP DOWN", "EXP UP" };
     const juce::StringArray stepNames { "OFF", "2", "3", "4", "6", "8", "12", "16", "24", "32" };
     constexpr int stepValues[] = { 0, 2, 3, 4, 6, 8, 12, 16, 24, 32 };
-    const juce::StringArray modWaveNames { "SINE", "DBL SINE", "SAW", "SQUARE", "PULSE", "SAW-PULSE", "RESO 1", "RESO 2", "RESO 3" };
 
     // Banque de départ : des mouvements typiques de séquences hi-tech
     struct LfoDefault { const char* rate; int shape; float amount; int steps; float phase; bool uni; };
@@ -100,14 +99,79 @@ namespace
         { "1 BAR", 2, 100.0f, 0, 0.0f, false } }; // SAW lente
 
     constexpr int defaultPattern[16] = { 1, 1, 2, 3, 1, 4, 2, 5, 1, 1, 3, 7, 6, 2, 8, 3 };
+
+    /** Routages de départ : source, destination, profondeur. */
+    struct SlotDefault { int source; seqs::Dest dest; float amount; };
+    const SlotDefault slotDefaults[] = {
+        { seqs::srcSeq,  seqs::Dest::cutoff, 27.0f },
+        { seqs::srcSeq,  seqs::Dest::aWarp,  12.0f },
+        { seqs::srcEnv2, seqs::Dest::cutoff, 30.0f },
+        { seqs::srcEnv2, seqs::Dest::aWarp,  15.0f } };
+
+    const juce::StringArray warpNames[2] = { { "OFF", "SYNC", "FM (FROM B)", "AM (FROM B)", "RM (FROM B)" },
+                                             { "OFF", "SYNC", "FM (FROM A)", "AM (FROM A)", "RM (FROM A)" } };
+
+    juce::String semitoneText (float v, int)
+    {
+        const float r = std::round (v * 100.0f) / 100.0f;
+        return (r > 0.0f ? "+" : "") + juce::String (r, std::abs (r - std::round (r)) < 0.005f ? 0 : 2) + " st";
+    }
+
+    // Les tables sont gardées en 16 bits compressés (gzip), puis en base64
+    juce::String encodeCycles (const std::vector<std::vector<float>>& cycles)
+    {
+        juce::MemoryOutputStream packed;
+        {
+            juce::GZIPCompressorOutputStream gz (packed, 6);
+            for (const auto& c : cycles)
+            {
+                gz.writeInt ((int) c.size());
+                for (float v : c)
+                    gz.writeShort ((short) juce::jlimit (-32767, 32767, juce::roundToInt (juce::jlimit (-1.0f, 1.0f, v) * 32767.0f)));
+            }
+        }
+        return packed.getMemoryBlock().toBase64Encoding();
+    }
+
+    std::vector<std::vector<float>> decodeCycles (const juce::String& text)
+    {
+        std::vector<std::vector<float>> cycles;
+        juce::MemoryBlock block;
+        if (! block.fromBase64Encoding (text) || block.getSize() == 0)
+            return cycles;
+
+        juce::MemoryInputStream packed (block, false);
+        juce::GZIPDecompressorInputStream gz (packed);
+        while (! gz.isExhausted() && cycles.size() < 4096)
+        {
+            const int n = gz.readInt();
+            if (n < 2 || n > 65536)
+                break;
+            std::vector<float> c ((size_t) n);
+            for (auto& v : c)
+                v = (float) gz.readShort() / 32767.0f;
+            cycles.push_back (std::move (c));
+        }
+        return cycles;
+    }
+
+    /** Peak normalisé : les cycles d'une table importée gardés à ±1 pour la sauvegarde en 16 bits. */
+    void normaliseCycles (std::vector<std::vector<float>>& cycles)
+    {
+        float peak = 0.0f;
+        for (const auto& c : cycles) for (float v : c) peak = std::max (peak, std::abs (v));
+        if (peak > 1.0e-9f)
+            for (auto& c : cycles) for (float& v : c) v /= peak;
+    }
 }
 
 //==============================================================================
 const juce::StringArray& SequencesAudioProcessor::destinationNames()
 {
     // Même ordre que seqs::Dest
-    static const juce::StringArray names { "OFF", "CUTOFF", "RESO", "FM INDEX", "FM RATIO", "PITCH", "PW", "DRIVE",
-                                           "AMP", "FM LEVEL", "OSC LEVEL", "NOISE", "PAN", "FEEDBACK", "SYNC", "TIMBRE" };
+    static const juce::StringArray names { "OFF", "A LEVEL", "A POS", "A COARSE", "A FINE", "A WARP",
+                                           "B LEVEL", "B POS", "B COARSE", "B FINE", "B WARP",
+                                           "NOISE", "PITCH", "PAN", "VOLUME", "CUTOFF", "RESO", "DRIVE" };
     return names;
 }
 
@@ -117,9 +181,10 @@ const juce::StringArray& SequencesAudioProcessor::sourceNames()
     return names;
 }
 
-const juce::StringArray& SequencesAudioProcessor::slotSourceNames()
+const juce::StringArray& SequencesAudioProcessor::modSourceNames()
 {
-    static const juce::StringArray names { "SEQ", "LFO 1", "LFO 2", "LFO 3", "LFO 4", "LFO 5", "LFO 6", "CHAOS 1", "CHAOS 2" };
+    static const juce::StringArray names { "SEQ", "LFO 1", "LFO 2", "LFO 3", "LFO 4", "LFO 5", "LFO 6", "CHAOS 1", "CHAOS 2",
+                                           "ENV 2", "VELO" };
     return names;
 }
 
@@ -139,40 +204,61 @@ double SequencesAudioProcessor::lfoRateBeats (int index)
     return lfoRates[juce::jlimit (0, numLfoRates - 1, index)].beats;
 }
 
+juce::String SequencesAudioProcessor::paramForDest (seqs::Dest d)
+{
+    static const char* ids[] = { "", "aLevel", "aPos", "aCoarse", "aFine", "aWarp", "bLevel", "bPos", "bCoarse", "bFine", "bWarp",
+                                 "noise", "pitch", "pan", "volume", "cutoff", "resonance", "drive" };
+    static_assert (std::size (ids) == seqs::numDests, "une entrée par destination");
+    return ids[juce::jlimit (0, seqs::numDests - 1, (int) d)];
+}
+
+seqs::Dest SequencesAudioProcessor::destForParam (const juce::String& id)
+{
+    for (int d = 1; d < seqs::numDests; ++d)
+        if (paramForDest ((seqs::Dest) d) == id)
+            return (seqs::Dest) d;
+    return seqs::Dest::off;
+}
+
+//==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::createParameterLayout()
 {
     Layout layout;
+
+    // --- Oscillateurs ---
+    // Les potards modulables ont exactement la course de seqs::DestRange (position du potard = valeur 0..1 du moteur).
+    for (int o = 0; o < seqs::numOscs; ++o)
+    {
+        const juce::String n = o == 0 ? "Osc A " : "Osc B ";
+        addPercent (layout, oscId (o, "Level"), n + "Level", o == 0 ? 80.0f : 0.0f);
+        addPercent (layout, oscId (o, "Pos"), n + "Position", 0.0f);
+        addInt (layout, oscId (o, "Oct"), n + "Octave", -4, 4, o == 0 ? 0 : 1,
+                [] (int v, int) { return (v > 0 ? "+" : "") + juce::String (v) + " oct"; });
+        addFloat (layout, oscId (o, "Coarse"), n + "Coarse", { -48.0f, 48.0f, 0.0f }, 0.0f, semitoneText);
+        addFloat (layout, oscId (o, "Fine"), n + "Fine", { -100.0f, 100.0f, 0.0f }, 0.0f,
+                  [] (float v, int) { const int i = juce::roundToInt (v); return (i > 0 ? "+" : "") + juce::String (i) + " ct"; });
+        addChoice (layout, oscId (o, "WarpMode"), n + "Warp Mode", warpNames[o], o == 0 ? (int) seqs::Warp::fm : 0);
+        addPercent (layout, oscId (o, "Warp"), n + "Warp", o == 0 ? 15.0f : 0.0f);
+    }
 
     // --- Voix ---
     addChoice (layout, "voiceMode", "Voice Mode", { "MONO", "POLY" }, 1);
     addMs (layout, "glide", "Glide", 0.0f, 1000.0f, 60.0f);
     addPercent (layout, "velocity", "Velocity", 50.0f);
-    addInt (layout, "transpose", "Transpose", -24, 24, 0, [] (int v, int) { return (v > 0 ? "+" : "") + juce::String (v) + " st"; });
-    addFloat (layout, "level", "Level", { -24.0f, 6.0f, 0.1f }, -3.0f,
-              [] (float v, int) { return (v > 0.04f ? "+" : "") + juce::String (v, 1) + " dB"; });
-
-    // --- FM ---
-    addPercent (layout, "fmLevel", "FM Level", 70.0f);
-    {
-        juce::NormalisableRange<float> ratio (0.25f, 16.0f, 0.001f);
-        ratio.setSkewForCentre (2.0f);
-        addFloat (layout, "fmRatio", "FM Ratio", ratio, 2.0f, [] (float v, int) { return juce::String (v, v < 10.0f ? 2 : 1); });
-    }
-    addFloat (layout, "fmIndex", "FM Index", { 0.0f, 10.0f, 0.01f }, 3.0f, [] (float v, int) { return juce::String (v, 2); });
-    addPercent (layout, "fmFeedback", "FM Feedback", 0.0f);
-    addPercent (layout, "fmEnv", "FM Env", 30.0f, true);
-    addChoice (layout, "modWave", "Mod Wave", modWaveNames, 0);
-    addPercent (layout, "timbre", "Timbre", 30.0f);
-
-    // --- Oscillateur ---
-    addChoice (layout, "oscWave", "Osc Wave", { "SAW", "SQUARE", "TRIANGLE", "SINE" }, 0);
-    addPercent (layout, "oscLevel", "Osc Level", 35.0f);
-    addInt (layout, "oscOctave", "Osc Octave", -2, 2, 0, [] (int v, int) { return (v > 0 ? "+" : "") + juce::String (v) + " oct"; });
-    addFloat (layout, "oscDetune", "Osc Detune", { -100.0f, 100.0f, 0.1f }, 7.0f,
-              [] (float v, int) { const int i = juce::roundToInt (v); return (i > 0 ? "+" : "") + juce::String (i) + " ct"; });
-    addFloat (layout, "oscPw", "Osc PW", { 5.0f, 95.0f, 0.1f }, 50.0f, percentText);
-    addPercent (layout, "oscSync", "Osc Sync", 0.0f);
+    addFloat (layout, "pitch", "Pitch", { -24.0f, 24.0f, 0.0f }, 0.0f, semitoneText);
     addPercent (layout, "noise", "Noise", 0.0f);
+    addFloat (layout, "pan", "Pan", { -100.0f, 100.0f, 0.0f }, 0.0f, [] (float v, int)
+    {
+        const int i = juce::roundToInt (v);
+        return i == 0 ? juce::String ("C") : juce::String (std::abs (i)) + (i < 0 ? " L" : " R");
+    });
+    addFloat (layout, "volume", "Volume", { 0.0f, 1.0f, 0.0f }, 0.8f * std::pow (10.0f, -3.0f / 40.0f), [] (float v, int)
+    {
+        const float gain = seqs::DestRange::toReal (seqs::Dest::volume, v);
+        if (gain < 1.0e-4f) return juce::String ("-INF");
+        const float db = 20.0f * std::log10 (gain);
+        return (db > 0.04f ? "+" : "") + juce::String (db, 1) + " dB";
+    });
 
     // --- Filtre ---
     addChoice (layout, "filterType", "Filter Type", { "LP", "BP", "HP" }, 0);
@@ -184,18 +270,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
         addFloat (layout, "cutoff", "Cutoff", cutoff, 900.0f, hzText);
     }
     addPercent (layout, "resonance", "Resonance", 40.0f);
-    addPercent (layout, "filterEnv", "Filter Env", 35.0f, true);
     addPercent (layout, "keyTrack", "Key Track", 50.0f);
 
     // --- Enveloppes ---
-    addMs (layout, "ampAttack", "Amp Attack", 0.5f, 5000.0f, 1.0f);
-    addMs (layout, "ampDecay", "Amp Decay", 1.0f, 5000.0f, 400.0f);
-    addPercent (layout, "ampSustain", "Amp Sustain", 70.0f);
-    addMs (layout, "ampRelease", "Amp Release", 1.0f, 5000.0f, 60.0f);
-    addMs (layout, "modAttack", "Mod Attack", 0.5f, 5000.0f, 1.0f);
-    addMs (layout, "modDecay", "Mod Decay", 1.0f, 5000.0f, 180.0f);
-    addPercent (layout, "modSustain", "Mod Sustain", 0.0f);
-    addMs (layout, "modRelease", "Mod Release", 1.0f, 5000.0f, 100.0f);
+    addMs (layout, "ampAttack", "Env 1 Attack", 0.5f, 5000.0f, 1.0f);
+    addMs (layout, "ampDecay", "Env 1 Decay", 1.0f, 5000.0f, 400.0f);
+    addPercent (layout, "ampSustain", "Env 1 Sustain", 70.0f);
+    addMs (layout, "ampRelease", "Env 1 Release", 1.0f, 5000.0f, 60.0f);
+    addMs (layout, "modAttack", "Env 2 Attack", 0.5f, 5000.0f, 1.0f);
+    addMs (layout, "modDecay", "Env 2 Decay", 1.0f, 5000.0f, 180.0f);
+    addPercent (layout, "modSustain", "Env 2 Sustain", 0.0f);
+    addMs (layout, "modRelease", "Env 2 Release", 1.0f, 5000.0f, 100.0f);
 
     // --- Distorsion ---
     addChoice (layout, "driveType", "Drive Type", { "SOFT", "FOLD", "CRUSH" }, 0);
@@ -238,17 +323,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     for (int i = 0; i < numSteps; ++i)
         addChoice (layout, stepId (i), "Seq Step " + juce::String (i + 1), sourceNames(), defaultPattern[i % 16]);
 
-    // --- Routages ---
+    // --- Routages (16) ---
     for (int k = 0; k < seqs::numSlots; ++k)
     {
-        int dest = 0;
-        float amount = 0.0f;
-        if (k == 0) { dest = (int) seqs::Dest::cutoff;  amount = 45.0f; }
-        if (k == 1) { dest = (int) seqs::Dest::fmIndex; amount = 30.0f; }
+        const SlotDefault d = k < (int) std::size (slotDefaults) ? slotDefaults[k] : SlotDefault { 0, seqs::Dest::off, 0.0f };
         const juce::String name = "Mod " + juce::String (k + 1) + " ";
-        addChoice (layout, slotId (k, "Src"), name + "Source", slotSourceNames(), 0);
-        addChoice (layout, slotId (k, "Dest"), name + "Destination", destinationNames(), dest);
-        addPercent (layout, slotId (k, "Amt"), name + "Amount", amount, true);
+        addChoice (layout, slotId (k, "Src"), name + "Source", modSourceNames(), d.source);
+        addChoice (layout, slotId (k, "Dest"), name + "Destination", destinationNames(), (int) d.dest);
+        addPercent (layout, slotId (k, "Amt"), name + "Amount", d.amount, true);
     }
 
     return layout;
@@ -260,14 +342,24 @@ SequencesAudioProcessor::SequencesAudioProcessor()
       apvts (*this, nullptr, "Sequences", createParameterLayout()),
       presets (apvts, "Sequences", ".seqpreset", PresetLibrary::defaultsOnly (*this, {}), {}, "UNTITLED")
 {
-    presets.restoreFromState();
-
     for (auto* param : getParameters())
         if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (param))
             raw[ranged->getParameterID()] = apvts.getRawParameterValue (ranged->getParameterID());
 
     cache.build (*this);
+
+    for (int o = 0; o < seqs::numOscs; ++o)
+        setBuiltinTable (o, 0);
+
+    presets.writeExtra = [this] (juce::XmlElement& xml) { xml.addChildElement (tablesToXml().release()); };
+    presets.readExtra = [this] (const juce::XmlElement* xml) { tablesFromXml (xml != nullptr ? xml->getChildByName ("TABLES") : nullptr); };
+    presets.restoreFromState();
+
+    for (auto& o : liveOffsets)
+        o.store (0.0f);
 }
+
+SequencesAudioProcessor::~SequencesAudioProcessor() = default;
 
 bool SequencesAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
@@ -289,17 +381,27 @@ void SequencesAudioProcessor::reset()
 }
 
 //==============================================================================
-void SequencesAudioProcessor::Cache::build (const SequencesAudioProcessor& proc)
+void SequencesAudioProcessor::Cache::build (SequencesAudioProcessor& proc)
 {
     auto get = [&proc] (const juce::String& id) { return proc.raw.at (id); };
 
-    for (const char* id : { "voiceMode", "glide", "velocity", "transpose", "level", "fmLevel", "fmRatio", "fmIndex", "fmFeedback",
-                            "fmEnv", "modWave", "timbre", "oscWave", "oscLevel", "oscOctave", "oscDetune", "oscPw", "oscSync", "noise",
-                            "filterType", "filterSlope", "cutoff", "resonance", "filterEnv", "keyTrack", "ampAttack", "ampDecay",
-                            "ampSustain", "ampRelease", "modAttack", "modDecay", "modSustain", "modRelease", "driveType", "drive",
-                            "drivePos", "seqOn", "seqSteps", "seqDiv", "seqFeel", "seqSwing", "seqSync", "seqRestart", "seqXfade",
-                            "seqManual" })
-        named[id] = get (id);
+    for (int d = 1; d < seqs::numDests; ++d)
+    {
+        dest[(size_t) d] = proc.apvts.getParameter (paramForDest ((seqs::Dest) d));
+        jassert (dest[(size_t) d] != nullptr);
+    }
+
+    for (int o = 0; o < seqs::numOscs; ++o)
+        osc[(size_t) o] = { get (oscId (o, "Oct")), get (oscId (o, "WarpMode")) };
+
+    voiceMode = get ("voiceMode"); glide = get ("glide"); velocity = get ("velocity");
+    filterType = get ("filterType"); filterSlope = get ("filterSlope"); keyTrack = get ("keyTrack");
+    ampAttack = get ("ampAttack"); ampDecay = get ("ampDecay"); ampSustain = get ("ampSustain"); ampRelease = get ("ampRelease");
+    modAttack = get ("modAttack"); modDecay = get ("modDecay"); modSustain = get ("modSustain"); modRelease = get ("modRelease");
+    driveType = get ("driveType"); drivePos = get ("drivePos");
+    seqOn = get ("seqOn"); seqSteps = get ("seqSteps"); seqDiv = get ("seqDiv"); seqFeel = get ("seqFeel");
+    seqSwing = get ("seqSwing"); seqSync = get ("seqSync"); seqRestart = get ("seqRestart");
+    seqXfade = get ("seqXfade"); seqManual = get ("seqManual");
 
     for (int i = 0; i < seqs::numLfos; ++i)
         lfo[(size_t) i] = { get (lfoId (i, "Rate")), get (lfoId (i, "Shape")), get (lfoId (i, "Amt")),
@@ -310,22 +412,6 @@ void SequencesAudioProcessor::Cache::build (const SequencesAudioProcessor& proc)
         steps[(size_t) i] = get (stepId (i));
     for (int k = 0; k < seqs::numSlots; ++k)
         slots[(size_t) k] = { get (slotId (k, "Src")), get (slotId (k, "Dest")), get (slotId (k, "Amt")) };
-
-    voiceMode = named.at ("voiceMode"); glide = named.at ("glide"); velocity = named.at ("velocity");
-    transpose = named.at ("transpose"); level = named.at ("level");
-    fmLevel = named.at ("fmLevel"); fmRatio = named.at ("fmRatio"); fmIndex = named.at ("fmIndex");
-    fmFeedback = named.at ("fmFeedback"); fmEnv = named.at ("fmEnv"); modWave = named.at ("modWave"); timbre = named.at ("timbre");
-    oscWave = named.at ("oscWave"); oscLevel = named.at ("oscLevel"); oscOctave = named.at ("oscOctave");
-    oscDetune = named.at ("oscDetune"); oscPw = named.at ("oscPw"); oscSync = named.at ("oscSync"); noise = named.at ("noise");
-    filterType = named.at ("filterType"); filterSlope = named.at ("filterSlope"); cutoff = named.at ("cutoff");
-    resonance = named.at ("resonance"); filterEnv = named.at ("filterEnv"); keyTrack = named.at ("keyTrack");
-    ampAttack = named.at ("ampAttack"); ampDecay = named.at ("ampDecay"); ampSustain = named.at ("ampSustain");
-    ampRelease = named.at ("ampRelease"); modAttack = named.at ("modAttack"); modDecay = named.at ("modDecay");
-    modSustain = named.at ("modSustain"); modRelease = named.at ("modRelease");
-    driveType = named.at ("driveType"); drive = named.at ("drive"); drivePos = named.at ("drivePos");
-    seqOn = named.at ("seqOn"); seqSteps = named.at ("seqSteps"); seqDiv = named.at ("seqDiv"); seqFeel = named.at ("seqFeel");
-    seqSwing = named.at ("seqSwing"); seqSync = named.at ("seqSync"); seqRestart = named.at ("seqRestart");
-    seqXfade = named.at ("seqXfade"); seqManual = named.at ("seqManual");
 }
 
 void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
@@ -336,33 +422,22 @@ void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
     const auto sec = [&v] (const std::atomic<float>* a) { return 0.001f * v (a); };
     const auto& c = cache;
 
+    for (int d = 1; d < seqs::numDests; ++d)
+        s.base[(size_t) d] = c.dest[(size_t) d]->getValue();
+
+    for (int o = 0; o < seqs::numOscs; ++o)
+    {
+        s.osc[(size_t) o].table = liveTables[(size_t) o].load();
+        s.osc[(size_t) o].octave = juce::jlimit (-4, 4, i (c.osc[(size_t) o].octave));
+        s.osc[(size_t) o].warp = (seqs::Warp) juce::jlimit (0, (int) seqs::Warp::count - 1, i (c.osc[(size_t) o].warp));
+    }
+
     s.mono = i (c.voiceMode) == 0;
     s.glideMs = v (c.glide);
     s.velocity = pct (c.velocity);
-    s.transpose = i (c.transpose);
-    s.level = juce::Decibels::decibelsToGain (v (c.level));
-
-    s.fmLevel = pct (c.fmLevel);
-    s.fmRatio = v (c.fmRatio);
-    s.fmIndex = v (c.fmIndex);
-    s.fmFeedback = pct (c.fmFeedback);
-    s.fmEnv = pct (c.fmEnv);
-    s.modWave = (seqs::ModWave) juce::jlimit (0, (int) seqs::ModWave::count - 1, i (c.modWave));
-    s.timbre = pct (c.timbre);
-
-    s.oscWave = (seqs::Wave) juce::jlimit (0, 3, i (c.oscWave));
-    s.oscLevel = pct (c.oscLevel);
-    s.oscOctave = i (c.oscOctave);
-    s.oscDetune = v (c.oscDetune);
-    s.oscPw = pct (c.oscPw);
-    s.oscSync = pct (c.oscSync);
-    s.noise = pct (c.noise);
 
     s.filterType = (seqs::FilterType) juce::jlimit (0, 2, i (c.filterType));
     s.slope24 = i (c.filterSlope) == 1;
-    s.cutoff = v (c.cutoff);
-    s.resonance = pct (c.resonance);
-    s.filterEnv = pct (c.filterEnv);
     s.keyTrack = pct (c.keyTrack);
 
     s.ampA = sec (c.ampAttack);  s.ampD = sec (c.ampDecay);
@@ -371,7 +446,6 @@ void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
     s.modS = pct (c.modSustain); s.modR = sec (c.modRelease);
 
     s.driveType = (seqs::DriveType) juce::jlimit (0, 2, i (c.driveType));
-    s.drive = pct (c.drive);
     s.drivePost = i (c.drivePos) == 1;
 
     for (int n = 0; n < seqs::numLfos; ++n)
@@ -412,8 +486,8 @@ void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
     for (int k = 0; k < seqs::numSlots; ++k)
     {
         const auto& sp = c.slots[(size_t) k];
-        s.slotSource[(size_t) k] = juce::jlimit (0, seqs::numSources, i (sp.source));
-        s.slotDest[(size_t) k] = (seqs::Dest) juce::jlimit (0, (int) seqs::Dest::count - 1, i (sp.dest));
+        s.slotSource[(size_t) k] = juce::jlimit (0, seqs::numModSources - 1, i (sp.source));
+        s.slotDest[(size_t) k] = (seqs::Dest) juce::jlimit (0, seqs::numDests - 1, i (sp.dest));
         s.slotAmount[(size_t) k] = pct (sp.amount);
     }
 }
@@ -483,6 +557,8 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
     playheadStep.store (engine.getPlayheadStep(), std::memory_order_relaxed);
     playheadBeats.store (engine.getPlayheadBeats(), std::memory_order_relaxed);
+    for (int d = 0; d < seqs::numDests; ++d)
+        liveOffsets[(size_t) d].store (engine.getLiveOffset ((seqs::Dest) d), std::memory_order_relaxed);
 }
 
 //==============================================================================
@@ -501,6 +577,201 @@ float SequencesAudioProcessor::realValue (const juce::String& id) const
     return p (id)->load();
 }
 
+//==============================================================================
+int SequencesAudioProcessor::getModulationSource (int slot) const  { return juce::roundToInt (realValue (slotId (slot, "Src"))); }
+seqs::Dest SequencesAudioProcessor::getModulationDest (int slot) const
+{
+    return (seqs::Dest) juce::jlimit (0, seqs::numDests - 1, juce::roundToInt (realValue (slotId (slot, "Dest"))));
+}
+float SequencesAudioProcessor::getModulationAmount (int slot) const { return 0.01f * realValue (slotId (slot, "Amt")); }
+
+int SequencesAudioProcessor::addModulation (int source, seqs::Dest dest)
+{
+    if (dest == seqs::Dest::off || source < 0 || source >= seqs::numModSources)
+        return -1;
+
+    for (int k = 0; k < seqs::numSlots; ++k)
+        if (getModulationDest (k) == dest && getModulationSource (k) == source)
+            return k;
+
+    for (int k = 0; k < seqs::numSlots; ++k)
+        if (getModulationDest (k) == seqs::Dest::off)
+        {
+            // Profondeur de départ : sensible mais pas brutale (une octave sur les hauteurs)
+            float amount = 0.25f;
+            if (dest == seqs::Dest::aCoarse || dest == seqs::Dest::bCoarse) amount = 12.0f / 96.0f;
+            if (dest == seqs::Dest::pitch)                                   amount = 12.0f / 48.0f;
+
+            setParam (slotId (k, "Src"), (float) source);
+            setParam (slotId (k, "Amt"), amount * 100.0f);
+            setParam (slotId (k, "Dest"), (float) dest);
+            return k;
+        }
+
+    return -1;
+}
+
+void SequencesAudioProcessor::removeModulation (int slot)
+{
+    if (! juce::isPositiveAndBelow (slot, seqs::numSlots))
+        return;
+    setParam (slotId (slot, "Dest"), 0.0f);
+    setParam (slotId (slot, "Amt"), 0.0f);
+    setParam (slotId (slot, "Src"), 0.0f);
+}
+
+void SequencesAudioProcessor::setModulationAmount (int slot, float amount)
+{
+    if (juce::isPositiveAndBelow (slot, seqs::numSlots))
+        setParam (slotId (slot, "Amt"), juce::jlimit (-1.0f, 1.0f, amount) * 100.0f);
+}
+
+std::vector<int> SequencesAudioProcessor::slotsForDest (seqs::Dest dest) const
+{
+    std::vector<int> slots;
+    if (dest != seqs::Dest::off)
+        for (int k = 0; k < seqs::numSlots; ++k)
+            if (getModulationDest (k) == dest)
+                slots.push_back (k);
+    return slots;
+}
+
+int SequencesAudioProcessor::usedSlotCount() const
+{
+    int n = 0;
+    for (int k = 0; k < seqs::numSlots; ++k)
+        n += getModulationDest (k) != seqs::Dest::off ? 1 : 0;
+    return n;
+}
+
+//==============================================================================
+SequencesAudioProcessor::TableInfo SequencesAudioProcessor::getTableInfo (int osc) const
+{
+    const juce::ScopedLock sl (tableLock);
+    return tables[(size_t) juce::jlimit (0, 1, osc)].info;
+}
+
+void SequencesAudioProcessor::installTable (int osc, std::unique_ptr<seqs::Wavetable> table, TableInfo info,
+                                            std::vector<std::vector<float>> cycles)
+{
+    osc = juce::jlimit (0, seqs::numOscs - 1, osc);
+    const juce::ScopedLock sl (tableLock);
+
+    // Les tables remplacées restent en vie 2 s : le fil audio a pu en prendre une au début d'un bloc
+    const auto now = juce::Time::getMillisecondCounter();
+    retired.erase (std::remove_if (retired.begin(), retired.end(),
+                                   [now] (const auto& r) { return now - r.first > 2000; }), retired.end());
+
+    auto& slot = tables[(size_t) osc];
+    const seqs::Wavetable* live = table != nullptr ? table.get() : seqs::BuiltinTables::get (juce::jmax (0, info.builtin));
+    info.numFrames = live->numFrames;
+
+    if (slot.owned != nullptr)
+        retired.emplace_back (now, std::move (slot.owned));
+
+    slot.owned = std::move (table);
+    slot.info = std::move (info);
+    slot.cycles = std::move (cycles);
+    liveTables[(size_t) osc].store (live);
+}
+
+void SequencesAudioProcessor::setBuiltinTable (int osc, int index)
+{
+    index = juce::jlimit (0, seqs::BuiltinTables::count() - 1, index);
+    TableInfo info;
+    info.builtin = index;
+    info.name = seqs::BuiltinTables::names()[(size_t) index];
+    installTable (osc, nullptr, info, {});
+}
+
+juce::String SequencesAudioProcessor::setUserTable (int osc, std::vector<std::vector<float>> cycles, const juce::String& name,
+                                                    const juce::File& file)
+{
+    normaliseCycles (cycles);
+    auto table = seqs::Wavetable::build (cycles, name.toStdString());
+    if (table == nullptr)
+        return "EMPTY WAVETABLE";
+
+    TableInfo info;
+    info.builtin = -1;
+    info.name = name;
+    info.file = file;
+    installTable (osc, std::move (table), info, std::move (cycles));
+    return {};
+}
+
+juce::String SequencesAudioProcessor::loadTableFile (int osc, const juce::File& file)
+{
+    if (! file.existsAsFile())
+        return "FILE NOT FOUND";
+    if (file.getSize() > 64 * 1024 * 1024)
+        return "FILE TOO BIG";
+
+    juce::MemoryBlock data;
+    if (! file.loadFileAsData (data))
+        return "COULD NOT READ THE FILE";
+
+    auto parsed = seqs::WavetableFile::parse ((const uint8_t*) data.getData(), data.getSize());
+    if (! parsed.error.empty())
+        return parsed.error;
+
+    return setUserTable (osc, std::move (parsed.cycles), file.getFileNameWithoutExtension().toUpperCase(), file);
+}
+
+std::unique_ptr<juce::XmlElement> SequencesAudioProcessor::tablesToXml() const
+{
+    const juce::ScopedLock sl (tableLock);
+    auto xml = std::make_unique<juce::XmlElement> ("TABLES");
+    for (int o = 0; o < seqs::numOscs; ++o)
+    {
+        const auto& t = tables[(size_t) o];
+        auto* e = xml->createNewChildElement ("TABLE");
+        e->setAttribute ("osc", o);
+        e->setAttribute ("name", t.info.name);
+        e->setAttribute ("builtin", t.info.builtin);
+        if (t.info.builtin < 0)
+        {
+            e->setAttribute ("file", t.info.file.getFullPathName());
+            e->setAttribute ("data", encodeCycles (t.cycles));
+        }
+    }
+    return xml;
+}
+
+void SequencesAudioProcessor::tablesFromXml (const juce::XmlElement* xml)
+{
+    std::array<bool, seqs::numOscs> done {};
+
+    if (xml != nullptr)
+        for (auto* e : xml->getChildWithTagNameIterator ("TABLE"))
+        {
+            const int o = e->getIntAttribute ("osc", -1);
+            if (! juce::isPositiveAndBelow (o, seqs::numOscs))
+                continue;
+
+            const int builtin = e->getIntAttribute ("builtin", 0);
+            if (builtin >= 0)
+            {
+                // Par le nom d'abord (l'ordre des tables intégrées peut changer d'une version à l'autre)
+                const int byName = seqs::BuiltinTables::indexOf (e->getStringAttribute ("name").toStdString());
+                setBuiltinTable (o, byName >= 0 ? byName : builtin);
+                done[(size_t) o] = true;
+            }
+            else
+            {
+                auto cycles = decodeCycles (e->getStringAttribute ("data"));
+                if (! cycles.empty())
+                    done[(size_t) o] = setUserTable (o, std::move (cycles), e->getStringAttribute ("name"),
+                                                     juce::File (e->getStringAttribute ("file"))).isEmpty();
+            }
+        }
+
+    for (int o = 0; o < seqs::numOscs; ++o)
+        if (! done[(size_t) o])
+            setBuiltinTable (o, 0);
+}
+
+//==============================================================================
 void SequencesAudioProcessor::randomizePattern()
 {
     // Sources qui font quelque chose (quantité non nulle)
@@ -522,14 +793,13 @@ void SequencesAudioProcessor::randomizePattern()
     // Rien n'écoute le séquenceur : on le branche sur la coupure pour l'entendre tout de suite
     bool listening = false;
     for (int k = 0; k < seqs::numSlots; ++k)
-        listening = listening || (juce::roundToInt (realValue (slotId (k, "Src"))) == 0
-                                  && juce::roundToInt (realValue (slotId (k, "Dest"))) != 0
-                                  && std::abs (realValue (slotId (k, "Amt"))) > 0.5f);
+        listening = listening || (getModulationSource (k) == seqs::srcSeq && getModulationDest (k) != seqs::Dest::off
+                                  && std::abs (getModulationAmount (k)) > 0.005f);
     if (! listening)
     {
-        setParam (slotId (0, "Src"), 0.0f);
-        setParam (slotId (0, "Dest"), (float) seqs::Dest::cutoff);
-        setParam (slotId (0, "Amt"), 45.0f);
+        const int slot = addModulation (seqs::srcSeq, seqs::Dest::cutoff);
+        if (slot >= 0)
+            setModulationAmount (slot, 0.3f);
     }
 }
 
@@ -582,7 +852,10 @@ void SequencesAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     if (auto xml = state.createXml())
+    {
+        xml->addChildElement (tablesToXml().release());
         copyXmlToBinary (*xml, destData);
+    }
 }
 
 void SequencesAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
@@ -590,6 +863,8 @@ void SequencesAudioProcessor::setStateInformation (const void* data, int sizeInB
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
         {
+            tablesFromXml (xml->getChildByName ("TABLES"));
+            xml->deleteAllChildElementsWithTagName ("TABLES");
             apvts.replaceState (juce::ValueTree::fromXml (*xml));
             presets.restoreFromState();
         }

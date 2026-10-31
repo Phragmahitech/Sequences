@@ -91,6 +91,11 @@ public:
        #endif
     }
 
+    /** Données en plus des paramètres (ex. wavetables) : écrites dans le fichier du preset et relues au chargement.
+        readExtra reçoit nullptr pour un point de départ d'usine. */
+    std::function<void (juce::XmlElement&)> writeExtra;
+    std::function<void (const juce::XmlElement*)> readExtra;
+
     /** Pour les tests : range les presets ailleurs. */
     void setFolderOverride (const juce::File& folder)   { folderOverride = folder; }
 
@@ -154,6 +159,9 @@ public:
                 e->setAttribute ("value", (double) ranged->convertFrom0to1 (ranged->getValue()));
             }
 
+        if (writeExtra)
+            writeExtra (xml);
+
         const auto dir = folder();
         if (! dir.createDirectory())
             return false;
@@ -178,6 +186,10 @@ public:
             if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (params[i]); ranged != nullptr && isStored (*ranged))
                 setParameter (*ranged, values[(size_t) i]);
 
+        if (readExtra)
+            if (auto xml = juce::XmlDocument::parse (file))
+                readExtra (xml.get());
+
         setCurrent ({ true, -1, file, file.getFileNameWithoutExtension() });
         return true;
     }
@@ -188,6 +200,8 @@ public:
             return;
 
         factory.apply (index);
+        if (readExtra)
+            readExtra (nullptr);
         setCurrent ({ false, index, {}, factory.name (index) });
     }
 
