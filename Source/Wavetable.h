@@ -404,7 +404,7 @@ struct BuiltinTables
     /** Cycles d'une table intégrée (2048 échantillons chacun). */
     static std::vector<std::vector<float>> cycles (int index)
     {
-        constexpr int n = wt::baseSize;
+        static constexpr int n = wt::baseSize;   // static : utilisable dans les lambdas sans capture (MSVC)
         std::vector<std::vector<float>> frames;
         auto make = [&frames] (int count, auto&& fn)
         {
