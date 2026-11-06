@@ -14,7 +14,8 @@ Synthé VST3 de Phragma, construit sur l'architecture d'Alaskan Bites 3 (Alien C
 - **ALGORITHMIC** : le vrai code de Plaits (Mutable Instruments, licence MIT), ses 24 modèles ;
   HARM, TIMBRE, MORPH, DECAY / COLOUR (LPG), AUX, OCT, SEMI, FINE, LEVEL, PAN.
 - **SUB + NOISE** : sub sinus / triangle / carré / scie (-1 ou -2 octaves), bruit blanc / rose / brun / digital.
-- **FM MATRIX** : la ligne module la colonne (WT, PD, NOISE vers WT et PD), diagonale = feedback.
+- **FM MATRIX** : la ligne module la colonne (WT, PD, ALGO, NOISE vers WT, PD et ALGO), diagonale = feedback.
+  L'ALGO (Plaits) reçoit sa FM par la hauteur, échantillon par échantillon (±48 demi-tons à 100 %).
   Clic = 0 ou 100 %, glisser = quantité, double-clic = 0. DEPTH, mode PHASE ou LINEAR.
   Un oscillateur à LEVEL 0 module quand même.
 - **BITE!** : FOLD, CRUSH, SOFT, avant ou après le filtre (POST FILTER), ASYM.
@@ -35,7 +36,10 @@ Synthé VST3 de Phragma, construit sur l'architecture d'Alaskan Bites 3 (Alien C
 
 ## Onglets ARP et FX
 - ARP : UP, DOWN, UP/DOWN, DOWN/UP, RANDOM, AS PLAYED, CHORD ; 1/4 à 1/32 ; 1 à 4 octaves ; GATE, SWING, LATCH.
-- FX : CHORUS -> DELAY (synchro, ping-pong, TONE) -> REVERB.
+- FX : CHORUS -> DELAY (SYNC ou temps libre en ms, ping-pong, TONE) -> REVERB.
+  Tous les potards des effets sont des destinations de modulation (les effets suivent la dernière note jouée
+  et gardent sa modulation pendant les queues).
+- RANDOM ne crée aucune modulation ; RANDOM ALL ne touche pas aux 2 CHAOS.
 
 ## Presets d'usine
 INIT, HITECH ZAPS, PD ACID, PLAITS PLUCKS, FM GROWL, CHAOS BLIPS, SUB BASS, SUPERSAW, WOBBLE LFO.

@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
+#include <new>
+#include <cmath>
+
 #include <array>
 #include <cmath>
 #include <memory>
@@ -43,7 +48,13 @@ public:
     PlaitsOsc()
     {
         allocator.Init (buffer.data(), buffer.size());
-        voice = std::make_unique<plaits::Voice>();
+        // Mémoire mise à zéro : certains membres de Plaits ne sont jamais initialisés (accords du moteur
+        // CHIPTUNE avant le premier front de déclenchement) ; des restes du tas y donnaient des NaN
+        // et une boucle sans fin dans SuperSquareOscillator.
+        void* memory = std::calloc (1, sizeof (plaits::Voice));
+        if (memory == nullptr)
+            throw std::bad_alloc();
+        voice.reset (new (memory) plaits::Voice());
         voice->Init (&allocator);
     }
 
@@ -78,17 +89,27 @@ public:
     float process (const Params& p)
     {
         if (position >= blockSize)
-            renderBlock (p);
+            renderBlock (p, blockSize);
         return out[(size_t) position++];
+    }
+
+    /** Un échantillon rendu seul, à la hauteur décalée de semitones (FM de l'ALGO, cadence audio). */
+    float processFm (const Params& p, float semitones)
+    {
+        Params q = p;
+        q.note = std::isfinite (semitones) ? std::clamp (p.note + semitones, -12.0f, 132.0f) : p.note;
+        renderBlock (q, 1);
+        position = blockSize;    // le prochain process() repart sur un bloc neuf
+        return out[0];
     }
 
 private:
     static constexpr int blockSize = (int) plaits::kBlockSize;
 
-    void renderBlock (const Params& p)
+    void renderBlock (const Params& p, int size)
     {
         plaits::Patch patch {};
-        patch.note = p.note + noteOffset;
+        patch.note = std::clamp (p.note, -24.0f, 120.0f) + noteOffset;   // au-delà, certains moteurs (CHIPTUNE) bouclent sans fin
         patch.harmonics = clamp01 (p.harmonics);
         patch.timbre = clamp01 (p.timbre);
         patch.morph = clamp01 (p.morph);
@@ -107,11 +128,11 @@ private:
             m.trigger = gate ? 1.0f : 0.0f;
 
         plaits::Voice::Frame frames[blockSize];
-        voice->Render (patch, m, frames, (size_t) blockSize);
+        voice->Render (patch, m, frames, (size_t) size);
 
         // Plaits inverse le signe en sortie (convertisseur du module) : on le remet à l'endroit
         const float aux = clamp01 (p.aux);
-        for (int i = 0; i < blockSize; ++i)
+        for (int i = 0; i < size; ++i)
             out[(size_t) i] = -((1.0f - aux) * (float) frames[i].out + aux * (float) frames[i].aux) / 32768.0f;
         position = 0;
     }
@@ -120,7 +141,8 @@ private:
 
     alignas (16) std::array<char, 16384> buffer {};
     stmlib::BufferAllocator allocator;
-    std::unique_ptr<plaits::Voice> voice;
+    struct VoiceDeleter { void operator() (plaits::Voice* v) const { v->~Voice(); std::free (v); } };
+    std::unique_ptr<plaits::Voice, VoiceDeleter> voice;
     std::array<float, blockSize> out {};
     int position = blockSize;
     bool gate = false;

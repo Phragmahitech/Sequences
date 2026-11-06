@@ -19,7 +19,9 @@ struct FxSettings
     float chorusMix = 0.4f;
 
     bool delayOn = false;
-    double delayBeats = 0.75;     // durée (noires)
+    bool delaySync = true;        // synchro au tempo, sinon en millisecondes (FREE)
+    double delayBeats = 0.75;     // durée (noires), si synchro
+    double delayMs = 375.0;       // durée (ms), sinon
     float delayFeedback = 0.35f;  // 0..0.95
     bool delayPingPong = true;
     float delayTone = 0.6f;       // 0 = sombre, 1 = clair
@@ -106,7 +108,8 @@ public:
         const double chorusInc = (double) s.chorusRate / sampleRate;
         const double chorusBase = 0.012 * sampleRate, chorusDepthSamples = 0.006 * sampleRate * s.chorusDepth;
 
-        const double delayTarget = std::clamp (s.delayBeats * 60.0 / std::max (20.0, bpm), 0.005, 4.0) * sampleRate;
+        const double delaySeconds = s.delaySync ? s.delayBeats * 60.0 / std::max (20.0, bpm) : s.delayMs * 0.001;
+        const double delayTarget = std::clamp (delaySeconds, 0.001, 4.0) * sampleRate;
         if (delayTimeSmoothed < 0.0)
             delayTimeSmoothed = delayTarget;
         const float feedback = std::clamp (s.delayFeedback, 0.0f, 0.95f);
@@ -149,7 +152,7 @@ public:
             // DELAY : synchro au tempo, ping-pong, filtre dans la boucle
             if (s.delayOn)
             {
-                delayTimeSmoothed += (delayTarget - delayTimeSmoothed) * 0.0005;
+                delayTimeSmoothed += (delayTarget - delayTimeSmoothed) * 0.002;
                 float dl = delayLines[0].read (delayTimeSmoothed);
                 float dr = delayLines[1].read (delayTimeSmoothed);
 

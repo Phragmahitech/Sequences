@@ -83,7 +83,7 @@ namespace
 
     //==========================================================================
     // Potards modulables : unité du paramètre <-> position (0..1) du moteur
-    enum class Unit { percent, semi, fine, pan, bipolar, cutoff, volume };
+    enum class Unit { percent, semi, fine, pan, bipolar, cutoff, volume, logHz, logMs };
 
     Unit unitOf (Dest d)
     {
@@ -93,6 +93,8 @@ namespace
         if (d == Dest::filterEnv)        return Unit::bipolar;
         if (d == Dest::cutoff)           return Unit::cutoff;
         if (d == Dest::volume)           return Unit::volume;
+        if (d == Dest::chorusRate)       return Unit::logHz;
+        if (d == Dest::delayTime)        return Unit::logMs;
         return Unit::percent;
     }
 
@@ -104,7 +106,8 @@ namespace
             case Unit::percent: return 100.0f * n;
             case Unit::pan: case Unit::bipolar: return 100.0f * seqs::DestRange::toReal (d, n);
             case Unit::volume: return n;
-            case Unit::semi: case Unit::fine: case Unit::cutoff: default: return seqs::DestRange::toReal (d, n);
+            case Unit::semi: case Unit::fine: case Unit::cutoff: case Unit::logHz: case Unit::logMs:
+            default: return seqs::DestRange::toReal (d, n);
         }
     }
 
@@ -121,7 +124,11 @@ namespace
         { "subLevel", "SUB LEVEL" }, { "noiseLevel", "NOISE LEVEL" }, { "fmDepth", "FM DEPTH" },
         { "biteFold", "BITE FOLD" }, { "biteCrush", "BITE CRUSH" }, { "biteSoft", "BITE SOFT" },
         { "cutoff", "CUTOFF" }, { "resonance", "RESO" }, { "filterDrive", "DRIVE" }, { "filterEnv", "ENV AMT" },
-        { "volume", "VOLUME" } };
+        { "volume", "VOLUME" },
+        { "chorusRate", "CHORUS RATE" }, { "chorusDepth", "CHORUS DEPTH" }, { "chorusMix", "CHORUS MIX" },
+        { "delayMs", "DELAY TIME" }, { "delayFeedback", "DELAY FDBK" }, { "delayTone", "DELAY TONE" }, { "delayMix", "DELAY MIX" },
+        { "reverbSize", "REVERB SIZE" }, { "reverbDecay", "REVERB DECAY" }, { "reverbDamping", "REVERB DAMP" },
+        { "reverbPredelay", "REVERB PRE" }, { "reverbMix", "REVERB MIX" } };
     static_assert (std::size (destInfo) == (size_t) seqs::numDests, "une entrée par destination");
 
     //==========================================================================
@@ -173,8 +180,8 @@ namespace
 
     constexpr int defaultPattern[16] = { 1, 1, 2, 3, 1, 4, 2, 5, 1, 1, 3, 7, 6, 2, 8, 3 };
 
-    const juce::StringArray fmRowIds { "Wt", "Pd", "Noise" };
-    const juce::StringArray fmColIds { "Wt", "Pd" };
+    const juce::StringArray fmRowIds { "Wt", "Pd", "Algo", "Noise" };
+    const juce::StringArray fmColIds { "Wt", "Pd", "Algo" };
 
     //==========================================================================
     // Les tables sont gardées en 16 bits compressés (gzip), puis en base64
@@ -408,6 +415,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
                 addFloat (layout, id, name, cutoff, def, hzText);
                 break;
             }
+            case Unit::logHz: case Unit::logMs:
+            {
+                const float lo = seqs::DestRange::toReal (d, 0.0f), hi = seqs::DestRange::toReal (d, 1.0f);
+                juce::NormalisableRange<float> range (lo, hi,
+                                                      [] (float a, float b, float t) { return a * std::pow (b / a, t); },
+                                                      [] (float a, float b, float v) { return std::log (v / a) / std::log (b / a); });
+                addFloat (layout, id, name, range, def, unitOf (d) == Unit::logHz ? hzText : msText);
+                break;
+            }
             case Unit::volume:
                 addFloat (layout, id, name, { 0.0f, 1.0f, 0.0f }, def, [] (float v, int)
                 {
@@ -442,8 +458,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     addChoice (layout, "noiseType", "noise type", { "WHITE", "PINK", "BROWN", "DIGITAL" }, (int) init.noiseType);
 
     // --- Matrice FM ---
-    const char* rowNames[] = { "wt", "pd", "noise" };
-    const char* colNames[] = { "wt", "pd" };
+    const char* rowNames[] = { "wt", "pd", "algo", "noise" };
+    const char* colNames[] = { "wt", "pd", "algo" };
     for (int r = 0; r < seqs::numFmRows; ++r)
         for (int c = 0; c < seqs::numFmCols; ++c)
             addPercent (layout, fmId (r, c), juce::String ("fm ") + rowNames[r] + " to " + colNames[c], 100.0f * init.fm[(size_t) r][(size_t) c]);
@@ -545,28 +561,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout SequencesAudioProcessor::cre
     addFloat (layout, "arpSwing", "arp swing", { 0.0f, 75.0f, 0.1f }, 0.0f, percentText);
     addBool (layout, "arpLatch", "arp latch", false);
 
-    // --- Effets ---
+    // --- Effets (les potards sont des destinations de modulation, créés plus haut) ---
     const seqs::FxSettings fx;
     addBool (layout, "chorusOn", "chorus on", fx.chorusOn);
-    {
-        juce::NormalisableRange<float> hz (0.05f, 5.0f, 0.0f);
-        hz.setSkewForCentre (0.6f);
-        addFloat (layout, "chorusRate", "chorus rate", hz, fx.chorusRate, hzText);
-    }
-    addPercent (layout, "chorusDepth", "chorus depth", 100.0f * fx.chorusDepth);
-    addPercent (layout, "chorusMix", "chorus mix", 100.0f * fx.chorusMix);
     addBool (layout, "delayOn", "delay on", fx.delayOn);
-    addChoice (layout, "delayTime", "delay time", rateNames (delayTimes), 4);
-    addFloat (layout, "delayFeedback", "delay feedback", { 0.0f, 95.0f, 0.0f }, 100.0f * fx.delayFeedback, percentText);
+    addBool (layout, "delaySync", "delay sync", fx.delaySync);
+    addChoice (layout, "delayTime", "delay time sync", rateNames (delayTimes), 4);
     addBool (layout, "delayPingPong", "delay ping pong", fx.delayPingPong);
-    addPercent (layout, "delayTone", "delay tone", 100.0f * fx.delayTone);
-    addPercent (layout, "delayMix", "delay mix", 100.0f * fx.delayMix);
     addBool (layout, "reverbOn", "reverb on", fx.reverbOn);
-    addPercent (layout, "reverbSize", "reverb size", 100.0f * fx.reverbSize);
-    addPercent (layout, "reverbDecay", "reverb decay", 100.0f * fx.reverbDecay);
-    addPercent (layout, "reverbDamping", "reverb damping", 100.0f * fx.reverbDamping);
-    addPercent (layout, "reverbPredelay", "reverb predelay", 100.0f * fx.reverbPredelay);
-    addPercent (layout, "reverbMix", "reverb mix", 100.0f * fx.reverbMix);
 
     return layout;
 }
@@ -615,7 +617,7 @@ void SequencesAudioProcessor::prepareToPlay (double sampleRate, int)
     readArpSettings (arpSettings);
     arp.reset();
     arp.setSettings (arpSettings);
-    readFxSettings (fxSettings);
+    readFxSettings (fxSettings, nullptr);
     fx.setSettings (fxSettings);
     fx.prepare (currentSampleRate);
 }
@@ -670,11 +672,8 @@ void SequencesAudioProcessor::Cache::build (SequencesAudioProcessor& proc)
 
     arpOn = get ("arpOn"); arpMode = get ("arpMode"); arpRate = get ("arpRate"); arpOct = get ("arpOct");
     arpGate = get ("arpGate"); arpSwing = get ("arpSwing"); arpLatch = get ("arpLatch");
-    chorusOn = get ("chorusOn"); chorusRate = get ("chorusRate"); chorusDepth = get ("chorusDepth"); chorusMix = get ("chorusMix");
-    delayOn = get ("delayOn"); delayTime = get ("delayTime"); delayFeedback = get ("delayFeedback");
-    delayPingPong = get ("delayPingPong"); delayTone = get ("delayTone"); delayMix = get ("delayMix");
-    reverbOn = get ("reverbOn"); reverbSize = get ("reverbSize"); reverbDecay = get ("reverbDecay");
-    reverbDamping = get ("reverbDamping"); reverbPredelay = get ("reverbPredelay"); reverbMix = get ("reverbMix");
+    chorusOn = get ("chorusOn"); delayOn = get ("delayOn"); delaySync = get ("delaySync"); delayTime = get ("delayTime");
+    delayPingPong = get ("delayPingPong"); reverbOn = get ("reverbOn");
 }
 
 void SequencesAudioProcessor::readSettings (seqs::Settings& s) const
@@ -794,25 +793,34 @@ void SequencesAudioProcessor::readArpSettings (seqs::ArpSettings& a) const
     a.latch = c.arpLatch->load() > 0.5f;
 }
 
-void SequencesAudioProcessor::readFxSettings (seqs::FxSettings& f) const
+void SequencesAudioProcessor::readFxSettings (seqs::FxSettings& f, const seqs::Engine* modulation) const
 {
     const auto& c = cache;
+    auto norm = [&] (Dest d)
+    {
+        const float offset = modulation != nullptr ? modulation->getFxOffset (d) : 0.0f;
+        return juce::jlimit (0.0f, 1.0f, c.dest[(size_t) d]->getValue() + offset);
+    };
+    auto real = [&] (Dest d) { return seqs::DestRange::toReal (d, norm (d)); };
+
     f.chorusOn = c.chorusOn->load() > 0.5f;
-    f.chorusRate = c.chorusRate->load();
-    f.chorusDepth = 0.01f * c.chorusDepth->load();
-    f.chorusMix = 0.01f * c.chorusMix->load();
+    f.chorusRate = real (Dest::chorusRate);
+    f.chorusDepth = norm (Dest::chorusDepth);
+    f.chorusMix = norm (Dest::chorusMix);
     f.delayOn = c.delayOn->load() > 0.5f;
+    f.delaySync = c.delaySync->load() > 0.5f;
     f.delayBeats = delayTimes[juce::jlimit (0, (int) std::size (delayTimes) - 1, juce::roundToInt (c.delayTime->load()))].beats;
-    f.delayFeedback = 0.01f * c.delayFeedback->load();
+    f.delayMs = real (Dest::delayTime);
+    f.delayFeedback = 0.95f * norm (Dest::delayFeedback);
     f.delayPingPong = c.delayPingPong->load() > 0.5f;
-    f.delayTone = 0.01f * c.delayTone->load();
-    f.delayMix = 0.01f * c.delayMix->load();
+    f.delayTone = norm (Dest::delayTone);
+    f.delayMix = norm (Dest::delayMix);
     f.reverbOn = c.reverbOn->load() > 0.5f;
-    f.reverbSize = 0.01f * c.reverbSize->load();
-    f.reverbDecay = 0.01f * c.reverbDecay->load();
-    f.reverbDamping = 0.01f * c.reverbDamping->load();
-    f.reverbPredelay = 0.01f * c.reverbPredelay->load();
-    f.reverbMix = 0.01f * c.reverbMix->load();
+    f.reverbSize = norm (Dest::reverbSize);
+    f.reverbDecay = norm (Dest::reverbDecay);
+    f.reverbDamping = norm (Dest::reverbDamping);
+    f.reverbPredelay = norm (Dest::reverbPredelay);
+    f.reverbMix = norm (Dest::reverbMix);
 }
 
 //==============================================================================
@@ -831,9 +839,6 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     arp.setSettings (arpSettings);
     if (arpWasOn != arpSettings.on)
         engine.allNotesOff (false);        // les notes jouées par l'autre chemin s'arrêtent
-    readFxSettings (fxSettings);
-    fx.setSettings (fxSettings);
-
     seqs::Engine::Transport transport;
     if (auto* head = getPlayHead())
         if (const auto position = head->getPosition())
@@ -904,7 +909,7 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     // --- Rendu ---
     float* left = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
-    std::array<float, 512> scratch {};
+    std::array<float, 64> scratch {};      // tranches courtes : la modulation des effets suit
 
     int position = 0;
     auto renderUpTo = [&] (int end)
@@ -914,6 +919,8 @@ void SequencesAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
             const int block = juce::jmin (end - position, (int) scratch.size());
             float* r = right != nullptr ? right + position : scratch.data();
             engine.render (left + position, r, block, transport, position);
+            readFxSettings (fxSettings, &engine);
+            fx.setSettings (fxSettings);
             fx.process (left + position, r, block, transport.bpm);
             if (right == nullptr)
                 for (int n = 0; n < block; ++n)
@@ -1238,23 +1245,6 @@ void SequencesAudioProcessor::randomizePattern()
 
     if (realValue ("seqOn") < 0.5f)
         setParam ("seqOn", 1.0f);
-
-    // Rien n'écoute le séquenceur : on le branche sur la coupure (et on la baisse si elle est grande ouverte)
-    bool listening = false;
-    for (int k = 0; k < seqs::numSlots; ++k)
-        listening = listening || (getModulationSource (k) == seqs::srcSeq && getModulationDest (k) != Dest::off
-                                  && std::abs (getModulationAmount (k)) > 0.005f);
-    if (! listening)
-    {
-        if (realValue ("cutoff") > 5000.0f)
-        {
-            setParam ("cutoff", 900.0f);
-            setParam ("resonance", 40.0f);
-        }
-        const int slot = addModulation (seqs::srcSeq, Dest::cutoff);
-        if (slot >= 0)
-            setModulationAmount (slot, 0.3f);
-    }
 }
 
 void SequencesAudioProcessor::randomizeAll()
@@ -1273,14 +1263,7 @@ void SequencesAudioProcessor::randomizeAll()
         setParam (lfoId (i, "Pol"), rng.chance (0.8) ? 0.0f : 1.0f);
     }
 
-    for (int c = 0; c < seqs::numChaos; ++c)
-    {
-        setParam (chaosId (c, "Rate"), (float) favouredRates[rng.range (0, 8)]);
-        setParam (chaosId (c, "Amt"), (float) rng.range (50, 100));
-        setParam (chaosId (c, "Smooth"), rng.chance (0.5) ? 0.0f : (float) rng.range (20, 100));
-    }
-
-    engine.setHostChaosSeed (rng.next());
+    // Les 2 CHAOS ne sont pas touchés
     randomizePattern();
 }
 

@@ -70,7 +70,8 @@ public:
     /** Lit tous les paramètres (aussi depuis l'interface, pour les aperçus). */
     void readSettings (seqs::Settings& s) const;
     void readArpSettings (seqs::ArpSettings& a) const;
-    void readFxSettings (seqs::FxSettings& f) const;
+    /** modulation : moteur dont on prend la modulation des effets (nullptr = potards seuls). */
+    void readFxSettings (seqs::FxSettings& f, const seqs::Engine* modulation = nullptr) const;
 
     //==========================================================================
     // Modulation
@@ -196,9 +197,7 @@ private:
         std::array<P, seqs::maxSteps> steps {};
         std::array<Slot, seqs::numSlots> slots {};
         P arpOn {}, arpMode {}, arpRate {}, arpOct {}, arpGate {}, arpSwing {}, arpLatch {};
-        P chorusOn {}, chorusRate {}, chorusDepth {}, chorusMix {};
-        P delayOn {}, delayTime {}, delayFeedback {}, delayPingPong {}, delayTone {}, delayMix {};
-        P reverbOn {}, reverbSize {}, reverbDecay {}, reverbDamping {}, reverbPredelay {}, reverbMix {};
+        P chorusOn {}, delayOn {}, delaySync {}, delayTime {}, delayPingPong {}, reverbOn {};
 
         void build (SequencesAudioProcessor&);
     };

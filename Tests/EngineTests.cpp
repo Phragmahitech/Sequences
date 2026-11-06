@@ -868,6 +868,52 @@ static void testFmMatrix()
             CHECK (finite && peak < 2.0f, "case FM %d -> %d bornée (%.2f)", row, col, peak);
         }
 
+    // ALGO dans la matrice : WT -> ALGO (FM par la hauteur) et ALGO -> WT
+    {
+        auto algoOnly = [] (float depth)
+        {
+            auto s = cleanSine();
+            setReal (s, Dest::wtLevel, 0.0f);
+            s.algoOn = true;
+            s.algoModel = 9;
+            setReal (s, Dest::algoHarmonics, 0.0f); setReal (s, Dest::algoTimbre, 0.0f); setReal (s, Dest::algoMorph, 0.0f);
+            setReal (s, Dest::algoLevel, 1.0f);
+            setReal (s, Dest::wtSemi, 7.0f);
+            s.fm[0][2] = 1.0f;
+            setReal (s, Dest::fmDepth, depth);
+            return s;
+        };
+        auto unmod = play (algoOnly (0.0f), 57, 24000), fmd = play (algoOnly (0.5f), 57, 24000);
+        bool finite = true;
+        for (float v : fmd) finite = finite && std::isfinite (v);
+        CHECK (finite && brightness (fmd) > 1.4 * brightness (unmod), "WT -> ALGO : FM audible (%.4f / %.4f)", brightness (unmod), brightness (fmd));
+        // Feedback de l'ALGO et toutes les cases ALGO : bornés
+        for (int row = 0; row < numFmRows; ++row)
+        {
+            auto s = algoOnly (1.0f);
+            s.fm[0][2] = 0.0f;
+            s.fm[(size_t) row][2] = 1.0f;
+            s.fm[2][0] = 1.0f; s.fm[2][1] = 1.0f;
+            setReal (s, Dest::wtLevel, 0.5f); setReal (s, Dest::pdLevel, 0.5f);
+            auto x = play (s, 45, 9600);
+            float peak = 0.0f; bool ok = true;
+            for (float v : x) { ok = ok && std::isfinite (v); peak = std::max (peak, std::abs (v)); }
+            CHECK (ok && peak < 2.0f, "cases ALGO, ligne %d : bornées (%.2f)", row, peak);
+        }
+        auto toWt = [] (float depth)
+        {
+            auto s = cleanSine();
+            s.algoOn = true; s.algoModel = 9;
+            setReal (s, Dest::algoLevel, 0.0f);
+            setReal (s, Dest::algoSemi, 7.0f);
+            s.fm[2][0] = 1.0f;
+            setReal (s, Dest::fmDepth, depth);
+            return s;
+        };
+        auto a = play (toWt (0.0f), 57, 24000), b = play (toWt (0.1f), 57, 24000);
+        CHECK (brightness (b) > 1.5 * brightness (a), "ALGO -> WT à niveau 0 : module quand même (%.4f / %.4f)", brightness (a), brightness (b));
+    }
+
     // Repliement en FM sur une scie aiguë (x2)
     {
         auto s = make (0.03f, FmMode::phase);
@@ -1307,6 +1353,19 @@ static void testFx()
         CHECK (peakAround (r, 12000) > 0.08f && peakAround (r, 12000) < peakAround (l, 6000), "2e écho à droite, plus faible");
         CHECK (peakAround (l, 3000) < 1e-3f, "rien entre les échos");
     }
+    // DELAY FREE : 100 ms quel que soit le tempo
+    for (double bpm : { 90.0, 174.0 })
+    {
+        FxSettings s; s.delayOn = true; s.delaySync = false; s.delayMs = 100.0; s.delayFeedback = 0.0f; s.delayMix = 1.0f; s.delayTone = 1.0f; s.delayPingPong = false;
+        Fx fx; fx.prepare (sr); fx.setSettings (s);
+        const int n = 12000;
+        auto l = impulse (n), r = impulse (n);
+        fx.process (l.data(), r.data(), n, bpm);
+        int at = 0; float best = 0.0f;
+        for (int i = 100; i < n; ++i) if (std::abs (l[(size_t) i]) > best) { best = std::abs (l[(size_t) i]); at = i; }
+        CHECK (std::abs (at - 4800) < 30, "DELAY FREE 100 ms à %.0f BPM : écho à %d", bpm, at);
+    }
+
     // REVERB : queue qui décroît, finie
     {
         FxSettings s; s.reverbOn = true; s.reverbMix = 1.0f; s.reverbDecay = 0.4f; s.reverbPredelay = 0.0f;

@@ -325,24 +325,36 @@ static void testRandomAndTools()
     }
     CHECK (onlyAudible, "RANDOM ne tire que les sources audibles");
 
-    // Séquenceur éteint et rien ne l'écoute : RANDOM l'allume et le branche sur la coupure
+    // RANDOM ne crée aucune modulation et ne touche pas au filtre
     set (p, "seqOn", 0.0f);
     for (int k = 0; k < seqs::numSlots; ++k)
-        if (p.getModulationSource (k) == seqs::srcSeq)
-            p.removeModulation (k);
-    p.randomizePattern();
+        p.removeModulation (k);
+    const float cutoffBefore = value (p, "cutoff");
+    for (int run = 0; run < 5; ++run)
+        p.randomizePattern();
     CHECK (value (p, "seqOn") > 0.5f, "RANDOM allume le séquenceur");
-    bool listening = false;
-    for (int k = 0; k < seqs::numSlots; ++k)
-        listening = listening || (p.getModulationSource (k) == seqs::srcSeq && p.getModulationDest (k) == seqs::Dest::cutoff);
-    CHECK (listening, "RANDOM branche SEQ sur la coupure");
+    CHECK (p.usedSlotCount() == 0, "RANDOM n'ajoute pas de modulation : %d", p.usedSlotCount());
+    CHECK (std::abs (value (p, "cutoff") - cutoffBefore) < 1e-3f, "RANDOM ne touche pas à la coupure");
 
     // RANDOM ALL change la banque
     std::vector<float> bank;
     for (int i = 0; i < seqs::numLfos; ++i)
         for (const char* n : { "Rate", "Shape", "Step" })
             bank.push_back (value (p, SequencesAudioProcessor::lfoId (i, n)));
+    std::vector<float> chaosBefore;
+    for (int c = 0; c < seqs::numChaos; ++c)
+        for (const char* n : { "Rate", "Amt", "Smooth" })
+            chaosBefore.push_back (value (p, SequencesAudioProcessor::chaosId (c, n)));
     p.randomizeAll();
+    {
+        size_t m = 0;
+        bool same = true;
+        for (int c = 0; c < seqs::numChaos; ++c)
+            for (const char* n : { "Rate", "Amt", "Smooth" })
+                same = same && std::abs (value (p, SequencesAudioProcessor::chaosId (c, n)) - chaosBefore[m++]) < 1e-6f;
+        CHECK (same, "RANDOM ALL ne touche pas aux CHAOS");
+        CHECK (p.usedSlotCount() == 0, "RANDOM ALL n'ajoute pas de modulation");
+    }
     int bankChanged = 0;
     size_t k = 0;
     for (int i = 0; i < seqs::numLfos; ++i)
@@ -594,6 +606,29 @@ static void testArpAndFx()
     }
     const double tailDry = renderRms (dry, 20, 512), tailWet = renderRms (wet, 20, 512);
     CHECK (tailDry < 1e-4 && tailWet > 1e-3, "REVERB : queue (%.5f / %.5f)", tailDry, tailWet);
+
+    // Les potards des effets se modulent : VELO -> REVERB MIX (mix à 0 sur le potard)
+    for (bool modulated : { false, true })
+    {
+        SequencesAudioProcessor q;
+        q.setPlayHead (&head);
+        set (q, "ampRelease", 5.0f);
+        set (q, "reverbOn", 1.0f);
+        set (q, "reverbMix", 0.0f);
+        set (q, "reverbDecay", 70.0f);
+        if (modulated)
+            q.setModulationAmount (q.addModulation (seqs::srcVelocity, seqs::Dest::reverbMix), 0.6f);
+        q.prepareToPlay (48000.0, 512);
+        juce::MidiBuffer note;
+        note.addEvent (juce::MidiMessage::noteOn (1, 57, (juce::uint8) 127), 0);
+        note.addEvent (juce::MidiMessage::noteOff (1, 57), 400);
+        renderRms (q, 1, 512, note);
+        renderRms (q, 10, 512);
+        const double tail = renderRms (q, 20, 512);
+        if (modulated) CHECK (tail > 1e-3, "VELO -> REVERB MIX : queue %.5f", tail);
+        else           CHECK (tail < 1e-4, "REVERB MIX 0 : pas de queue %.5f", tail);
+    }
+    CHECK (seqs::DestRange::toReal (seqs::Dest::delayTime, 0.0f) > 4.0f && std::abs (value (p, "delayMs") - 375.0f) < 0.5f, "DELAY FREE : 375 ms par défaut");
 }
 static juce::MouseEvent mouseAt (juce::Component& c, juce::Point<float> pt, juce::ModifierKeys mods = {},
                                  std::optional<juce::Point<float>> downAt = {})

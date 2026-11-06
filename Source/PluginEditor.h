@@ -424,6 +424,8 @@ private:
     juce::TextButton loadButton, leftButton, rightButton, clearButton, randomButton, randomAllButton, addModButton;
     juce::Slider* mlHzKnob = nullptr;
     juce::ComboBox* mlRateBox = nullptr;
+    juce::Slider* delayMsKnob = nullptr;
+    juce::ComboBox* delayTimeBox = nullptr;
     juce::Rectangle<int> modListArea, seqModListArea, headerInfo;
 
     int shownStep = -2, tick = 0, shownRows = -1, shownVoices = -1;

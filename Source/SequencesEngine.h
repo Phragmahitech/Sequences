@@ -36,8 +36,9 @@ constexpr int numLfos = 6;
 constexpr int numChaos = 2;
 constexpr int numSources = numLfos + numChaos;   // sources du séquenceur : 1..6 = LFO, 7..8 = CHAOS (0 = OFF)
 constexpr int numSlots = 24;
-constexpr int numFmRows = 3;                      // WT, PD, NOISE
-constexpr int numFmCols = 2;                      // vers WT, vers PD
+constexpr int numFmRows = 4;                      // WT, PD, ALGO, NOISE
+constexpr int numFmCols = 3;                      // vers WT, vers PD, vers ALGO
+constexpr double algoFmSemitones = 48.0;          // FM de l'ALGO (par la hauteur) : écart à 100 %
 constexpr double twoPi = 6.283185307179586;
 constexpr double pi = 3.141592653589793;
 
@@ -59,6 +60,9 @@ enum class Dest : int
     biteFold, biteCrush, biteSoft,
     cutoff, resonance, filterDrive, filterEnv,
     volume,
+    chorusRate, chorusDepth, chorusMix,
+    delayTime, delayFeedback, delayTone, delayMix,
+    reverbSize, reverbDecay, reverbDamping, reverbPredelay, reverbMix,
     count
 };
 constexpr int numDests = (int) Dest::count;
@@ -89,6 +93,8 @@ struct DestRange
         if (d == Dest::filterEnv)      return -1.0f + 2.0f * n;
         if (d == Dest::volume)         { const float g = n / 0.8f; return g * g; }   // gain, 0.8 = 0 dB
         if (d == Dest::cutoff)         return 20.0f * std::pow (1000.0f, n);  // Hz
+        if (d == Dest::chorusRate)     return 0.05f * std::pow (100.0f, n);   // Hz
+        if (d == Dest::delayTime)      return 5.0f * std::pow (400.0f, n);    // ms (mode FREE)
         return n;
     }
 
@@ -99,6 +105,8 @@ struct DestRange
         if (isPan (d) || d == Dest::filterEnv) return (v + 1.0f) * 0.5f;
         if (d == Dest::volume)         return 0.8f * std::sqrt (std::max (0.0f, v));
         if (d == Dest::cutoff)         return std::log (std::max (20.0f, v) / 20.0f) / std::log (1000.0f);
+        if (d == Dest::chorusRate)     return std::log (std::max (0.05f, v) / 0.05f) / std::log (100.0f);
+        if (d == Dest::delayTime)      return std::log (std::max (5.0f, v) / 5.0f) / std::log (400.0f);
         return v;
     }
 
@@ -167,7 +175,7 @@ struct Settings
     int subOctave = -1;
     NoiseType noiseType = NoiseType::white;
 
-    // Matrice FM : [ligne = WT, PD, NOISE][colonne = vers WT, vers PD], 0..1
+    // Matrice FM : [ligne = WT, PD, ALGO, NOISE][colonne = vers WT, vers PD, vers ALGO], 0..1
     std::array<std::array<float, numFmCols>, numFmRows> fm {};
     FmMode fmMode = FmMode::phase;
 
@@ -216,6 +224,10 @@ struct Settings
         set (Dest::biteFold, 0.0f); set (Dest::biteCrush, 0.0f); set (Dest::biteSoft, 0.0f);
         set (Dest::cutoff, 20000.0f); set (Dest::resonance, 0.1f); set (Dest::filterDrive, 0.0f); set (Dest::filterEnv, 0.0f);
         set (Dest::volume, 1.0f);
+        set (Dest::chorusRate, 0.3f); set (Dest::chorusDepth, 0.5f); set (Dest::chorusMix, 0.4f);
+        set (Dest::delayTime, 375.0f); set (Dest::delayFeedback, 0.35f); set (Dest::delayTone, 0.6f); set (Dest::delayMix, 0.25f);
+        set (Dest::reverbSize, 0.6f); set (Dest::reverbDecay, 0.5f); set (Dest::reverbDamping, 0.5f);
+        set (Dest::reverbPredelay, 0.1f); set (Dest::reverbMix, 0.2f);
     }
 
     float real (Dest d) const     { return DestRange::toReal (d, base[(size_t) d]); }
@@ -1130,10 +1142,21 @@ public:
 
         [[maybe_unused]] const auto& [os, osRate, baseNote, table, unison, wtLevel, wtHz, wtWarp, framePos,
                      pdLevel, pdHz, pdAmount, pdShape, pdCrush, pdFold, subLevel, subHz, noiseLevel,
-                     linearFm, wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise,
+                     linearFm, wtFromWt, wtFromPd, wtFromAlgo, wtFromNoise, pdFromWt, pdFromPd, pdFromAlgo, pdFromNoise, algoFromWt, algoFromPd, algoFromAlgo, algoFromNoise, algoFm,
                      warpFactor, levelPos, algoActive, algoParams, algoGainL, algoGainR,
                      biteFold, biteCrush, biteSoft, g, resonance, drive, stereo, pdActive, wtActive, volume, dcOs] = ctl;
-        const float algo = algoActive ? plaits->process (algoParams) : 0.0f;
+        float algo = 0.0f;
+        if (algoActive)
+        {
+            if (algoFm)
+            {
+                // FM de l'ALGO : sa hauteur suit les modulateurs, échantillon par échantillon
+                const float m = algoFromWt * lastWt + algoFromPd * lastPd + algoFromAlgo * lastAlgo + algoFromNoise * lastNoise;
+                algo = plaits->processFm (algoParams, (float) algoFmSemitones * std::clamp (m, -1.5f, 1.5f));
+            }
+            else
+                algo = plaits->process (algoParams);
+        }
         const float algoL = algo * algoGainL, algoR = algo * algoGainR;
 
         // --- Boucle suréchantillonnée -------------------------------------------------
@@ -1143,6 +1166,7 @@ public:
             const float t = (float) (n + 1) / (float) os;
             const float algoNowL = lastAlgoL + (algoL - lastAlgoL) * t;
             const float algoNowR = lastAlgoR + (algoR - lastAlgoR) * t;
+            const float algoNow = lastAlgo + (algo - lastAlgo) * t;
 
             // Bruit (aussi modulateur de la matrice)
             noiseState ^= noiseState << 13;
@@ -1180,11 +1204,13 @@ public:
                 default: break;
             }
 
+            lastNoise = noise;
+
             // PHASE DISTORTION
             float pd = 0.0f;
             if (pdActive)
             {
-                const float mod = pdFromWt * lastWt + pdFromPd * lastPd + pdFromNoise * noise;
+                const float mod = pdFromWt * lastWt + pdFromPd * lastPd + pdFromAlgo * algoNow + pdFromNoise * noise;
                 double p = pdPhase;
                 double inc = pdHz / osRate;
                 if (linearFm)
@@ -1222,7 +1248,7 @@ public:
                 lastWt = 0.0f;
             else
             {
-                const float mod = wtFromWt * lastWt + wtFromPd * pd + wtFromNoise * noise;
+                const float mod = wtFromWt * lastWt + wtFromPd * pd + wtFromAlgo * algoNow + wtFromNoise * noise;
                 const double baseInc = std::min (wtHz / osRate, 0.45);
                 for (int u = 0; u < unison; ++u)
                 {
@@ -1320,6 +1346,7 @@ public:
         }
         lastAlgoL = algoL;
         lastAlgoR = algoR;
+        lastAlgo = algo;
 
         // --- Retour à la fréquence de base ---------------------------------------------
         float yl = subL[0], yr = subR[0];
@@ -1354,7 +1381,8 @@ public:
     {
         int os; double osRate, baseNote; const Wavetable* table; int unison; float wtLevel; double wtHz; float wtWarp; double framePos;
         float pdLevel; double pdHz, pdAmount, pdShape; float pdCrush, pdFold, subLevel; double subHz; float noiseLevel;
-        bool linearFm; float wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise;
+        bool linearFm; float wtFromWt, wtFromPd, wtFromAlgo, wtFromNoise, pdFromWt, pdFromPd, pdFromAlgo, pdFromNoise;
+        float algoFromWt, algoFromPd, algoFromAlgo, algoFromNoise; bool algoFm;
         double warpFactor, levelPos; bool algoActive; PlaitsOsc::Params algoParams; float algoGainL, algoGainR;
         float biteFold, biteCrush, biteSoft; double g, resonance, drive; bool stereo, pdActive, wtActive; float volume, dcOs;
     };
@@ -1451,8 +1479,10 @@ public:
         // Matrice FM
         const float depth = norm (Dest::fmDepth);
         const bool linearFm = s.fmMode == FmMode::linear;
-        const float wtFromWt = depth * s.fm[0][0], wtFromPd = depth * s.fm[1][0], wtFromNoise = depth * s.fm[2][0];
-        const float pdFromWt = depth * s.fm[0][1], pdFromPd = depth * s.fm[1][1], pdFromNoise = depth * s.fm[2][1];
+        const float wtFromWt = depth * s.fm[0][0], wtFromPd = depth * s.fm[1][0], wtFromAlgo = depth * s.fm[2][0], wtFromNoise = depth * s.fm[3][0];
+        const float pdFromWt = depth * s.fm[0][1], pdFromPd = depth * s.fm[1][1], pdFromAlgo = depth * s.fm[2][1], pdFromNoise = depth * s.fm[3][1];
+        const float algoFromWt = depth * s.fm[0][2], algoFromPd = depth * s.fm[1][2], algoFromAlgo = depth * s.fm[2][2], algoFromNoise = depth * s.fm[3][2];
+        const bool algoFm = algoFromWt > 0.0f || algoFromPd > 0.0f || algoFromAlgo > 0.0f || algoFromNoise > 0.0f;
 
         // Niveau de mipmap : harmoniques jusqu'à 0,75 fe (le décimateur coupe au-dessus de 0,5 fe) ; sans
         // suréchantillonnage, un niveau de plus pour rester sous Nyquist
@@ -1464,7 +1494,8 @@ public:
         if (linearFm)
             effective *= 1.0 + linDepth * (wtFromWt + wtFromPd);
         else
-            effective += twoPi * pmDepth * ((double) wtFromPd * pdHz + (double) wtFromWt * wtHz);
+            effective += twoPi * pmDepth * ((double) wtFromPd * pdHz + (double) wtFromWt * wtHz
+                                        + (double) wtFromAlgo * detail::noteToHz (baseNote + 12.0 * s.algoOctave));
         const double levelBias = os == 1 ? 1.0 : 0.0;
         auto levelFor = [&] (double hz)
         {
@@ -1491,7 +1522,7 @@ public:
 
         // ALGORITHMIC OSC (Plaits, à la fréquence de base, interpolé) : réglages
         const float algoLevel = s.algoOn ? real (Dest::algoLevel) : 0.0f;
-        const bool algoActive = s.algoOn && algoLevel > 0.0f;
+        const bool algoActive = s.algoOn && (algoLevel > 0.0f || wtFromAlgo > 0.0f || pdFromAlgo > 0.0f);
         PlaitsOsc::Params algoParams;
         algoParams.model = s.algoModel;
         algoParams.note = (float) (baseNote + 12.0 * s.algoOctave + real (Dest::algoSemi) + 0.01 * real (Dest::algoFine));
@@ -1516,12 +1547,12 @@ public:
         const double resonance = norm (Dest::resonance);
         const double drive = norm (Dest::filterDrive);
         const bool stereo = sh.stereo;
-        const bool pdActive = s.pdOn && (pdLevel > 0.0f || wtFromPd > 0.0f);
-        const bool wtActive = s.wtOn && (wtLevel > 0.0f || pdFromWt > 0.0f);
+        const bool pdActive = s.pdOn && (pdLevel > 0.0f || wtFromPd > 0.0f || (algoActive && algoFromPd > 0.0f));
+        const bool wtActive = s.wtOn && (wtLevel > 0.0f || pdFromWt > 0.0f || (algoActive && algoFromWt > 0.0f));
         const float volume = real (Dest::volume);
         const float dcOs = dcCoefOs (os);
 
-        ctl = Control { os, osRate, baseNote, table, unison, wtLevel, wtHz, wtWarp, framePos, pdLevel, pdHz, pdAmount, pdShape, pdCrush, pdFold, subLevel, subHz, noiseLevel, linearFm, wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise, warpFactor, levelPos, algoActive, algoParams, algoGainL, algoGainR, biteFold, biteCrush, biteSoft, g, resonance, drive, stereo, pdActive, wtActive, volume, dcOs };
+        ctl = Control { os, osRate, baseNote, table, unison, wtLevel, wtHz, wtWarp, framePos, pdLevel, pdHz, pdAmount, pdShape, pdCrush, pdFold, subLevel, subHz, noiseLevel, linearFm, wtFromWt, wtFromPd, wtFromAlgo, wtFromNoise, pdFromWt, pdFromPd, pdFromAlgo, pdFromNoise, algoFromWt, algoFromPd, algoFromAlgo, algoFromNoise, algoFm, warpFactor, levelPos, algoActive, algoParams, algoGainL, algoGainR, biteFold, biteCrush, biteSoft, g, resonance, drive, stereo, pdActive, wtActive, volume, dcOs };
     }
 
     int note = -1;
@@ -1539,7 +1570,7 @@ private:
     {
         wtPhase.fill (0.0);
         pdPhase = subPhase = digitalPhase = 0.0;
-        lastWt = lastPd = 0.0f;
+        lastWt = lastPd = lastAlgo = lastNoise = 0.0f;
         lastAlgoL = lastAlgoR = 0.0f;
         pink.fill (0.0f);
         brown = 0.0f;
@@ -1564,7 +1595,7 @@ private:
     float cachedDetune = -1.0f, cachedSpread = -1.0f, cachedWtPan = -2.0f;
 
     double pdPhase = 0.0, subPhase = 0.0, digitalPhase = 0.0;
-    float lastWt = 0.0f, lastPd = 0.0f, lastAlgoL = 0.0f, lastAlgoR = 0.0f;
+    float lastWt = 0.0f, lastPd = 0.0f, lastAlgo = 0.0f, lastNoise = 0.0f, lastAlgoL = 0.0f, lastAlgoR = 0.0f;
     std::array<float, 3> pink {};
     float brown = 0.0f;
     uint16_t lfsr = 0x7FFF;
@@ -1606,6 +1637,7 @@ public:
             v.reset();
         heldNotes.clear();
         pitchWheel = 0.0f;
+        fxOffsets.fill (0.0f);
         dcInL = dcInR = dcOutL = dcOutR = 0.0f;
     }
 
@@ -1773,6 +1805,8 @@ public:
     int getPlayheadStep() const noexcept                  { return playheadStep; }
     double getPlayheadBeats() const noexcept              { return playheadBeats; }
     float getLiveOffset (Dest d) const noexcept           { return liveOffsets[(size_t) d]; }
+    /** Modulation des effets (dernière voix jouée, gardée quand plus aucune voix ne joue). */
+    float getFxOffset (Dest d) const noexcept             { return fxOffsets[(size_t) d]; }
 
     int activeVoiceCount() const
     {
@@ -1801,7 +1835,7 @@ private:
         playheadStep = latest != nullptr && settings.seq.on ? latest->lastStep : -1;
         playheadBeats = latest == nullptr ? -1.0 : (settings.seq.hostSync ? lastHostBeats : latest->seqBeats);
         if (latest != nullptr)
-            liveOffsets = latest->offsets;
+            liveOffsets = fxOffsets = latest->offsets;   // les effets gardent la dernière modulation pendant les queues
         else
             liveOffsets.fill (0.0f);
     }
@@ -1840,7 +1874,7 @@ private:
     float dcCoef = 0.999f, dcInL = 0.0f, dcInR = 0.0f, dcOutL = 0.0f, dcOutR = 0.0f;
     int playheadStep = -1;
     double playheadBeats = -1.0;
-    std::array<float, numDests> liveOffsets {};
+    std::array<float, numDests> liveOffsets {}, fxOffsets {};
 };
 
 } // namespace seqs

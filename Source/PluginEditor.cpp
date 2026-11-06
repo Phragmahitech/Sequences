@@ -1486,50 +1486,54 @@ void SequencesFacade::buildMain()
 
     // --- Rangée 2 : SUB + NOISE, FM MATRIX, BITE!, FILTER ---
     const int y2 = 262 + g;
+    const int subW = 210, fmW = 384, biteW = 206;
     {
-        const auto r = panel (page, "SUB + NOISE", { 0, y2, 230, 214 });
+        const auto r = panel (page, "SUB + NOISE", { 0, y2, subW, 214 });
         page.leftCaptions.push_back ({ "SUB", { r.getX() + 12, r.getY() + 44, 80, 14 } });
         addInlineChoice (page, "subWave", { r.getX() + 12, r.getY() + 62, 84, 22 });
-        knobRow (page, { r.getX() + 102, r.getY() + 30, r.getWidth() - 110, 88 }, { { "subOct", "OCT" }, { "subLevel", "LEVEL" } }, true);
+        knobRow (page, { r.getX() + 100, r.getY() + 30, r.getWidth() - 106, 88 }, { { "subOct", "OCT" }, { "subLevel", "LEVEL" } }, true);
         page.leftCaptions.push_back ({ "NOISE", { r.getX() + 12, r.getY() + 136, 80, 14 } });
         addInlineChoice (page, "noiseType", { r.getX() + 12, r.getY() + 154, 84, 22 });
-        knobRow (page, { r.getX() + 102 + (r.getWidth() - 110) / 2, r.getY() + 122, (r.getWidth() - 110) / 2, 88 },
+        knobRow (page, { r.getX() + 100 + (r.getWidth() - 106) / 2, r.getY() + 122, (r.getWidth() - 106) / 2, 88 },
                  { { "noiseLevel", "LEVEL" } }, true);
     }
     {
-        const auto r = panel (page, "FM MATRIX", { 230 + g, y2, 300, 214 }, "ROW MODULATES COLUMN, DIAGONAL = FEEDBACK");
-        const char* rows[] = { "WT", "PD", "NOISE" };
-        const char* cols[] = { "TO WT", "TO PD" };
+        const auto r = panel (page, "FM MATRIX", { subW + g, y2, fmW, 214 }, "ROW MODULATES COLUMN, DIAGONAL = FEEDBACK");
+        const char* rows[] = { "WT", "PD", "ALGO", "NOISE" };
+        const char* cols[] = { "TO WT", "TO PD", "TO ALGO" };
+        const int cw = 64, ch = 28, x0 = r.getX() + 56, y0 = r.getY() + 58;
         for (int c = 0; c < seqs::numFmCols; ++c)
-            page.captions.push_back ({ cols[c], { r.getX() + 62 + c * 76, r.getY() + 44, 70, 14 } });
+            page.captions.push_back ({ cols[c], { x0 + c * (cw + 4), r.getY() + 42, cw, 14 } });
         for (int row = 0; row < seqs::numFmRows; ++row)
         {
-            page.leftCaptions.push_back ({ rows[row], { r.getX() + 12, r.getY() + 62 + row * 38, 48, 32 } });
+            page.leftCaptions.push_back ({ rows[row], { r.getX() + 12, y0 + row * (ch + 4), 44, ch } });
             for (int c = 0; c < seqs::numFmCols; ++c)
             {
                 auto cell = std::make_unique<ui::FmCell> (audioProcessor, row, c);
-                cell->setBounds (r.getX() + 62 + c * 76, r.getY() + 62 + row * 38, 70, 32);
+                cell->setBounds (x0 + c * (cw + 4), y0 + row * (ch + 4), cw, ch);
                 page.addAndMakeVisible (*cell);
                 fmCells.push_back (cell.get());
                 owned.push_back (std::move (cell));
             }
         }
-        addKnob (page, "fmDepth", "DEPTH", { r.getRight() - 12 - 70, r.getY() + 40, 70, 104 });
-        addCaptionedChoice (page, "fmMode", "MODE", { r.getRight() - 12 - 74, r.getY() + 150, 74, 44 });
+        addKnob (page, "fmDepth", "DEPTH", { r.getRight() - 12 - 72, r.getY() + 40, 72, 104 });
+        addCaptionedChoice (page, "fmMode", "MODE", { r.getRight() - 12 - 76, r.getY() + 150, 76, 44 });
+        page.leftCaptions.push_back ({ "ALGO : FM BY PITCH", { r.getX() + 12, r.getY() + 190, 200, 14 } });
     }
     {
-        const auto r = panel (page, "BITE!", { 230 + 300 + 2 * g, y2, 250, 214 });
-        knobRow (page, { r.getX() + 8, r.getY() + 34, r.getWidth() - 16, 112 }, { { "biteFold", "FOLD" }, { "biteCrush", "CRUSH" }, { "biteSoft", "SOFT" } });
-        addToggle (page, "bitePost", "POST FILTER", { r.getX() + 12, r.getY() + 166, 120, 26 });
-        addToggle (page, "biteAsym", "ASYM", { r.getX() + 140, r.getY() + 166, r.getWidth() - 152, 26 });
+        const auto r = panel (page, "BITE!", { subW + fmW + 2 * g, y2, biteW, 214 });
+        knobRow (page, { r.getX() + 6, r.getY() + 34, r.getWidth() - 12, 112 }, { { "biteFold", "FOLD" }, { "biteCrush", "CRUSH" }, { "biteSoft", "SOFT" } }, true);
+        addToggle (page, "bitePost", "POST FILTER", { r.getX() + 12, r.getY() + 166, 108, 26 });
+        addToggle (page, "biteAsym", "ASYM", { r.getX() + 126, r.getY() + 166, r.getWidth() - 138, 26 });
     }
     {
-        const auto r = panel (page, "FILTER", { 230 + 300 + 250 + 3 * g, y2, 1288 - (230 + 300 + 250 + 3 * g), 214 });
+        const int fx = subW + fmW + biteW + 3 * g;
+        const auto r = panel (page, "FILTER", { fx, y2, 1288 - fx, 214 });
         int x = r.getRight() - 12;
         auto right = [&x, &r] (int w) { x -= w; const juce::Rectangle<int> b (x, r.getY() + 6, w, 22); x -= 6; return b; };
-        addInlineChoice (page, "filterSlope", right (74));
-        addInlineChoice (page, "filterType", right (74));
-        addInlineChoice (page, "filterModel", right (90));
+        addInlineChoice (page, "filterSlope", right (70));
+        addInlineChoice (page, "filterType", right (70));
+        addInlineChoice (page, "filterModel", right (84));
         knobRow (page, { r.getX() + 8, r.getY() + 44, r.getWidth() - 16, 140 },
                  { { "cutoff", "CUTOFF" }, { "resonance", "RESO" }, { "keyTrack", "KEY TRK" }, { "filterDrive", "DRIVE" }, { "filterEnv", "ENV AMT", true } });
     }
@@ -1735,10 +1739,13 @@ void SequencesFacade::buildFx()
         knobRow (page, { r.getX() + 8, r.getY() + 50, r.getWidth() - 16, 140 }, { { "chorusRate", "RATE" }, { "chorusDepth", "DEPTH" }, { "chorusMix", "MIX" } });
     }
     {
-        const auto r = panel (page, "DELAY", { 312, 0, 480, 250 }, "SYNCED TO THE TEMPO");
+        const auto r = panel (page, "DELAY", { 312, 0, 480, 250 }, "SYNC OFF = FREE TIME IN MS");
         addToggle (page, "delayPingPong", "PING-PONG", { r.getRight() - 12 - 96, r.getY() + 8, 96, 24 });
-        addToggle (page, "delayOn", "ON", { r.getRight() - 12 - 96 - 6 - 48, r.getY() + 8, 48, 24 });
-        addCaptionedChoice (page, "delayTime", "TIME", { r.getX() + 12, r.getY() + 70, 90, 44 });
+        addToggle (page, "delaySync", "SYNC", { r.getRight() - 12 - 96 - 6 - 58, r.getY() + 8, 58, 24 });
+        addToggle (page, "delayOn", "ON", { r.getRight() - 12 - 96 - 6 - 58 - 6 - 48, r.getY() + 8, 48, 24 });
+        addCaptionedChoice (page, "delayTime", "SYNC TIME", { r.getX() + 12, r.getY() + 54, 90, 44 });
+        delayTimeBox = &choices.back()->box;
+        delayMsKnob = &addKnob (page, "delayMs", "FREE TIME", { r.getX() + 12, r.getY() + 106, 90, 100 }, false, true);
         knobRow (page, { r.getX() + 110, r.getY() + 50, r.getWidth() - 122, 140 }, { { "delayFeedback", "FEEDBACK" }, { "delayTone", "TONE" }, { "delayMix", "MIX" } });
     }
     {
@@ -1747,7 +1754,8 @@ void SequencesFacade::buildFx()
         knobRow (page, { r.getX() + 8, r.getY() + 50, r.getWidth() - 16, 140 },
                  { { "reverbSize", "SIZE" }, { "reverbDecay", "DECAY" }, { "reverbDamping", "DAMP" }, { "reverbPredelay", "PRE" }, { "reverbMix", "MIX" } });
     }
-    page.notes.push_back ({ "CHAIN : SYNTH -> CHORUS -> DELAY -> REVERB -> OUT", { 12, 266, 600, 20 } });
+    page.notes.push_back ({ "CHAIN : SYNTH -> CHORUS -> DELAY -> REVERB -> OUT.   EVERY FX KNOB CAN BE MODULATED : DRAG A SOURCE CHIP ONTO IT "
+                            "(THE FX FOLLOW THE LAST NOTE PLAYED, AND KEEP ITS MODULATION DURING THE TAILS).", { 12, 266, 1200, 40 } });
 }
 
 //==============================================================================
@@ -1883,6 +1891,14 @@ void SequencesFacade::timerCallback()
     const bool sync = audioProcessor.apvts.getRawParameterValue ("mlSync")->load() > 0.5f;
     if (mlHzKnob != nullptr) mlHzKnob->setAlpha (sync ? 0.35f : 1.0f);
     if (mlRateBox != nullptr) mlRateBox->setAlpha (sync ? 1.0f : 0.35f);
+    const bool delaySync = audioProcessor.apvts.getRawParameterValue ("delaySync")->load() > 0.5f;
+    if (delayMsKnob != nullptr) delayMsKnob->setAlpha (delaySync ? 0.35f : 1.0f);
+    if (delayTimeBox != nullptr) delayTimeBox->setAlpha (delaySync ? 1.0f : 0.35f);
+
+    if (currentTab == tabFx && (playing || tick % 6 == 0))
+        for (auto* k : modKnobs)
+            if (k->isShowing())
+                k->repaint();
 
     if (currentTab == tabMain && (playing || tick % 6 == 0))
     {
