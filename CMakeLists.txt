@@ -17,7 +17,7 @@ endif()
 # Windows : runtime C++ lié en statique -> aucun "Visual C++ Redistributable" à installer
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(Sequences VERSION 0.3.0 LANGUAGES C CXX)
+project(Sequences VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,19 @@ FetchContent_Declare(JUCE
     GIT_TAG        8.0.15
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(JUCE)
+
+# --- Plaits (Mutable Instruments, licence MIT) --------------------------------
+file(GLOB_RECURSE SEQUENCES_PLAITS_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/plaits/*.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/stmlib/*.cc)
+add_library(SequencesPlaits STATIC ${SEQUENCES_PLAITS_SOURCES})
+target_compile_definitions(SequencesPlaits PUBLIC TEST)
+target_include_directories(SequencesPlaits SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty)
+if(MSVC)
+    target_compile_options(SequencesPlaits PRIVATE /W0 /wd4244 /wd4305)
+else()
+    target_compile_options(SequencesPlaits PRIVATE -w)
+endif()
 
 # --- Plugin ------------------------------------------------------------------
 juce_add_plugin(Sequences
@@ -69,6 +82,7 @@ target_compile_definitions(Sequences PUBLIC ${SEQUENCES_DEFINITIONS})
 
 target_link_libraries(Sequences
     PRIVATE
+        SequencesPlaits
         juce::juce_audio_processors
     PUBLIC
         juce::juce_recommended_config_flags
@@ -81,6 +95,7 @@ if(SEQUENCES_BUILD_TESTS)
     # Moteur seul, sans JUCE
     add_executable(SequencesEngineTests Tests/EngineTests.cpp)
     target_include_directories(SequencesEngineTests PRIVATE Source)
+    target_link_libraries(SequencesEngineTests PRIVATE SequencesPlaits)
     add_test(NAME engine COMMAND SequencesEngineTests)
 
     # Plugin complet (paramètres, MIDI, état, presets, interface)
@@ -91,6 +106,7 @@ if(SEQUENCES_BUILD_TESTS)
         Source/PluginEditor.cpp)
     target_compile_definitions(SequencesPluginTests PRIVATE ${SEQUENCES_DEFINITIONS} JUCE_MODAL_LOOPS_PERMITTED=1)
     target_link_libraries(SequencesPluginTests PRIVATE
+        SequencesPlaits
         juce::juce_audio_processors
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags)
@@ -104,6 +120,7 @@ if(SEQUENCES_BUILD_TESTS)
         Source/PluginEditor.cpp)
     target_compile_definitions(SequencesRender PRIVATE ${SEQUENCES_DEFINITIONS} JUCE_MODAL_LOOPS_PERMITTED=1)
     target_link_libraries(SequencesRender PRIVATE
+        SequencesPlaits
         juce::juce_audio_processors
         juce::juce_audio_formats
         juce::juce_recommended_config_flags

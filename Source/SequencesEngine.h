@@ -4,122 +4,147 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 
 #include "Wavetable.h"
+#include "PlaitsOsc.h"
 
 /**
-    Moteur de Sequences (sans JUCE, testable seul).
+    Moteur de Sequences v0.4 (sans JUCE, testable seul), sur le modèle d'Alaskan Bites 3.
 
-    Une voix = 2 oscillateurs wavetable (A et B) calculés en suréchantillonnage x2, chacun avec
-    OCT (octaves), COARSE (demi-tons, continu : il glisse quand on le tourne ou le module), FINE,
-    POS (position dans la table) et un WARP à la façon de Serum : SYNC, FM / AM / RM depuis l'autre
-    oscillateur (A est modulé par B, B par A). + bruit -> distorsion (avant ou après le filtre)
-    -> filtre d'état (LP / BP / HP, 12 ou 24 dB) -> volume. Deux enveloppes ADSR (ENV 1 = ampli, ENV 2).
+    Une voix =
+      WAVETABLE (unison jusqu'à 8, detune, spread, warp SYNC / BEND+ / BEND- / MIRROR)
+    + PHASE DISTORTION (formes Casio CZ, PD AMT, SHAPE, CRUSH, FOLD)
+    + ALGORITHMIC OSC (Plaits de Mutable Instruments, 24 modèles, LPG)
+    + SUB + NOISE
+    -> matrice FM (WT, PD, NOISE modulent WT et PD ; diagonale = feedback ; mode PHASE ou LINEAR)
+    -> BITE! (fold, crush, soft, asymétrie ; avant ou après le filtre)
+    -> FILTRE (LADDER ou SVF ; LP / BP / HP / NOTCH ; 12 ou 24 dB)
+    -> volume (ENV 1), panoramique. Tout jusqu'au filtre compris tourne suréchantillonné (1x, 2x ou 4x).
 
-    Modulation :
-      - une banque de 6 LFO et 2 CHAOS, un séquenceur qui choisit la source à chaque pas (SEQ),
-        plus ENV 2 et la vélocité ;
-      - 16 routages source -> destination. Une modulation s'ajoute à la position du potard
-        (0..1, sur toute sa course), comme dans Serum : +100 % = toute la course vers la droite.
-    En mode NOTE, le temps des LFO part de chaque note (pas au legato). En mode HOST, il suit le morceau.
+    Modulation : ENV 2 (filtre) et ENV 3, MAIN LFO (2 destinations fixes), banque de 6 LFO + 2 CHAOS,
+    séquenceur qui choisit la source à chaque pas (SEQ), vélocité, molette. 24 routages source ->
+    destination ; une modulation s'ajoute à la position du potard (0..1), comme dans Serum.
 */
 namespace seqs
 {
 
 constexpr int maxSteps = 32;
-constexpr int maxVoices = 8;
+constexpr int maxVoices = 16;
+constexpr int maxUnison = 8;
 constexpr int numLfos = 6;
 constexpr int numChaos = 2;
 constexpr int numSources = numLfos + numChaos;   // sources du séquenceur : 1..6 = LFO, 7..8 = CHAOS (0 = OFF)
-constexpr int numSlots = 16;
-constexpr int numOscs = 2;
+constexpr int numSlots = 24;
+constexpr int numFmRows = 3;                      // WT, PD, NOISE
+constexpr int numFmCols = 2;                      // vers WT, vers PD
 constexpr double twoPi = 6.283185307179586;
 constexpr double pi = 3.141592653589793;
 
 /** Sources d'un routage. */
-enum ModSource : int { srcSeq = 0, srcLfo1 = 1, srcChaos1 = 7, srcEnv2 = 9, srcVelocity = 10, numModSources = 11 };
+enum ModSource : int
+{
+    srcSeq = 0, srcLfo1 = 1, srcChaos1 = 7, srcEnv2 = 9, srcEnv3 = 10, srcVelocity = 11, srcMainLfo = 12, srcModWheel = 13,
+    numModSources = 14
+};
 
 /** Destinations : chacune correspond à un potard de l'interface. */
 enum class Dest : int
 {
     off = 0,
-    aLevel, aPos, aCoarse, aFine, aWarp,
-    bLevel, bPos, bCoarse, bFine, bWarp,
-    noise, pitch, pan, volume,
-    cutoff, resonance, drive,
+    wtPos, wtWarp, wtSemi, wtFine, wtLevel, wtDetune, wtSpread, wtPan,
+    pdAmount, pdShape, pdCrush, pdFold, pdLevel, pdSemi, pdFine,
+    algoHarmonics, algoTimbre, algoMorph, algoDecay, algoColour, algoAux, algoLevel, algoSemi, algoFine, algoPan,
+    subLevel, noiseLevel, fmDepth,
+    biteFold, biteCrush, biteSoft,
+    cutoff, resonance, filterDrive, filterEnv,
+    volume,
     count
 };
 constexpr int numDests = (int) Dest::count;
 
-enum class Warp : int { off = 0, sync, fm, am, rm, count };
+enum class WtWarp : int { off = 0, sync, bendPlus, bendMinus, mirror, count };
+enum class PdWave : int { saw = 0, square, pulse, dblSine, sawPulse, reso1, reso2, reso3, count };
+enum class SubWave : int { sine = 0, triangle, square, saw, count };
+enum class NoiseType : int { white = 0, pink, brown, digital, count };
+enum class FmMode : int { phase = 0, linear, count };
+enum class FilterModel : int { ladder = 0, svf, count };
+enum class FilterType : int { lowpass = 0, bandpass, highpass, notch, count };
 enum class LfoShape : int { sine = 0, triangle, saw, ramp, square, pulse, expDown, expUp, count };
-enum class FilterType : int { lowpass = 0, bandpass, highpass };
-enum class DriveType : int { soft = 0, fold, crush };
+enum class MainLfoShape : int { sine = 0, triangle, saw, ramp, square, sampleHold, smoothRandom, count };
+enum class VoiceMode : int { poly = 0, mono, legato, count };
 
 /** Position du potard (0..1) -> valeur réelle, pour chaque destination. */
 struct DestRange
 {
+    static bool isSemi (Dest d)    { return d == Dest::wtSemi || d == Dest::pdSemi || d == Dest::algoSemi; }
+    static bool isFine (Dest d)    { return d == Dest::wtFine || d == Dest::pdFine || d == Dest::algoFine; }
+    static bool isPan (Dest d)     { return d == Dest::wtPan || d == Dest::algoPan; }
+
     static float toReal (Dest d, float n)
     {
-        if (d == Dest::aCoarse || d == Dest::bCoarse)   return -48.0f + 96.0f * n;          // demi-tons
-        if (d == Dest::aFine || d == Dest::bFine)       return -100.0f + 200.0f * n;        // centièmes
-        if (d == Dest::pitch)                           return -24.0f + 48.0f * n;          // demi-tons
-        if (d == Dest::pan)                             return -1.0f + 2.0f * n;
-        if (d == Dest::volume)                          { const float g = n / 0.8f; return g * g; }   // gain, 0.8 = 0 dB
-        if (d == Dest::cutoff)                          return 20.0f * std::pow (1000.0f, n);  // Hz
+        if (isSemi (d))                return -48.0f + 96.0f * n;            // demi-tons (continu)
+        if (isFine (d))                return -100.0f + 200.0f * n;          // centièmes
+        if (isPan (d))                 return -1.0f + 2.0f * n;
+        if (d == Dest::filterEnv)      return -1.0f + 2.0f * n;
+        if (d == Dest::volume)         { const float g = n / 0.8f; return g * g; }   // gain, 0.8 = 0 dB
+        if (d == Dest::cutoff)         return 20.0f * std::pow (1000.0f, n);  // Hz
         return n;
     }
 
     static float toNorm (Dest d, float v)
     {
-        if (d == Dest::aCoarse || d == Dest::bCoarse)   return (v + 48.0f) / 96.0f;
-        if (d == Dest::aFine || d == Dest::bFine)       return (v + 100.0f) / 200.0f;
-        if (d == Dest::pitch)                           return (v + 24.0f) / 48.0f;
-        if (d == Dest::pan)                             return (v + 1.0f) * 0.5f;
-        if (d == Dest::volume)                          return 0.8f * std::sqrt (std::max (0.0f, v));
-        if (d == Dest::cutoff)                          return std::log (std::max (20.0f, v) / 20.0f) / std::log (1000.0f);
+        if (isSemi (d))                return (v + 48.0f) / 96.0f;
+        if (isFine (d))                return (v + 100.0f) / 200.0f;
+        if (isPan (d) || d == Dest::filterEnv) return (v + 1.0f) * 0.5f;
+        if (d == Dest::volume)         return 0.8f * std::sqrt (std::max (0.0f, v));
+        if (d == Dest::cutoff)         return std::log (std::max (20.0f, v) / 20.0f) / std::log (1000.0f);
         return v;
     }
 
-    /** Hauteurs : lissage plus long, pour que COARSE glisse quand on le tourne. */
-    static bool isPitch (Dest d)  { return d == Dest::aCoarse || d == Dest::bCoarse || d == Dest::pitch; }
+    /** Hauteurs : lissage plus long, pour que SEMI glisse quand on le tourne. */
+    static bool isPitch (Dest d)   { return isSemi (d); }
 };
 
 struct LfoSettings
 {
-    double periodBeats = 1.0;    // durée d'un cycle, en noires
+    double periodBeats = 1.0;
     LfoShape shape = LfoShape::sine;
-    float amount = 1.0f;         // 0..1
-    int steps = 0;               // 0 = continu, sinon nombre de marches par cycle
-    float phase = 0.0f;          // 0..1
-    bool unipolar = false;       // false : -1..1, true : 0..1
+    float amount = 1.0f;
+    int steps = 0;
+    float phase = 0.0f;
+    bool unipolar = false;
 };
 
 struct ChaosSettings
 {
-    double periodBeats = 0.25;   // une nouvelle valeur par période
+    double periodBeats = 0.25;
     float amount = 1.0f;
-    float smooth = 0.0f;         // 0 = marches nettes, 1 = glisse sur toute la période
+    float smooth = 0.0f;
 };
 
 struct SeqSettings
 {
     bool on = true;
     int steps = 16;
-    double stepBeats = 0.5;      // durée d'un pas en noires (triolet / pointé compris)
-    double swing = 0.0;          // 0..0.75
-    bool hostSync = false;       // false = NOTE, true = HOST
-    bool restart = true;         // chaque pas fait repartir sa source de sa phase
-    float xfadeMs = 2.0f;        // fondu entre deux sources
-    int manual = 1;              // source jouée quand le séquenceur est éteint (1..8)
-    std::array<int, maxSteps> pattern {};   // 0 = OFF, 1..8 = source
+    double stepBeats = 0.5;
+    double swing = 0.0;
+    bool hostSync = false;
+    bool restart = true;
+    float xfadeMs = 2.0f;
+    int manual = 1;
+    std::array<int, maxSteps> pattern {};
 };
 
-struct OscSettings
+struct MainLfoSettings
 {
-    const Wavetable* table = nullptr;   // nullptr = table intégrée BASIC SHAPES
-    int octave = 0;
-    Warp warp = Warp::off;
+    bool sync = true;
+    double periodBeats = 1.0;      // si sync
+    float rateHz = 1.0f;           // sinon
+    MainLfoShape shape = MainLfoShape::sine;
+    bool retrig = false;
+    std::array<Dest, 2> dest { Dest::off, Dest::off };
+    std::array<float, 2> amount {};
 };
 
 struct Settings
@@ -127,38 +152,70 @@ struct Settings
     /** Position (0..1) de chaque potard modulable. */
     std::array<float, numDests> base {};
 
-    std::array<OscSettings, numOscs> osc {};
+    // Oscillateurs
+    bool wtOn = true, pdOn = true, algoOn = true;
+    const Wavetable* table = nullptr;     // nullptr = table intégrée BASIC SHAPES
+    WtWarp wtWarp = WtWarp::off;
+    int wtOctave = 0, pdOctave = 0, algoOctave = 0;
+    int unison = 1;
+    float wtPhase = 0.0f;                 // 0..1
+    bool wtRandomPhase = false;
+    PdWave pdWave = PdWave::saw;
+    int algoModel = 8;                    // Plaits : 8 = VIRTUAL ANALOG
+    bool algoLpg = false;
+    SubWave subWave = SubWave::sine;
+    int subOctave = -1;
+    NoiseType noiseType = NoiseType::white;
 
-    bool mono = false;
-    float glideMs = 60.0f;
-    float velocity = 0.5f;       // sensibilité à la vélocité
+    // Matrice FM : [ligne = WT, PD, NOISE][colonne = vers WT, vers PD], 0..1
+    std::array<std::array<float, numFmCols>, numFmRows> fm {};
+    FmMode fmMode = FmMode::phase;
 
+    // Bite
+    bool bitePost = false, biteAsym = false;
+
+    // Filtre
+    FilterModel filterModel = FilterModel::ladder;
     FilterType filterType = FilterType::lowpass;
-    bool slope24 = true;
-    float keyTrack = 0.5f;
+    bool slope24 = false;
+    float keyTrack = 0.0f;
 
-    float ampA = 0.001f, ampD = 0.3f, ampS = 0.8f, ampR = 0.08f;
-    float modA = 0.001f, modD = 0.18f, modS = 0.0f, modR = 0.1f;
+    // Voix
+    VoiceMode voiceMode = VoiceMode::poly;
+    float glideMs = 0.0f;
+    float bendRange = 2.0f;
+    float velocity = 0.5f;
+    int oversampling = 2;                 // 1, 2 ou 4
 
-    DriveType driveType = DriveType::soft;
-    bool drivePost = false;
+    // Enveloppes (secondes, sustain 0..1)
+    float ampA = 0.005f, ampD = 0.3f, ampS = 0.7f, ampR = 0.25f;
+    float fltA = 0.005f, fltD = 0.4f, fltS = 0.3f, fltR = 0.3f;
+    float modA = 0.005f, modD = 0.1f, modS = 0.0f, modR = 0.2f;
 
+    // Modulation
+    MainLfoSettings mainLfo {};
     std::array<LfoSettings, numLfos> lfo {};
     std::array<ChaosSettings, numChaos> chaos {};
     SeqSettings seq {};
-
     std::array<int, numSlots> slotSource {};
     std::array<Dest, numSlots> slotDest {};
-    std::array<float, numSlots> slotAmount {};   // -1..1
+    std::array<float, numSlots> slotAmount {};
 
     Settings()
     {
         slotDest.fill (Dest::off);
         auto set = [this] (Dest d, float real) { base[(size_t) d] = DestRange::toNorm (d, real); };
-        set (Dest::aLevel, 0.8f);  set (Dest::aPos, 0.0f); set (Dest::aCoarse, 0.0f); set (Dest::aFine, 0.0f); set (Dest::aWarp, 0.0f);
-        set (Dest::bLevel, 0.0f);  set (Dest::bPos, 0.0f); set (Dest::bCoarse, 0.0f); set (Dest::bFine, 0.0f); set (Dest::bWarp, 0.0f);
-        set (Dest::noise, 0.0f);   set (Dest::pitch, 0.0f); set (Dest::pan, 0.0f);    set (Dest::volume, 1.0f);
-        set (Dest::cutoff, 20000.0f); set (Dest::resonance, 0.0f); set (Dest::drive, 0.0f);
+        set (Dest::wtPos, 0.0f);   set (Dest::wtWarp, 0.0f);  set (Dest::wtSemi, 0.0f); set (Dest::wtFine, 0.0f);
+        set (Dest::wtLevel, 0.8f); set (Dest::wtDetune, 0.2f); set (Dest::wtSpread, 0.6f); set (Dest::wtPan, 0.0f);
+        set (Dest::pdAmount, 0.5f); set (Dest::pdShape, 0.0f); set (Dest::pdCrush, 0.0f); set (Dest::pdFold, 0.0f);
+        set (Dest::pdLevel, 0.0f); set (Dest::pdSemi, 0.0f);  set (Dest::pdFine, 0.0f);
+        set (Dest::algoHarmonics, 0.5f); set (Dest::algoTimbre, 0.5f); set (Dest::algoMorph, 0.5f);
+        set (Dest::algoDecay, 0.5f); set (Dest::algoColour, 0.5f); set (Dest::algoAux, 0.0f);
+        set (Dest::algoLevel, 0.0f); set (Dest::algoSemi, 0.0f); set (Dest::algoFine, 0.0f); set (Dest::algoPan, 0.0f);
+        set (Dest::subLevel, 0.0f); set (Dest::noiseLevel, 0.0f); set (Dest::fmDepth, 0.0f);
+        set (Dest::biteFold, 0.0f); set (Dest::biteCrush, 0.0f); set (Dest::biteSoft, 0.0f);
+        set (Dest::cutoff, 20000.0f); set (Dest::resonance, 0.1f); set (Dest::filterDrive, 0.0f); set (Dest::filterEnv, 0.0f);
+        set (Dest::volume, 1.0f);
     }
 
     float real (Dest d) const     { return DestRange::toReal (d, base[(size_t) d]); }
@@ -499,19 +556,6 @@ struct RandomPattern
 };
 
 //==============================================================================
-namespace detail
-{
-    inline float fastTanh (float x)
-    {
-        x = std::clamp (x, -4.0f, 4.0f);
-        const float x2 = x * x;
-        return x * (27.0f + x2) / (27.0f + 9.0f * x2);
-    }
-
-    inline double noteToHz (double note)     { return 440.0 * std::exp2 ((note - 69.0) / 12.0); }
-}
-
-//==============================================================================
 /** Décimateur ÷2 : filtre demi-bande à phase linéaire (95 coefficients, fenêtre de Kaiser).
     Bande passante jusqu'à 0,44 fe, coupure au-delà de 0,56 fe (fe = fréquence de sortie). */
 class HalfbandDecimator
@@ -685,9 +729,220 @@ struct Svf
         {
             case FilterType::bandpass: return v1 * k;
             case FilterType::highpass: return x - k * v1 - v2;
+            case FilterType::notch:    return x - k * v1;
             case FilterType::lowpass:
+            case FilterType::count:
             default:                   return v2;
         }
+    }
+};
+
+//==============================================================================
+namespace detail
+{
+    inline float fastTanh (float x)
+    {
+        x = std::clamp (x, -4.0f, 4.0f);
+        const float x2 = x * x;
+        return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+    }
+
+    inline double noteToHz (double note)     { return 440.0 * std::exp2 ((note - 69.0) / 12.0); }
+
+    inline double polyBlep (double t, double dt)
+    {
+        if (dt <= 0.0) return 0.0;
+        if (t < dt)            { t /= dt; return t + t - t * t - 1.0; }
+        if (t > 1.0 - dt)      { t = (t - 1.0) / dt; return t * t + t + t + 1.0; }
+        return 0.0;
+    }
+
+    inline double frac (double x)            { return x - std::floor (x); }
+}
+
+//==============================================================================
+/** Oscillateur à distorsion de phase, façon Casio CZ. p = phase 0..1, amount = PD AMT, shape = courbure. */
+struct PhaseDistortion
+{
+    static double curve (double x, double shape)
+    {
+        // SHAPE : les segments de la fonction de phase se courbent (plus de dents, plus de « quack »)
+        return shape <= 0.0 ? x : std::pow (std::clamp (x, 0.0, 1.0), 1.0 + 3.0 * shape);
+    }
+
+    static double sawWarp (double p, double d, double shape)
+    {
+        const double m = 0.5 - 0.49 * d;
+        return p < m ? 0.5 * curve (p / m, shape) : 0.5 + 0.5 * curve ((p - m) / (1.0 - m), shape);
+    }
+
+    static float read (PdWave wave, double p, double d, double shape)
+    {
+        d = std::clamp (d, 0.0, 1.0);
+        const double w = 1.0 - 0.98 * d;
+        double phase = p;
+
+        switch (wave)
+        {
+            case PdWave::saw:       phase = sawWarp (p, d, shape); break;
+            case PdWave::square:
+            {
+                const double x = detail::frac (2.0 * p);
+                const double h = 0.5 * curve (std::min (x / w, 1.0), shape);
+                phase = p < 0.5 ? h : 0.5 + h;
+                break;
+            }
+            case PdWave::pulse:     phase = curve (std::min (p / w, 1.0), shape); break;
+            case PdWave::dblSine:   phase = p + d * (detail::frac (2.0 * p) - p); phase = curve (detail::frac (phase), shape); break;
+            case PdWave::sawPulse:
+                phase = p < 0.5 ? 0.5 * sawWarp (2.0 * p, d, shape) : 0.5 + 0.5 * curve (std::min ((2.0 * p - 1.0) / w, 1.0), shape);
+                break;
+            case PdWave::reso1: case PdWave::reso2: case PdWave::reso3:
+            {
+                const double r = 1.0 + 15.0 * d;
+                double window = 1.0 - p;
+                if (wave == PdWave::reso2) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;
+                if (wave == PdWave::reso3) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;
+                window = curve (window, shape);
+                return (float) (std::cos (twoPi * r * p) * window);
+            }
+            case PdWave::count:
+            default: break;
+        }
+        return (float) std::cos (twoPi * phase);
+    }
+};
+
+//==============================================================================
+/** Filtre ladder façon Moog (4 pôles TPT, saturation dans la boucle) avec sorties par mélange de pôles. */
+struct Ladder
+{
+    std::array<double, 4> s {};
+
+    void reset()   { s.fill (0.0); }
+
+    double process (double x, double g, double k, double drive, FilterType type, bool slope24)
+    {
+        const double G = g / (1.0 + g);
+        const double G2 = G * G, G3 = G2 * G, G4 = G3 * G;
+        const double sigma = (1.0 - G) * (G3 * s[0] + G2 * s[1] + G * s[2] + s[3]);
+        const double y4est = (G4 * x + sigma) / (1.0 + k * G4);
+
+        // Saturation de l'entrée (avec la contre-réaction)
+        const double gain = 1.0 + 4.0 * drive;
+        const double u = (double) detail::fastTanh ((float) ((x - k * y4est) * gain)) / gain * (1.0 + 0.3 * drive);
+
+        double in = u;
+        std::array<double, 4> y {};
+        for (int i = 0; i < 4; ++i)
+        {
+            const double v = (in - s[(size_t) i]) * G;
+            y[(size_t) i] = v + s[(size_t) i];
+            s[(size_t) i] = y[(size_t) i] + v;
+            in = y[(size_t) i];
+        }
+
+        const double comp = 1.0 + 0.3 * k;   // la résonance creuse le grave : on le rend en partie
+        switch (type)
+        {
+            case FilterType::highpass:  return slope24 ? u - 4.0 * y[0] + 6.0 * y[1] - 4.0 * y[2] + y[3] : u - 2.0 * y[0] + y[1];
+            case FilterType::bandpass:  return comp * (slope24 ? 4.0 * (y[1] - 2.0 * y[2] + y[3]) : 2.0 * (y[0] - y[1]));
+            case FilterType::notch:     return slope24 ? u - 4.0 * y[0] + 6.0 * y[1] - 4.0 * y[2] + 2.0 * y[3] : u - 2.0 * y[0] + 2.0 * y[1];
+            case FilterType::lowpass:
+            case FilterType::count:
+            default:                    return comp * (slope24 ? y[3] : y[1]);
+        }
+    }
+};
+
+/** Filtre complet d'un canal : LADDER ou SVF (2 étages en 24 dB). */
+struct VoiceFilter
+{
+    Ladder ladder;
+    std::array<Svf, 2> svf {};
+
+    void reset()   { ladder.reset(); for (auto& f : svf) f.reset(); }
+
+    double process (double x, double g, double resonance, double drive, FilterModel model, FilterType type, bool slope24)
+    {
+        if (model == FilterModel::ladder)
+            return ladder.process (x, g, 4.0 * resonance, drive, type, slope24);
+
+        // SVF : la saturation avant le filtre tient lieu de DRIVE
+        if (drive > 0.0)
+        {
+            const double gain = 1.0 + 4.0 * drive;
+            x = (double) detail::fastTanh ((float) (x * gain)) / gain * (1.0 + 0.3 * drive);
+        }
+        const double k = 2.0 - 1.98 * resonance;
+        auto stage = [&] (Svf& f, double in, double kk)
+        {
+            if (type == FilterType::notch)
+            {
+                // Notch = entrée - passe-bande normalisé
+                const double bp = f.process (in, g, kk, FilterType::bandpass);
+                return in - bp;
+            }
+            return f.process (in, g, kk, type);
+        };
+
+        double y = stage (svf[0], x, k);
+        if (slope24)
+            y = stage (svf[1], y, type == FilterType::bandpass ? std::max (k, 0.7) : std::max (k, 1.0));
+        return y;
+    }
+};
+
+//==============================================================================
+/** Bite! : fold, crush, soft (+ asymétrie), stéréo. */
+struct Bite
+{
+    std::array<float, 2> crushHold {};
+    std::array<double, 2> crushCounter {};
+    std::array<float, 2> dcIn {}, dcOut {};
+
+    void reset()   { crushHold.fill (0.0f); crushCounter.fill (0.0); dcIn.fill (0.0f); dcOut.fill (0.0f); }
+
+    float process (int ch, float x, float fold, float crush, float soft, bool asym, float dcCoef)
+    {
+        if (fold <= 0.0f && crush <= 0.0f && soft <= 0.0f)
+            return x;
+
+        if (asym)
+            x += 0.35f;
+
+        if (fold > 0.0f)
+        {
+            const float folded = std::sin (x * (1.0f + 7.0f * fold) * 1.5707963f);
+            x += (folded - x) * std::min (1.0f, fold * 5.0f);
+        }
+        if (soft > 0.0f)
+        {
+            const float g = 1.0f + 20.0f * soft;
+            x = detail::fastTanh (x * g) / detail::fastTanh (g);
+        }
+        if (crush > 0.0f)
+        {
+            const double factor = 1.0 + (double) crush * crush * 31.0;
+            crushCounter[(size_t) ch] += 1.0;
+            if (crushCounter[(size_t) ch] >= factor)
+            {
+                crushCounter[(size_t) ch] -= factor;
+                const float levels = std::exp2 (16.0f - 13.0f * crush);
+                crushHold[(size_t) ch] = std::round (x * levels) / levels;
+            }
+            x = crushHold[(size_t) ch];
+        }
+
+        if (asym)
+        {
+            // Retire le continu ajouté par l'asymétrie
+            const float y = x - dcIn[(size_t) ch] + dcCoef * dcOut[(size_t) ch];
+            dcIn[(size_t) ch] = x;
+            dcOut[(size_t) ch] = y;
+            x = y;
+        }
+        return x;
     }
 };
 
@@ -709,6 +964,30 @@ struct Smoothed
     }
 };
 
+/** Valeur du MAIN LFO pour une phase (cycles), -1..1. */
+inline float mainLfoValue (MainLfoShape shape, double cycles, uint64_t seed)
+{
+    const double p = detail::frac (cycles);
+    switch (shape)
+    {
+        case MainLfoShape::triangle:     return (float) (p < 0.25 ? 4.0 * p : p < 0.75 ? 2.0 - 4.0 * p : 4.0 * p - 4.0);
+        case MainLfoShape::saw:          return (float) (2.0 * p - 1.0);
+        case MainLfoShape::ramp:         return (float) (1.0 - 2.0 * p);
+        case MainLfoShape::square:       return p < 0.5 ? 1.0f : -1.0f;
+        case MainLfoShape::sampleHold:   return hashValue (seed, (int64_t) std::floor (cycles));
+        case MainLfoShape::smoothRandom:
+        {
+            const auto i = (int64_t) std::floor (cycles);
+            const float a = hashValue (seed, i), b = hashValue (seed, i + 1);
+            const float w = (float) (0.5 - 0.5 * std::cos (pi * p));
+            return a + (b - a) * w;
+        }
+        case MainLfoShape::sine:
+        case MainLfoShape::count:
+        default:                         return std::sin ((float) (twoPi * p));
+    }
+}
+
 //==============================================================================
 class Voice
 {
@@ -717,62 +996,65 @@ public:
     {
         sampleRate = sr;
         ampEnv.setSampleRate (sr);
+        fltEnv.setSampleRate (sr);
         modEnv.setSampleRate (sr);
-        slotCoef = (float) (1.0 - std::exp (-1.0 / (0.0004 * sr)));   // anti-clic de 0,4 ms
+        if (plaits == nullptr)
+            plaits = std::make_unique<PlaitsOsc>();
+        plaits->setSampleRate (sr);
+        slotCoef = (float) (1.0 - std::exp (-1.0 / (0.0004 * sr)));
+        dcCoef = (float) std::exp (-twoPi * 10.0 / sr);
         reset();
     }
 
     void reset()
     {
-        ampEnv.reset();
-        modEnv.reset();
+        ampEnv.reset(); fltEnv.reset(); modEnv.reset();
         note = -1;
         held = false;
-        phase.fill (0.0);
-        lastOut.fill (0.0f);
-        decimator.reset();
-        for (auto& f : filters) f.reset();
-        crushHold = 0.0f;
-        crushCounter = 0.0;
+        resetDsp();
         slotValue.fill (0.0f);
         offsets.fill (0.0f);
         seqBeats = 0.0;
+        seconds = 0.0;
         lastStep = -1;
+        if (plaits != nullptr) plaits->reset();
     }
 
     bool isActive() const noexcept           { return ampEnv.isActive(); }
     bool isReleasing() const noexcept        { return ampEnv.isReleasing(); }
 
-    void start (int midiNote, float vel, const Settings& s, bool retrigger, bool glide, uint64_t order, float panPosition,
-                uint64_t newChaosSeed)
+    void start (int midiNote, float vel, const Settings& s, bool retrigger, double fromNote, uint64_t order, uint64_t seed)
     {
         const bool wasActive = isActive();
         note = midiNote;
         targetNote = (double) midiNote;
-        if (! glide || ! wasActive)
-            currentNote = targetNote;
-
+        currentNote = fromNote;
         held = true;
         startOrder = order;
-        spread = panPosition;
 
         if (retrigger || ! wasActive)
         {
             velocity = std::clamp (vel, 0.0f, 1.0f);
             if (! wasActive)
+                resetDsp();
+
+            // Phases de départ des oscillateurs
+            Rng rng (seed ^ 0xA5A5A5A5ull);
+            for (int u = 0; u < maxUnison; ++u)
+                wtPhase[(size_t) u] = s.wtRandomPhase ? rng.uniform() : (double) s.wtPhase;
+            if (! wasActive)
             {
-                // Voix au repos : phases à zéro -> attaques identiques d'une note à l'autre
-                phase.fill (0.0);
-                lastOut.fill (0.0f);
-                decimator.reset();
-                for (auto& f : filters) f.reset();
+                pdPhase = 0.0;
+                subPhase = 0.0;
             }
-            ampEnv.noteOn (s.ampA, s.ampD, s.ampS);
-            modEnv.noteOn (s.modA, s.modD, s.modS);
-            ampEnv.setTimes (s.ampA, s.ampD, s.ampS, s.ampR);
-            modEnv.setTimes (s.modA, s.modD, s.modS, s.modR);
+
+            ampEnv.noteOn (s.ampA, s.ampD, s.ampS);  ampEnv.setTimes (s.ampA, s.ampD, s.ampS, s.ampR);
+            fltEnv.noteOn (s.fltA, s.fltD, s.fltS);  fltEnv.setTimes (s.fltA, s.fltD, s.fltS, s.fltR);
+            modEnv.noteOn (s.modA, s.modD, s.modS);  modEnv.setTimes (s.modA, s.modD, s.modS, s.modR);
+            plaits->noteOn();
             seqBeats = 0.0;
-            chaosSeed = newChaosSeed;
+            seconds = 0.0;
+            chaosSeed = seed;
             firstSample = true;
         }
     }
@@ -781,7 +1063,9 @@ public:
     {
         held = false;
         ampEnv.noteOff (s.ampR);
+        fltEnv.noteOff (s.fltR);
         modEnv.noteOff (s.modR);
+        plaits->noteOff();
     }
 
     void kill()                              { reset(); }
@@ -789,257 +1073,452 @@ public:
     void updateTimes (const Settings& s)
     {
         ampEnv.setTimes (s.ampA, s.ampD, s.ampS, s.ampR);
+        fltEnv.setTimes (s.fltA, s.fltD, s.fltS, s.fltR);
         modEnv.setTimes (s.modA, s.modD, s.modS, s.modR);
     }
 
     void setGlideTarget (int midiNote)       { note = midiNote; targetNote = (double) midiNote; }
 
-    /** neededSources : bit k = la source k sert dans un routage. */
-    void render (const Settings& s, const Smoothed& sm, float& outL, float& outR, double beatsInc, double bpm,
-                 double hostBeats, double glideCoef, float pitchBend, uint64_t& noiseState, uint64_t hostChaosSeed,
-                 uint32_t neededSources)
+    struct Shared
+    {
+        double beatsInc = 0.0, bpm = 120.0, hostBeats = 0.0, hostSeconds = 0.0;
+        double glideCoef = 1.0;
+        float pitchBend = 0.0f, modWheel = 0.0f;
+        uint64_t hostChaosSeed = 1;
+        uint32_t neededSources = 0;
+        bool stereo = true;
+    };
+
+    void render (const Settings& s, const Smoothed& sm, const Shared& sh, float& outL, float& outR, uint64_t& noiseState)
     {
         if (! isActive())
             return;
 
-        currentNote += (targetNote - currentNote) * glideCoef;
+        currentNote += (targetNote - currentNote) * sh.glideCoef;
 
         const float ampLevel = ampEnv.next();
+        const float fltLevel = fltEnv.next();
         const float modLevel = modEnv.next();
 
         // --- Modulation ---------------------------------------------------------
         offsets.fill (0.0f);
         {
             const bool host = s.seq.hostSync;
-            const double t = host ? hostBeats : seqBeats;
-            const uint64_t seed = host ? hostChaosSeed : chaosSeed;
+            const double t = host ? sh.hostBeats : seqBeats;
+            const uint64_t seed = host ? sh.hostChaosSeed : chaosSeed;
 
             std::array<float, numModSources> value {};
             {
-                // Le séquenceur tourne toujours (tête de lecture affichée même sans routage)
-                const auto out = Mod::seq (s, t, bpm, seed);
+                const auto out = Mod::seq (s, t, sh.bpm, seed);
                 value[srcSeq] = out.value;
                 lastStep = out.step;
             }
             for (int k = srcLfo1; k < srcEnv2; ++k)
-                if (neededSources & (1u << k))
+                if (sh.neededSources & (1u << k))
                     value[(size_t) k] = Mod::source (s, k, t, t, seed);
-            value[srcEnv2] = modLevel;
+            value[srcEnv2] = fltLevel;
+            value[srcEnv3] = modLevel;
             value[srcVelocity] = velocity;
-
-            for (int k = 0; k < numSlots; ++k)
+            value[srcModWheel] = sh.modWheel;
             {
-                const auto d = s.slotDest[(size_t) k];
+                const auto& ml = s.mainLfo;
+                const double localTime = ml.sync ? seqBeats : seconds;
+                const double globalTime = ml.sync ? sh.hostBeats : sh.hostSeconds;
+                const double time = ml.retrig ? localTime : globalTime;
+                const double cycles = ml.sync ? time / std::max (1.0e-4, ml.periodBeats) : time * (double) ml.rateHz;
+                value[srcMainLfo] = mainLfoValue (ml.shape, cycles, ml.retrig ? chaosSeed : sh.hostChaosSeed);
+            }
+
+            auto route = [&] (int k, int src, Dest d, float amount)
+            {
                 float& sv = slotValue[(size_t) k];
                 if (d == Dest::off)
                 {
                     sv = 0.0f;
-                    continue;
+                    return;
                 }
-
-                const int src = std::clamp (s.slotSource[(size_t) k], 0, numModSources - 1);
-                const float target = s.slotAmount[(size_t) k] * value[(size_t) src];
+                const float target = amount * value[(size_t) std::clamp (src, 0, numModSources - 1)];
                 sv = firstSample ? target : sv + (target - sv) * slotCoef;
                 offsets[(size_t) d] += sv;
-            }
+            };
+
+            for (int k = 0; k < numSlots; ++k)
+                route (k, s.slotSource[(size_t) k], s.slotDest[(size_t) k], s.slotAmount[(size_t) k]);
+            for (int k = 0; k < 2; ++k)
+                route (numSlots + k, srcMainLfo, s.mainLfo.dest[(size_t) k], s.mainLfo.amount[(size_t) k]);
         }
 
         firstSample = false;
-        seqBeats += beatsInc;
+        seqBeats += sh.beatsInc;
+        seconds += 1.0 / sampleRate;
 
         auto norm = [&] (Dest d) { return std::clamp (sm.base[(size_t) d] + offsets[(size_t) d], 0.0f, 1.0f); };
         auto real = [&] (Dest d) { return DestRange::toReal (d, norm (d)); };
 
-        // --- Oscillateurs (suréchantillonnés x2) -----------------------------------
-        const double osRate = 2.0 * sampleRate;
-        const double baseNote = currentNote + pitchBend + real (Dest::pitch);
+        // --- Réglages de l'échantillon ------------------------------------------------
+        const int os = s.oversampling >= 4 ? 4 : (s.oversampling >= 2 ? 2 : 1);
+        const double osRate = sampleRate * os;
+        const double baseNote = currentNote + sh.pitchBend;
 
-        struct OscFrame
+        // WAVETABLE
+        const Wavetable* table = s.table != nullptr ? s.table : BuiltinTables::get (0);
+        const int unison = std::clamp (s.unison, 1, maxUnison);
+        const float wtLevel = s.wtOn ? real (Dest::wtLevel) : 0.0f;
+        const double wtHz = detail::noteToHz (baseNote + 12.0 * s.wtOctave + real (Dest::wtSemi) + 0.01 * real (Dest::wtFine));
+        const float detune = norm (Dest::wtDetune);
+        const float spread = norm (Dest::wtSpread);
+        const float wtPan = real (Dest::wtPan);
+        const float wtWarp = norm (Dest::wtWarp);
+        const double framePos = (double) norm (Dest::wtPos) * (double) (table->numFrames - 1);
+
+        // PHASE DISTORTION
+        const float pdLevel = s.pdOn ? real (Dest::pdLevel) : 0.0f;
+        const double pdHz = std::min (detail::noteToHz (baseNote + 12.0 * s.pdOctave + real (Dest::pdSemi) + 0.01 * real (Dest::pdFine)), osRate * 0.45);
+        const double pdAmount = norm (Dest::pdAmount), pdShape = norm (Dest::pdShape);
+        const float pdCrush = norm (Dest::pdCrush), pdFold = norm (Dest::pdFold);
+
+        // SUB / NOISE
+        const float subLevel = norm (Dest::subLevel);
+        const double subHz = std::min (detail::noteToHz (baseNote + 12.0 * s.subOctave), osRate * 0.45);
+        const float noiseLevel = norm (Dest::noiseLevel);
+
+        // Matrice FM
+        const float depth = norm (Dest::fmDepth);
+        const bool linearFm = s.fmMode == FmMode::linear;
+        const float wtFromWt = depth * s.fm[0][0], wtFromPd = depth * s.fm[1][0], wtFromNoise = depth * s.fm[2][0];
+        const float pdFromWt = depth * s.fm[0][1], pdFromPd = depth * s.fm[1][1], pdFromNoise = depth * s.fm[2][1];
+        constexpr double pmDepth = 2.0;    // excursion de phase (cycles) à 100 %
+        constexpr double linDepth = 4.0;   // FM linéaire : écart de fréquence relatif à 100 %
+
+        // Niveau de mipmap : harmoniques jusqu'à 0,75 fe (le décimateur coupe au-dessus de 0,5 fe) ; sans
+        // suréchantillonnage, un niveau de plus pour rester sous Nyquist
+        double warpFactor = 1.0;
+        if (s.wtWarp == WtWarp::sync)                                 warpFactor = std::exp2 (4.0 * wtWarp);
+        else if (s.wtWarp == WtWarp::bendPlus || s.wtWarp == WtWarp::bendMinus) warpFactor = 1.0 + 3.0 * wtWarp;
+        else if (s.wtWarp == WtWarp::mirror)                          warpFactor = 1.0 + wtWarp;
+        double effective = wtHz * warpFactor;
+        if (linearFm)
+            effective *= 1.0 + linDepth * (wtFromWt + wtFromPd);
+        else
+            effective += twoPi * pmDepth * ((double) wtFromPd * pdHz + (double) wtFromWt * wtHz);
+        const double levelBias = os == 1 ? 1.0 : 0.0;
+        auto levelFor = [&] (double hz)
         {
-            const Wavetable* table;
-            double hz, inc, framePos, levelPos, syncRatio;
-            float warp, level;
-            Warp mode;
+            return std::clamp (std::log2 (std::max (1.0e-9, hz * 1024.0 / (0.75 * sampleRate))) + levelBias, 0.0, (double) (wt::numLevels - 1));
         };
-        std::array<OscFrame, numOscs> o {};
+        const double levelPos = levelFor (effective);
 
-        for (int i = 0; i < numOscs; ++i)
+        // Unison : désaccord et panoramique de chaque voix
+        if (unison != cachedUnison || std::abs (detune - cachedDetune) > 1.0e-5f || std::abs (spread - cachedSpread) > 1.0e-5f
+            || std::abs (wtPan - cachedWtPan) > 1.0e-5f)
         {
-            const auto& os = s.osc[(size_t) i];
-            const Dest coarse = i == 0 ? Dest::aCoarse : Dest::bCoarse;
-            const Dest fine = i == 0 ? Dest::aFine : Dest::bFine;
-            const Dest pos = i == 0 ? Dest::aPos : Dest::bPos;
-            const Dest warp = i == 0 ? Dest::aWarp : Dest::bWarp;
-            const Dest level = i == 0 ? Dest::aLevel : Dest::bLevel;
-
-            auto& f = o[(size_t) i];
-            f.table = os.table != nullptr ? os.table : BuiltinTables::get (0);
-            f.mode = os.warp;
-            f.warp = norm (warp);
-            f.level = real (level);
-
-            f.hz = std::min (detail::noteToHz (baseNote + 12.0 * os.octave + real (coarse) + real (fine) * 0.01), osRate * 0.45);
-            f.inc = f.hz / osRate;
-            f.syncRatio = f.mode == Warp::sync ? std::exp2 (4.0 * f.warp) : 1.0;
-            f.framePos = (double) norm (pos) * (double) (f.table->numFrames - 1);
-        }
-
-        for (int i = 0; i < numOscs; ++i)
-        {
-            // Niveau de la table : harmoniques jusqu'à ~0,75 fe (le décimateur coupe au-dessus de 0,5 fe).
-            // En FM, chaque harmonique h balaie jusqu'à h × (f + 2π·D·fm) : on prend moins d'harmoniques.
-            auto& f = o[(size_t) i];
-            double effective = f.hz * f.syncRatio;
-            if (f.mode == Warp::fm && f.warp > 0.0f)
+            cachedUnison = unison; cachedDetune = detune; cachedSpread = spread; cachedWtPan = wtPan;
+            const float norm1 = 1.0f / std::sqrt ((float) unison);
+            for (int u = 0; u < unison; ++u)
             {
-                const double fm = o[(size_t) (1 - i)].hz;
-                effective = f.hz + twoPi * fmDepth * (double) f.warp * fm + fm;
+                const double pos = unison > 1 ? (double) u / (unison - 1) * 2.0 - 1.0 : 0.0;
+                unisonRatio[(size_t) u] = std::exp2 (pos * 100.0 * (double) (detune * detune) / 1200.0);
+                const float pan = std::clamp ((float) pos * spread + wtPan, -1.0f, 1.0f);
+                const float angle = (float) (0.25 * pi) * (pan + 1.0f);
+                unisonL[(size_t) u] = std::cos (angle) * 1.41421356f * norm1;
+                unisonR[(size_t) u] = std::sin (angle) * 1.41421356f * norm1;
             }
-            f.levelPos = std::clamp (std::log2 (std::max (1.0e-9, effective * 1024.0 / (0.75 * sampleRate))), 0.0, (double) (wt::numLevels - 1));
         }
 
-        std::array<float, 2> sub {};
-        for (int n = 0; n < 2; ++n)
+        // ALGORITHMIC OSC (Plaits, à la fréquence de base, interpolé)
+        float algo = 0.0f;
+        const float algoLevel = s.algoOn ? real (Dest::algoLevel) : 0.0f;
+        if (s.algoOn)
         {
-            // B d'abord (il lit la dernière sortie de A), puis A (il lit la sortie de B qui vient d'être calculée)
-            float outs[numOscs] {};
-            for (int i = numOscs - 1; i >= 0; --i)
-            {
-                const auto& f = o[(size_t) i];
-                const float other = i == 0 ? outs[1] : lastOut[0];
-
-                double p = phase[(size_t) i];
-                if (f.mode == Warp::sync)
-                    p = p * f.syncRatio;
-                else if (f.mode == Warp::fm)
-                    p += fmDepth * f.warp * other;
-                p -= std::floor (p);
-
-                float v = f.table->read (f.framePos, f.levelPos, p);
-                if (f.mode == Warp::am)
-                    v *= 1.0f - f.warp * 0.5f * (1.0f - other);
-                else if (f.mode == Warp::rm)
-                    v *= (1.0f - f.warp) + f.warp * other;
-
-                outs[i] = v;
-                phase[(size_t) i] += f.inc;
-                phase[(size_t) i] -= std::floor (phase[(size_t) i]);
-            }
-
-            lastOut[0] = outs[0];
-            lastOut[1] = outs[1];
-            sub[(size_t) n] = outs[0] * o[0].level + outs[1] * o[1].level;
+            PlaitsOsc::Params p;
+            p.model = s.algoModel;
+            p.note = (float) (baseNote + 12.0 * s.algoOctave + real (Dest::algoSemi) + 0.01 * real (Dest::algoFine));
+            p.harmonics = norm (Dest::algoHarmonics);
+            p.timbre = norm (Dest::algoTimbre);
+            p.morph = norm (Dest::algoMorph);
+            p.decay = norm (Dest::algoDecay);
+            p.colour = norm (Dest::algoColour);
+            p.aux = norm (Dest::algoAux);
+            p.lpg = s.algoLpg;
+            algo = plaits->process (p);
         }
+        const float algoPan = std::clamp (real (Dest::algoPan), -1.0f, 1.0f);
+        const float algoAngle = (float) (0.25 * pi) * (algoPan + 1.0f);
+        const float algoL = algo * algoLevel * std::cos (algoAngle) * 1.41421356f;
+        const float algoR = algo * algoLevel * std::sin (algoAngle) * 1.41421356f;
 
-        double x = decimator.process (sub[0], sub[1]);
+        // Bite et filtre
+        const float biteFold = norm (Dest::biteFold), biteCrush = norm (Dest::biteCrush), biteSoft = norm (Dest::biteSoft);
+        const double tracked = (double) real (Dest::cutoff)
+                             * std::exp2 (s.keyTrack * (currentNote - 60.0) / 12.0 + 7.0 * (double) real (Dest::filterEnv) * fltLevel);
+        const double cutoff = std::clamp (tracked, 16.0, std::min (20000.0, osRate * 0.45));
+        const double g = std::tan (pi * cutoff / osRate);
+        const double resonance = norm (Dest::resonance);
+        const double drive = norm (Dest::filterDrive);
+        const bool stereo = sh.stereo;
 
-        // --- Bruit ------------------------------------------------------------------
-        const float noiseLevel = real (Dest::noise);
-        if (noiseLevel > 0.0f)
+        // --- Boucle suréchantillonnée -------------------------------------------------
+        std::array<float, 4> subL {}, subR {};
+        for (int n = 0; n < os; ++n)
         {
+            const float t = (float) (n + 1) / (float) os;
+            const float algoNowL = lastAlgoL + (algoL - lastAlgoL) * t;
+            const float algoNowR = lastAlgoR + (algoR - lastAlgoR) * t;
+
+            // Bruit (aussi modulateur de la matrice)
             noiseState ^= noiseState << 13;
             noiseState ^= noiseState >> 7;
             noiseState ^= noiseState << 17;
-            x += ((double) (noiseState >> 11) * (2.0 / 9007199254740992.0) - 1.0) * noiseLevel;
+            const float white = (float) ((double) (noiseState >> 11) * (2.0 / 9007199254740992.0) - 1.0);
+            float noise = white;
+            switch (s.noiseType)
+            {
+                case NoiseType::pink:
+                    // Filtre de Paul Kellet (version économique)
+                    pink[0] = 0.99765f * pink[0] + white * 0.0990460f;
+                    pink[1] = 0.96300f * pink[1] + white * 0.2965164f;
+                    pink[2] = 0.57000f * pink[2] + white * 1.0526913f;
+                    noise = 0.25f * (pink[0] + pink[1] + pink[2] + white * 0.1848f);
+                    break;
+                case NoiseType::brown:
+                    brown = (brown + 0.02f * white) * 0.998f;
+                    noise = 3.5f * brown;
+                    break;
+                case NoiseType::digital:
+                {
+                    // Bruit 1 bit cadencé sur la note (façon puce sonore)
+                    digitalPhase += 8.0 * subHz / osRate;
+                    if (digitalPhase >= 1.0)
+                    {
+                        digitalPhase -= std::floor (digitalPhase);
+                        lfsr = (uint16_t) ((lfsr >> 1) | (((lfsr ^ (lfsr >> 1)) & 1u) << 14));
+                    }
+                    noise = (lfsr & 1u) ? 0.7f : -0.7f;
+                    break;
+                }
+                case NoiseType::white:
+                case NoiseType::count:
+                default: break;
+            }
+
+            // PHASE DISTORTION
+            float pd = 0.0f;
+            {
+                const float mod = pdFromWt * lastWt + pdFromPd * lastPd + pdFromNoise * noise;
+                double p = pdPhase;
+                double inc = pdHz / osRate;
+                if (linearFm)
+                    inc *= 1.0 + linDepth * mod;
+                else
+                    p += pmDepth * mod;
+                p = detail::frac (p);
+                pd = PhaseDistortion::read (s.pdWave, p, pdAmount, pdShape);
+                if (pdFold > 0.0f)
+                {
+                    const float folded = std::sin (pd * (1.0f + 7.0f * pdFold) * 1.5707963f);
+                    pd += (folded - pd) * std::min (1.0f, pdFold * 5.0f);
+                }
+                if (pdCrush > 0.0f)
+                {
+                    const double factor = 1.0 + (double) pdCrush * pdCrush * 31.0;
+                    pdCrushCounter += 1.0;
+                    if (pdCrushCounter >= factor)
+                    {
+                        pdCrushCounter -= factor;
+                        const float levels = std::exp2 (16.0f - 13.0f * pdCrush);
+                        pdCrushHold = std::round (pd * levels) / levels;
+                    }
+                    pd = pdCrushHold;
+                }
+                pdPhase = detail::frac (pdPhase + inc);
+                lastPd = pd;
+            }
+
+            // WAVETABLE (unison)
+            float wtL = 0.0f, wtR = 0.0f, wtMono = 0.0f;
+            {
+                const float mod = wtFromWt * lastWt + wtFromPd * pd + wtFromNoise * noise;
+                const double baseInc = std::min (wtHz / osRate, 0.45);
+                for (int u = 0; u < unison; ++u)
+                {
+                    double& ph = wtPhase[(size_t) u];
+                    double inc = baseInc * unisonRatio[(size_t) u];
+                    double p = ph;
+                    if (linearFm)
+                        inc *= 1.0 + linDepth * mod;
+                    else
+                        p += pmDepth * mod;
+                    p = detail::frac (p);
+
+                    float v;
+                    switch (s.wtWarp)
+                    {
+                        case WtWarp::sync:
+                            v = table->read (framePos, levelPos, detail::frac (p * warpFactor));
+                            break;
+                        case WtWarp::bendPlus: case WtWarp::bendMinus:
+                        {
+                            const double e = s.wtWarp == WtWarp::bendPlus ? 1.0 + 3.0 * wtWarp : 1.0 / (1.0 + 3.0 * wtWarp);
+                            const double b = p < 0.5 ? 0.5 * std::pow (2.0 * p, e) : 1.0 - 0.5 * std::pow (2.0 * (1.0 - p), e);
+                            v = table->read (framePos, levelPos, std::min (b, 0.9999999));
+                            break;
+                        }
+                        case WtWarp::mirror:
+                        {
+                            const float a = table->read (framePos, levelPos, p);
+                            const double m = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;
+                            v = a + (table->read (framePos, levelPos, std::min (m, 0.9999999)) - a) * wtWarp;
+                            break;
+                        }
+                        case WtWarp::off:
+                        case WtWarp::count:
+                        default:
+                            v = table->read (framePos, levelPos, p);
+                            break;
+                    }
+
+                    wtL += v * unisonL[(size_t) u];
+                    wtR += v * unisonR[(size_t) u];
+                    wtMono += v;
+                    ph = detail::frac (ph + inc);
+                }
+                lastWt = wtMono / (float) unison;
+            }
+
+            // SUB
+            float sub = 0.0f;
+            if (subLevel > 0.0f)
+            {
+                const double dt = subHz / osRate;
+                switch (s.subWave)
+                {
+                    case SubWave::triangle: sub = (float) (subPhase < 0.5 ? 4.0 * subPhase - 1.0 : 3.0 - 4.0 * subPhase); break;
+                    case SubWave::square:
+                    {
+                        double sq = subPhase < 0.5 ? 1.0 : -1.0;
+                        sq += detail::polyBlep (subPhase, dt) - detail::polyBlep (detail::frac (subPhase + 0.5), dt);
+                        sub = (float) sq;
+                        break;
+                    }
+                    case SubWave::saw:      sub = (float) (2.0 * subPhase - 1.0 - detail::polyBlep (subPhase, dt)); break;
+                    case SubWave::sine:
+                    case SubWave::count:
+                    default:                sub = std::sin ((float) (twoPi * subPhase)); break;
+                }
+                subPhase = detail::frac (subPhase + dt);
+            }
+
+            // Mélange
+            const float centre = pd * pdLevel + sub * subLevel + noise * noiseLevel;
+            float l = 0.5f * (wtL * wtLevel + centre + algoNowL);
+            float r = 0.5f * (wtR * wtLevel + centre + algoNowR);
+
+            // Bite (avant le filtre)
+            if (! s.bitePost)
+            {
+                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+            }
+
+            l = (float) filters[0].process (l, g, resonance, drive, s.filterModel, s.filterType, s.slope24);
+            if (stereo)
+                r = (float) filters[1].process (r, g, resonance, drive, s.filterModel, s.filterType, s.slope24);
+
+            if (s.bitePost)
+            {
+                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+            }
+
+            subL[(size_t) n] = l;
+            subR[(size_t) n] = stereo ? r : l;
         }
+        lastAlgoL = algoL;
+        lastAlgoR = algoR;
 
-        x *= 0.5;
-
-        // --- Distorsion / filtre ------------------------------------------------------
-        const float driveAmount = real (Dest::drive);
-        if (! s.drivePost)
-            x = shape (x, s.driveType, driveAmount);
-
+        // --- Retour à la fréquence de base ---------------------------------------------
+        float yl = subL[0], yr = subR[0];
+        if (os == 2)
         {
-            const double tracked = (double) real (Dest::cutoff) * std::exp2 (s.keyTrack * (currentNote - 60.0) / 12.0);
-            const double cutoff = std::clamp (tracked, 16.0, sampleRate * 0.45);
-            const double g = std::tan (pi * cutoff / sampleRate);
-            const double k = 2.0 - 1.96 * (double) real (Dest::resonance);
-            x = filters[0].process (x, g, k, s.filterType);
-            if (s.slope24)
-                x = filters[1].process (x, g, s.filterType == FilterType::bandpass ? std::max (k, 0.7) : std::max (k, 1.0), s.filterType);
+            yl = decim[0].process (subL[0], subL[1]);
+            yr = stereo ? decim[1].process (subR[0], subR[1]) : yl;
+        }
+        else if (os == 4)
+        {
+            const float a = decim[0].process (subL[0], subL[1]), b = decim[0].process (subL[2], subL[3]);
+            yl = decim[2].process (a, b);
+            if (stereo)
+            {
+                const float c = decim[1].process (subR[0], subR[1]), d = decim[1].process (subR[2], subR[3]);
+                yr = decim[3].process (c, d);
+            }
+            else
+                yr = yl;
         }
 
-        if (s.drivePost)
-            x = shape (x, s.driveType, driveAmount);
-
-        // --- Volume + panoramique ------------------------------------------------------
         const float velGain = 1.0f - s.velocity * (1.0f - velocity);
         const float gain = ampLevel * velGain * real (Dest::volume);
-        const float p = std::clamp (spread + real (Dest::pan), -1.0f, 1.0f);
-        if (std::abs (p - cachedPan) > 1.0e-7f)
-        {
-            cachedPan = p;
-            const float angle = (float) (0.25 * pi) * (p + 1.0f);
-            panL = std::cos (angle) * 1.41421356f;
-            panR = std::sin (angle) * 1.41421356f;
-        }
-        const float y = (float) x * gain;
-        outL += y * panL;
-        outR += y * panR;
+        outL += yl * gain;
+        outR += yr * gain;
 
-        if (! std::isfinite (y))
+        if (! std::isfinite (yl) || ! std::isfinite (yr))
             reset();
     }
-
-    /** FM : excursion de phase maximale, en cycles, à WARP = 100 %. */
-    static constexpr double fmDepth = 3.0;
 
     int note = -1;
     bool held = false;
     uint64_t startOrder = 0;
     int lastStep = -1;
-    double seqBeats = 0.0;
-    std::array<float, numDests> offsets {};   // décalage de modulation de chaque potard (dernier échantillon)
+    double seqBeats = 0.0, seconds = 0.0;
+    double currentNote = 60.0;
+    std::array<float, numDests> offsets {};
 
 private:
-    double shape (double x, DriveType type, float amount)
-    {
-        if (amount <= 0.0f)
-            return x;
+    float dcCoefOs (int os) const            { return os == 1 ? dcCoef : (os == 2 ? std::sqrt (dcCoef) : std::sqrt (std::sqrt (dcCoef))); }
 
-        switch (type)
-        {
-            case DriveType::fold:
-            {
-                const double g = 1.0 + 7.0 * amount;
-                const double folded = std::sin (g * x * 1.5707963267948966);
-                const double mix = std::min (1.0, (double) amount * 5.0);
-                return x + (folded - x) * mix;
-            }
-            case DriveType::crush:
-            {
-                const double factor = 1.0 + (double) amount * amount * 31.0;
-                crushCounter += 1.0;
-                if (crushCounter >= factor)
-                {
-                    crushCounter -= factor;
-                    const double levels = std::exp2 (16.0 - 13.0 * amount);
-                    crushHold = (float) (std::round (x * levels) / levels);
-                }
-                return crushHold;
-            }
-            case DriveType::soft:
-            default:
-            {
-                const float g = 1.0f + 30.0f * amount;
-                return detail::fastTanh ((float) x * g) / detail::fastTanh (g) * (1.0f - 0.25f * amount);
-            }
-        }
+    void resetDsp()
+    {
+        wtPhase.fill (0.0);
+        pdPhase = subPhase = digitalPhase = 0.0;
+        lastWt = lastPd = 0.0f;
+        lastAlgoL = lastAlgoR = 0.0f;
+        pink.fill (0.0f);
+        brown = 0.0f;
+        lfsr = 0x7FFF;
+        pdCrushHold = 0.0f;
+        pdCrushCounter = 0.0;
+        for (auto& f : filters) f.reset();
+        for (auto& d : decim) d.reset();
+        bite.reset();
+        cachedUnison = -1;
     }
 
     double sampleRate = 48000.0;
-    Envelope ampEnv, modEnv;
-    double targetNote = 60.0, currentNote = 60.0;
-    float velocity = 1.0f, spread = 0.0f;
-    float cachedPan = 2.0f, panL = 1.0f, panR = 1.0f;
-    std::array<double, numOscs> phase {};
-    std::array<float, numOscs> lastOut {};
-    HalfbandDecimator decimator;
-    std::array<Svf, 2> filters {};
-    float crushHold = 0.0f;
-    double crushCounter = 0.0;
-    std::array<float, numSlots> slotValue {};
+    Envelope ampEnv, fltEnv, modEnv;
+    double targetNote = 60.0;
+    float velocity = 1.0f;
+
+    std::array<double, maxUnison> wtPhase {};
+    std::array<double, maxUnison> unisonRatio {};
+    std::array<float, maxUnison> unisonL {}, unisonR {};
+    int cachedUnison = -1;
+    float cachedDetune = -1.0f, cachedSpread = -1.0f, cachedWtPan = -2.0f;
+
+    double pdPhase = 0.0, subPhase = 0.0, digitalPhase = 0.0;
+    float lastWt = 0.0f, lastPd = 0.0f, lastAlgoL = 0.0f, lastAlgoR = 0.0f;
+    std::array<float, 3> pink {};
+    float brown = 0.0f;
+    uint16_t lfsr = 0x7FFF;
+    float pdCrushHold = 0.0f;
+    double pdCrushCounter = 0.0;
+
+    std::unique_ptr<PlaitsOsc> plaits;
+    std::array<VoiceFilter, 2> filters {};
+    std::array<HalfbandDecimator, 4> decim {};
+    Bite bite;
+    float dcCoef = 0.999f;
+
+    std::array<float, numSlots + 2> slotValue {};
     float slotCoef = 0.05f;
     uint64_t chaosSeed = 1;
     bool firstSample = true;
@@ -1056,7 +1535,7 @@ public:
             v.prepare (sampleRate);
         smoothed.snap (settings);
         heldNotes.clear();
-        freeBeats = 0.0;
+        freeBeats = freeSeconds = 0.0;
         dcCoef = (float) std::exp (-twoPi * 8.0 / sampleRate);
         dcInL = dcInR = dcOutL = dcOutR = 0.0f;
         prepared = true;
@@ -1067,13 +1546,13 @@ public:
         for (auto& v : voices)
             v.reset();
         heldNotes.clear();
-        pitchBend = 0.0f;
+        pitchWheel = 0.0f;
         dcInL = dcInR = dcOutL = dcOutR = 0.0f;
     }
 
     void setSettings (const Settings& s)
     {
-        const bool modeChanged = s.mono != settings.mono;
+        const bool modeChanged = (s.voiceMode == VoiceMode::poly) != (settings.voiceMode == VoiceMode::poly);
         settings = s;
         if (modeChanged)
             allNotesOff (true);
@@ -1082,6 +1561,8 @@ public:
     const Settings& getSettings() const noexcept     { return settings; }
 
     void setHostChaosSeed (uint64_t seed) noexcept    { hostChaosSeed = seed; }
+    void setPitchWheel (float v) noexcept             { pitchWheel = std::clamp (v, -1.0f, 1.0f); }
+    void setModWheel (float v) noexcept               { modWheel = std::clamp (v, 0.0f, 1.0f); }
 
     //==========================================================================
     void noteOn (int midiNote, float velocity)
@@ -1089,17 +1570,23 @@ public:
         midiNote = std::clamp (midiNote, 0, 127);
         ++orderCounter;
         const uint64_t seed = noteRng.next();
+        const bool glide = settings.glideMs > 0.0f && lastNote >= 0;
+        const double from = glide ? lastPlayedPitch() : (double) midiNote;
 
-        if (settings.mono)
+        if (settings.voiceMode != VoiceMode::poly)
         {
             heldNotes.remove (midiNote);
-            const bool legato = ! heldNotes.empty() && voices[0].isActive() && voices[0].held;
+            const bool overlapping = ! heldNotes.empty() && voices[0].isActive() && voices[0].held;
             heldNotes.push (midiNote);
 
             for (size_t i = 1; i < voices.size(); ++i)
                 if (voices[i].isActive()) voices[i].release (settings);
 
-            voices[0].start (midiNote, velocity, settings, ! legato, legato, orderCounter, 0.0f, seed);
+            // MONO : chaque note relance les enveloppes ; LEGATO : pas si une note est déjà tenue
+            const bool retrigger = settings.voiceMode == VoiceMode::mono || ! overlapping;
+            const double start = voices[0].isActive() && glide ? voices[0].currentNote : from;
+            voices[0].start (midiNote, velocity, settings, retrigger, start, orderCounter, seed);
+            lastNote = midiNote;
             return;
         }
 
@@ -1112,21 +1599,18 @@ public:
                 if (! v.isActive()) { chosen = &v; break; }
 
         if (chosen == nullptr)
-        {
             for (int pass = 0; pass < 2 && chosen == nullptr; ++pass)
                 for (auto& v : voices)
                     if ((pass == 1 || v.isReleasing()) && (chosen == nullptr || v.startOrder < chosen->startOrder))
                         chosen = &v;
-        }
 
-        static const float spreads[] = { 0.0f, -0.18f, 0.18f, -0.09f, 0.09f, -0.27f, 0.27f, 0.0f };
-        const auto index = (size_t) (chosen - voices.data());
-        chosen->start (midiNote, velocity, settings, true, false, orderCounter, spreads[index % 8], seed);
+        chosen->start (midiNote, velocity, settings, true, from, orderCounter, seed);
+        lastNote = midiNote;
     }
 
     void noteOff (int midiNote)
     {
-        if (settings.mono)
+        if (settings.voiceMode != VoiceMode::poly)
         {
             heldNotes.remove (midiNote);
             auto& v = voices[0];
@@ -1157,8 +1641,6 @@ public:
         }
     }
 
-    void setPitchBend (float semitones)               { pitchBend = semitones; }
-
     //==========================================================================
     struct Transport
     {
@@ -1172,18 +1654,33 @@ public:
         if (! prepared)
             prepare (sampleRate);
 
-        const double bpm = std::clamp (transport.bpm > 0.0 ? transport.bpm : 120.0, 20.0, 999.0);
-        const double beatsInc = bpm / 60.0 / sampleRate;
+        Voice::Shared sh;
+        sh.bpm = std::clamp (transport.bpm > 0.0 ? transport.bpm : 120.0, 20.0, 999.0);
+        sh.beatsInc = sh.bpm / 60.0 / sampleRate;
+        sh.pitchBend = pitchWheel * settings.bendRange;
+        sh.modWheel = modWheel;
+        sh.hostChaosSeed = hostChaosSeed;
+        sh.glideCoef = settings.glideMs > 0.0f ? 1.0 - std::exp (-1.0 / (settings.glideMs * 0.001 * 0.4 * sampleRate)) : 1.0;
+
         const float fast = (float) (1.0 - std::exp (-1.0 / (0.005 * sampleRate)));
         const float slow = (float) (1.0 - std::exp (-1.0 / (0.015 * sampleRate)));
-        const double glideCoef = settings.mono && settings.glideMs > 0.0f
-                                     ? 1.0 - std::exp (-1.0 / (settings.glideMs * 0.001 * 0.4 * sampleRate))
-                                     : 1.0;
 
-        uint32_t needed = 0;
+        sh.neededSources = 0;
         for (int k = 0; k < numSlots; ++k)
             if (settings.slotDest[(size_t) k] != Dest::off)
-                needed |= 1u << std::clamp (settings.slotSource[(size_t) k], 0, numModSources - 1);
+                sh.neededSources |= 1u << std::clamp (settings.slotSource[(size_t) k], 0, numModSources - 1);
+
+        // Stéréo seulement si quelque chose écarte les canaux (sinon un seul filtre par voix)
+        sh.stereo = (settings.wtOn && settings.unison > 1 && settings.base[(size_t) Dest::wtSpread] > 0.0f)
+                  || std::abs (settings.base[(size_t) Dest::wtPan] - 0.5f) > 1.0e-4f
+                  || (settings.algoOn && std::abs (settings.base[(size_t) Dest::algoPan] - 0.5f) > 1.0e-4f);
+        for (int k = 0; k < numSlots; ++k)
+        {
+            const auto d = settings.slotDest[(size_t) k];
+            sh.stereo = sh.stereo || d == Dest::wtPan || d == Dest::algoPan || d == Dest::wtSpread;
+        }
+        for (auto d : settings.mainLfo.dest)
+            sh.stereo = sh.stereo || d == Dest::wtPan || d == Dest::algoPan || d == Dest::wtSpread;
 
         for (auto& v : voices)
             if (v.isActive())
@@ -1192,13 +1689,12 @@ public:
         for (int i = 0; i < numSamples; ++i)
         {
             smoothed.step (settings, fast, slow);
+            sh.hostBeats = transport.playing ? std::max (0.0, transport.ppq + (double) (sampleOffset + i) * sh.beatsInc) : freeBeats;
+            sh.hostSeconds = sh.hostBeats * 60.0 / sh.bpm;
 
-            const double hostBeats = transport.playing ? std::max (0.0, transport.ppq + (double) (sampleOffset + i) * beatsInc)
-                                                       : freeBeats;
             float l = 0.0f, r = 0.0f;
-
             for (auto& v : voices)
-                v.render (settings, smoothed, l, r, beatsInc, bpm, hostBeats, glideCoef, pitchBend, noiseState, hostChaosSeed, needed);
+                v.render (settings, smoothed, sh, l, r, noiseState);
 
             const float outL = l - dcInL + dcCoef * dcOutL;
             const float outR = r - dcInR + dcCoef * dcOutR;
@@ -1208,8 +1704,8 @@ public:
 
             left[i] = dcOutL;
             right[i] = dcOutR;
-            freeBeats += beatsInc;
-            lastHostBeats = hostBeats;
+            freeBeats += sh.beatsInc;
+            lastHostBeats = sh.hostBeats;
         }
 
         updatePlayhead();
@@ -1217,7 +1713,6 @@ public:
 
     int getPlayheadStep() const noexcept                  { return playheadStep; }
     double getPlayheadBeats() const noexcept              { return playheadBeats; }
-    /** Décalage de modulation actuel d'un potard (voix la plus récente ; 0 si rien ne joue). */
     float getLiveOffset (Dest d) const noexcept           { return liveOffsets[(size_t) d]; }
 
     int activeVoiceCount() const
@@ -1228,6 +1723,15 @@ public:
     }
 
 private:
+    double lastPlayedPitch() const
+    {
+        const Voice* latest = nullptr;
+        for (auto& v : voices)
+            if (v.isActive() && (latest == nullptr || v.startOrder > latest->startOrder))
+                latest = &v;
+        return latest != nullptr ? latest->currentNote : (double) lastNote;
+    }
+
     void updatePlayhead()
     {
         const Voice* latest = nullptr;
@@ -1268,11 +1772,12 @@ private:
 
     NoteStack heldNotes;
     uint64_t orderCounter = 0;
+    int lastNote = -1;
     Rng noteRng { 0xC0FFEEull };
     uint64_t noiseState = 0x2545F4914F6CDD1Dull;
     uint64_t hostChaosSeed = 0x1234567ull;
-    float pitchBend = 0.0f;
-    double freeBeats = 0.0, lastHostBeats = 0.0;
+    float pitchWheel = 0.0f, modWheel = 0.0f;
+    double freeBeats = 0.0, freeSeconds = 0.0, lastHostBeats = 0.0;
     float dcCoef = 0.999f, dcInL = 0.0f, dcInR = 0.0f, dcOutL = 0.0f, dcOutR = 0.0f;
     int playheadStep = -1;
     double playheadBeats = -1.0;

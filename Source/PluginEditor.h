@@ -25,13 +25,19 @@ namespace ui
             return juce::Colour (colours[juce::jlimit (0, 8, s)]);
         }
 
-        /** Couleur d'une source de modulation : SEQ, LFO 1..6, CHAOS 1..2, ENV 2, VELO. */
+        /** Couleur d'une source de modulation. */
         static juce::Colour modSource (int s)
         {
-            if (s == seqs::srcSeq)       return juce::Colour (0xff00a9b8);
-            if (s == seqs::srcEnv2)      return juce::Colour (0xff8a6a3a);
-            if (s == seqs::srcVelocity)  return juce::Colour (0xffd0312d);
-            return source (s);
+            switch (s)
+            {
+                case seqs::srcSeq:      return juce::Colour (0xff00a9b8);
+                case seqs::srcEnv2:     return juce::Colour (0xff8a6a3a);
+                case seqs::srcEnv3:     return juce::Colour (0xff5d7a2a);
+                case seqs::srcVelocity: return juce::Colour (0xffd0312d);
+                case seqs::srcMainLfo:  return juce::Colour (0xff3a4bd0);
+                case seqs::srcModWheel: return juce::Colour (0xff9a3a7a);
+                default:                return source (s);
+            }
         }
     };
 
@@ -50,10 +56,10 @@ namespace ui
         void drawButtonBackground (juce::Graphics&, juce::Button&, const juce::Colour&, bool over, bool down) override;
         void drawButtonText (juce::Graphics&, juce::TextButton&, bool over, bool down) override;
         void drawComboBox (juce::Graphics&, int w, int h, bool down, int bx, int by, int bw, int bh, juce::ComboBox&) override;
-        juce::Font getComboBoxFont (juce::ComboBox&) override                 { return font (11.5f, true, 0.04f); }
+        juce::Font getComboBoxFont (juce::ComboBox&) override                 { return font (11.0f, true, 0.04f); }
         void positionComboBoxText (juce::ComboBox&, juce::Label&) override;
         juce::Font getPopupMenuFont() override                                 { return font (12.5f, true, 0.04f); }
-        juce::Font getTextButtonFont (juce::TextButton&, int) override        { return font (11.0f, true, 0.12f); }
+        juce::Font getTextButtonFont (juce::TextButton&, int) override        { return font (10.5f, true, 0.12f); }
     };
 
     //==========================================================================
@@ -68,7 +74,6 @@ namespace ui
         void mouseUp (const juce::MouseEvent&) override;
 
         static juce::String dragDescription (int source)   { return "modsrc:" + juce::String (source); }
-        /** Source d'une description de glisser-déposer, -1 si ce n'en est pas une. */
         static int sourceFromDescription (const juce::var& description);
 
         int getSource() const noexcept                      { return source; }
@@ -99,11 +104,8 @@ namespace ui
         void itemDropped (const SourceDetails&) override;
 
         seqs::Dest getDest() const noexcept                     { return dest; }
-        /** Pour les tests : le slot que le prochain réglage de profondeur modifie. */
         int getActiveSlot() const noexcept                      { return activeSlot; }
         void setActiveSlot (int s) noexcept                      { activeSlot = s; }
-
-        /** Le point (en coordonnées du potard) est-il sur l'anneau de modulation ? */
         bool isOnRing (juce::Point<float>) const;
 
     private:
@@ -132,8 +134,7 @@ namespace ui
         void mouseUp (const juce::MouseEvent&) override;
         void mouseDoubleClick (const juce::MouseEvent&) override;
 
-        static constexpr int rowHeight = 22;
-        /** Hauteur voulue (suivant le nombre de modulations). */
+        static constexpr int rowHeight = 24;
         int idealHeight() const;
         std::vector<int> rows() const;
 
@@ -149,12 +150,12 @@ namespace ui
     };
 
     //==========================================================================
-    /** Affichage d'une wavetable + choix de table (menu, ◀ ▶, glisser un fichier .wav depuis le Finder). */
+    /** Affichage de la wavetable + choix de table (menu, ◀ ▶, glisser un fichier .wav depuis le Finder). */
     class WavetableView final : public juce::Component,
                                 public juce::FileDragAndDropTarget
     {
     public:
-        WavetableView (SequencesAudioProcessor&, int osc);
+        explicit WavetableView (SequencesAudioProcessor&);
 
         void paint (juce::Graphics&) override;
         void resized() override;
@@ -164,17 +165,16 @@ namespace ui
         void fileDragExit (const juce::StringArray&) override               { fileHover = false; repaint(); }
         void filesDropped (const juce::StringArray& files, int, int) override;
 
-        /** Importe un fichier (affiche l'erreur s'il y en a une). */
         void load (const juce::File& file);
         void step (int delta);
+        void openChooser();
         juce::String getError() const                       { return error; }
 
     private:
         void showMenu();
-        void openChooser (const juce::File& folder);
+        void openChooserAt (const juce::File& folder);
 
         SequencesAudioProcessor& processor;
-        int osc;
         juce::TextButton prev, next, name;
         std::unique_ptr<juce::FileChooser> chooser;
         juce::String error;
@@ -226,7 +226,6 @@ namespace ui
         seqs::Settings settings;
     };
 
-    //==========================================================================
     class LfoPreview final : public juce::Component
     {
     public:
@@ -238,6 +237,87 @@ namespace ui
         int lfo;
         seqs::Settings settings;
     };
+
+    /** Forme d'onde de la PHASE DISTORTION (forme, PD AMT et SHAPE, modulation comprise). */
+    class PdView final : public juce::Component
+    {
+    public:
+        explicit PdView (SequencesAudioProcessor& p) : processor (p) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        seqs::Settings settings;
+    };
+
+    /** Courbe d'une enveloppe ADSR. */
+    class EnvView final : public juce::Component
+    {
+    public:
+        EnvView (SequencesAudioProcessor& p, juce::String prefix, juce::Colour c) : processor (p), id (std::move (prefix)), colour (c) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        juce::String id;
+        juce::Colour colour;
+    };
+
+    class MainLfoView final : public juce::Component
+    {
+    public:
+        explicit MainLfoView (SequencesAudioProcessor& p) : processor (p) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        seqs::Settings settings;
+    };
+
+    /** Case de la matrice FM : glisser vers le haut / bas règle la quantité, double-clic remet à zéro. */
+    class FmCell final : public juce::Component
+    {
+    public:
+        FmCell (SequencesAudioProcessor&, int row, int col);
+        void paint (juce::Graphics&) override;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseDrag (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
+        void mouseDoubleClick (const juce::MouseEvent&) override;
+
+        float getValue() const;     // 0..1
+
+    private:
+        void setValue (float v);
+        SequencesAudioProcessor& processor;
+        int row, col;
+        juce::RangedAudioParameter* param = nullptr;
+        float startValue = 0.0f;
+        bool dragged = false;
+    };
+
+    /** Oscilloscope + crête de sortie. */
+    class Scope final : public juce::Component
+    {
+    public:
+        explicit Scope (SequencesAudioProcessor& p) : processor (p) {}
+        void paint (juce::Graphics&) override;
+
+    private:
+        SequencesAudioProcessor& processor;
+        std::array<float, SequencesAudioProcessor::scopeSize> data {};
+    };
+
+    /** Une page (onglet) : ses panneaux et légendes sont dessinés derrière ses potards. */
+    class Page final : public juce::Component
+    {
+    public:
+        void paint (juce::Graphics&) override;
+
+        struct Panel { juce::String title; juce::Rectangle<int> bounds; juce::String note; };
+        std::vector<Panel> panels;
+        std::vector<std::pair<juce::String, juce::Rectangle<int>>> captions, leftCaptions, notes;
+    };
 }
 
 //==============================================================================
@@ -247,6 +327,7 @@ class SequencesFacade final : public juce::Component,
 {
 public:
     static constexpr int width = 1320, height = 900;
+    enum Tab { tabMain = 0, tabSeq, tabMatrix, tabArp, tabFx, numTabs };
 
     explicit SequencesFacade (SequencesAudioProcessor&);
     ~SequencesFacade() override;
@@ -256,14 +337,21 @@ public:
 
     phragma::PresetBar& getPresetBar() noexcept       { return presetBar; }
 
+    void showTab (int tab);
+    int getTab() const noexcept                       { return currentTab; }
+
     /** Pour les tests. */
     juce::TextButton& getRandomButton()               { return randomButton; }
     juce::TextButton& getRandomAllButton()            { return randomAllButton; }
+    juce::TextButton& getTabButton (int t)            { return tabButtons[(size_t) t]; }
+    ui::Page& getPage (int t)                         { return pages[(size_t) t]; }
     ui::StepMatrix& getMatrix()                       { return *matrix; }
     ui::ModKnob* getModKnob (seqs::Dest);
     ui::SourceChip* getChip (int source);
     ui::ModList& getModList()                         { return *modList; }
-    ui::WavetableView& getTableView (int osc)         { return *tableViews[(size_t) osc]; }
+    ui::WavetableView& getTableView()                 { return *tableView; }
+    ui::FmCell* getFmCell (int row, int col);
+    juce::Component* findById (const juce::String& id);
 
 private:
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
@@ -288,49 +376,57 @@ private:
         std::unique_ptr<ButtonAttachment> attachment;
     };
 
-    struct Panel
-    {
-        juce::String title;
-        juce::Rectangle<int> bounds;
-    };
-
     void timerCallback() override;
 
-    juce::Slider& addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar = false, bool small = false);
-    void addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell);
-    juce::ComboBox& addInlineChoice (const juce::String& id, juce::Rectangle<int> area);
-    void addLabelledChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth);
-    void addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar);
-    void addToggle (const juce::String& id, const juce::String& text, juce::Rectangle<int> area);
-    void addButton (juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area);
+    // Construction : chaque élément va sur une page
+    juce::Slider& addKnob (ui::Page&, const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar = false, bool small = false);
+    juce::ComboBox& addInlineChoice (ui::Page&, const juce::String& id, juce::Rectangle<int> area);
+    void addLabelledChoice (ui::Page&, const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth);
+    void addCaptionedChoice (ui::Page&, const juce::String& id, const juce::String& label, juce::Rectangle<int> area);
+    void addBar (ui::Page&, const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar);
+    juce::TextButton& addToggle (ui::Page&, const juce::String& id, const juce::String& text, juce::Rectangle<int> area);
+    void addButton (juce::Component& parent, juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area);
     ui::SourceChip& addChip (int source, const juce::String& text, juce::Rectangle<int> area);
+    /** Une rangée de potards répartis sur la largeur. */
+    struct K { juce::String id, label; bool bipolar = false; };
+    void knobRow (ui::Page&, juce::Rectangle<int> area, std::initializer_list<K> knobs, bool small = false);
+    juce::Rectangle<int> panel (ui::Page&, const juce::String& title, juce::Rectangle<int> bounds, const juce::String& note = {});
 
-    void buildOsc (int osc, juce::Rectangle<int> area);
-    void buildBank (juce::Rectangle<int> area);
-    void buildSequencer (juce::Rectangle<int> area);
+    void buildMain();
+    void buildSeq();
+    void buildMatrix();
+    void buildArp();
+    void buildFx();
 
     SequencesAudioProcessor& audioProcessor;
     ui::LookAndFeel lookAndFeel;
     phragma::PresetBar presetBar;
+
+    std::array<ui::Page, numTabs> pages;
+    std::array<juce::TextButton, numTabs> tabButtons;
+    int currentTab = tabMain;
 
     std::vector<std::unique_ptr<Knob>> knobs;
     std::vector<std::unique_ptr<Choice>> choices;
     std::vector<std::unique_ptr<Toggle>> toggles;
     std::vector<std::unique_ptr<ui::SourceChip>> chips;
     std::vector<ui::ModKnob*> modKnobs;
-    std::vector<Panel> panels;
-    std::vector<std::pair<juce::String, juce::Rectangle<int>>> captions, leftCaptions;
+    std::vector<std::unique_ptr<juce::Component>> owned;     // vues diverses (formes, enveloppes...)
+    std::vector<ui::FmCell*> fmCells;
 
-    std::array<std::unique_ptr<ui::WavetableView>, seqs::numOscs> tableViews;
+    std::unique_ptr<ui::WavetableView> tableView;
     std::unique_ptr<ui::StepMatrix> matrix;
     std::unique_ptr<ui::CircuitView> circuit;
-    std::unique_ptr<ui::ModList> modList;
-    juce::Viewport modViewport;
-    std::vector<std::unique_ptr<ui::LfoPreview>> previews;
-    juce::TextButton leftButton, rightButton, clearButton, randomButton, randomAllButton;
-    juce::Rectangle<int> seqPanel, bankPanel, modListArea;
+    std::unique_ptr<ui::ModList> modList, seqModList;
+    juce::Viewport modViewport, seqModViewport;
+    std::unique_ptr<ui::Scope> scope;
+    std::vector<ui::LfoPreview*> previews;
+    juce::TextButton loadButton, leftButton, rightButton, clearButton, randomButton, randomAllButton, addModButton;
+    juce::Slider* mlHzKnob = nullptr;
+    juce::ComboBox* mlRateBox = nullptr;
+    juce::Rectangle<int> modListArea, seqModListArea, headerInfo;
 
-    int shownStep = -2, tick = 0, shownRows = -1;
+    int shownStep = -2, tick = 0, shownRows = -1, shownVoices = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SequencesFacade)
 };

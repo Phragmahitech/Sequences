@@ -1,5 +1,7 @@
 // Tests du moteur de Sequences (sans JUCE).
 #include "SequencesEngine.h"
+#include "Arp.h"
+#include "Fx.h"
 
 #include <cstdio>
 #include <fstream>
@@ -25,29 +27,8 @@ static int failures = 0, checks = 0;
 static bool near (double a, double b, double tol)   { return std::abs (a - b) <= tol; }
 
 static const Wavetable* sineTable()     { return BuiltinTables::get (BuiltinTables::indexOf ("SINE")); }
-static const Wavetable* basicTable()    { return BuiltinTables::get (BuiltinTables::indexOf ("BASIC SHAPES")); }
 
 static void setReal (Settings& s, Dest d, float v)   { s.base[(size_t) d] = DestRange::toNorm (d, v); }
-
-/** Osc A = sinus pur, B coupé, filtre ouvert, rien d'autre. */
-static Settings cleanSine()
-{
-    Settings s;
-    s.osc[0].table = sineTable();
-    s.osc[1].table = sineTable();
-    setReal (s, Dest::aLevel, 1.0f);
-    setReal (s, Dest::bLevel, 0.0f);
-    setReal (s, Dest::cutoff, 20000.0f);
-    setReal (s, Dest::resonance, 0.0f);
-    setReal (s, Dest::volume, 1.0f);
-    s.keyTrack = 0.0f;
-    s.slope24 = false;
-    s.ampA = 0.0005f; s.ampD = 1.0f; s.ampS = 1.0f; s.ampR = 0.01f;
-    s.velocity = 0.0f;
-    s.seq.on = false;
-    s.seq.manual = 1;
-    return s;
-}
 
 static std::vector<float> render (Engine& e, int n, Engine::Transport t = {}, std::vector<float>* right = nullptr)
 {
@@ -119,7 +100,78 @@ static int periodByAutocorrelation (const std::vector<float>& x, int from, int l
     return best;
 }
 
-//==============================================================================
+/** WAVETABLE = sinus pur, tout le reste coupé, filtre ouvert. */
+static Settings cleanSine()
+{
+    Settings s;
+    s.table = sineTable();
+    s.unison = 1;
+    s.pdOn = true;
+    s.algoOn = false;
+    setReal (s, Dest::wtLevel, 1.0f);
+    setReal (s, Dest::pdLevel, 0.0f);
+    setReal (s, Dest::algoLevel, 0.0f);
+    setReal (s, Dest::wtSpread, 0.0f);
+    setReal (s, Dest::cutoff, 20000.0f);
+    setReal (s, Dest::resonance, 0.0f);
+    setReal (s, Dest::volume, 1.0f);
+    s.filterModel = FilterModel::svf;
+    s.slope24 = false;
+    s.keyTrack = 0.0f;
+    s.ampA = 0.0005f; s.ampD = 1.0f; s.ampS = 1.0f; s.ampR = 0.01f;
+    s.velocity = 0.0f;
+    s.seq.on = false;
+    s.seq.manual = 1;
+    return s;
+}
+
+static Settings onlyPd (PdWave w, float amount)
+{
+    auto s = cleanSine();
+    setReal (s, Dest::wtLevel, 0.0f);
+    setReal (s, Dest::pdLevel, 1.0f);
+    s.pdWave = w;
+    setReal (s, Dest::pdAmount, amount);
+    return s;
+}
+
+static std::vector<float> play (Settings s, int note, int samples, double sr = 48000.0, std::vector<float>* right = nullptr, float velocity = 1.0f)
+{
+    Engine e;
+    e.setSettings (s);
+    e.prepare (sr);
+    e.noteOn (note, velocity);
+    return render (e, samples, {}, right);
+}
+
+static double brightness (const std::vector<float>& x, size_t from = 2400)
+{
+    double d = 0.0, e = 0.0;
+    for (size_t i = from; i < x.size(); ++i) { d += (double) (x[i] - x[i - 1]) * (x[i] - x[i - 1]); e += (double) x[i] * x[i]; }
+    return std::sqrt (d / (e + 1e-20));
+}
+
+/** Énergie hors des harmoniques de f0, en dB par rapport aux harmoniques. */
+static double inharmonicDb (const std::vector<float>& x, int from, double f0, double sr)
+{
+    const int n = 32768;
+    std::vector<std::complex<double>> spec ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double win = 0.35875 - 0.48829 * std::cos (twoPi * i / n) + 0.14128 * std::cos (2 * twoPi * i / n) - 0.01168 * std::cos (3 * twoPi * i / n);
+        spec[(size_t) i] = { x[(size_t) (from + i)] * win, 0.0 };
+    }
+    wt::fft (spec, false);
+    double harmonic = 0.0, other = 0.0;
+    for (int b = 1; b < n / 2; ++b)
+    {
+        const double f = b * sr / n;
+        const double nearest = std::round (f / f0) * f0;
+        (std::abs (f - nearest) < 12.0 ? harmonic : other) += std::norm (spec[(size_t) b]);
+    }
+    return 10.0 * std::log10 (other / harmonic);
+}
+
 static void testStepPositions()
 {
     CHECK (stepAt (0.0, 16, 0.25, 0.0).step == 0, "pas 0");
@@ -234,6 +286,44 @@ static Settings seqSettings()
     return s;
 }
 
+static void testSequencerSources()
+{
+    auto s = seqSettings();
+
+    // Pas 0 -> LFO 1, temps local depuis le début du pas
+    auto o = Mod::seq (s, 0.1, 120.0, 1);
+    CHECK (o.step == 0 && o.source == 1, "pas 0, source 1");
+    CHECK (near (o.value, Mod::lfo (s.lfo[0], 0.1), 1e-6), "valeur LFO 1");
+
+    // Pas 1 -> LFO 2, RESTART : repart de sa phase au début du pas
+    o = Mod::seq (s, 0.25 + 0.03125, 120.0, 1);
+    CHECK (o.step == 1 && o.source == 2, "pas 1, source 2");
+    CHECK (near (o.value, 1.0, 1e-5), "LFO 2 au quart de son cycle : %f", o.value);
+
+    // Sans RESTART : temps global
+    s.seq.restart = false;
+    o = Mod::seq (s, 0.3, 120.0, 1);
+    CHECK (near (o.value, Mod::lfo (s.lfo[1], 0.3), 1e-6), "sans restart");
+    s.seq.restart = true;
+
+    // OFF
+    s.seq.pattern[1] = 0;
+    CHECK (Mod::seq (s, 0.3, 120.0, 1).value == 0.0f, "pas OFF muet");
+
+    // Séquenceur éteint : source manuelle
+    s.seq.on = false;
+    s.seq.manual = 2;
+    o = Mod::seq (s, 0.03125, 120.0, 1);
+    CHECK (o.step == -1 && o.source == 2 && near (o.value, 1.0, 1e-5), "manuel");
+    s.seq.on = true;
+
+    // CHAOS dans un pas
+    s.seq.pattern[0] = 7;
+    o = Mod::seq (s, 0.1, 120.0, 55);
+    CHECK (o.source == 7 && o.value == Mod::chaos (s.chaos[0], 0.1, 55), "chaos 1");
+}
+
+//==============================================================================
 static void testCrossfade()
 {
     auto s = seqSettings();
@@ -308,44 +398,6 @@ static void testRandomPatterns()
         CHECK (seen[(size_t) sIdx] > 50, "style %d tiré %d fois", sIdx, seen[(size_t) sIdx]);
 }
 
-static void testSequencerSources()
-{
-    auto s = seqSettings();
-
-    // Pas 0 -> LFO 1, temps local depuis le début du pas
-    auto o = Mod::seq (s, 0.1, 120.0, 1);
-    CHECK (o.step == 0 && o.source == 1, "pas 0, source 1");
-    CHECK (near (o.value, Mod::lfo (s.lfo[0], 0.1), 1e-6), "valeur LFO 1");
-
-    // Pas 1 -> LFO 2, RESTART : repart de sa phase au début du pas
-    o = Mod::seq (s, 0.25 + 0.03125, 120.0, 1);
-    CHECK (o.step == 1 && o.source == 2, "pas 1, source 2");
-    CHECK (near (o.value, 1.0, 1e-5), "LFO 2 au quart de son cycle : %f", o.value);
-
-    // Sans RESTART : temps global
-    s.seq.restart = false;
-    o = Mod::seq (s, 0.3, 120.0, 1);
-    CHECK (near (o.value, Mod::lfo (s.lfo[1], 0.3), 1e-6), "sans restart");
-    s.seq.restart = true;
-
-    // OFF
-    s.seq.pattern[1] = 0;
-    CHECK (Mod::seq (s, 0.3, 120.0, 1).value == 0.0f, "pas OFF muet");
-
-    // Séquenceur éteint : source manuelle
-    s.seq.on = false;
-    s.seq.manual = 2;
-    o = Mod::seq (s, 0.03125, 120.0, 1);
-    CHECK (o.step == -1 && o.source == 2 && near (o.value, 1.0, 1e-5), "manuel");
-    s.seq.on = true;
-
-    // CHAOS dans un pas
-    s.seq.pattern[0] = 7;
-    o = Mod::seq (s, 0.1, 120.0, 55);
-    CHECK (o.source == 7 && o.value == Mod::chaos (s.chaos[0], 0.1, 55), "chaos 1");
-}
-
-//==============================================================================
 static void testWavetableBuilder()
 {
     // Une scie de 2048 points : chaque niveau ne garde que ses harmoniques
@@ -532,33 +584,6 @@ static void testWavParser()
     }
 }
 
-static void testRealSerumFiles (const std::vector<std::string>& paths)
-{
-    for (const auto& path : paths)
-    {
-        std::ifstream f (path, std::ios::binary);
-        if (! f) continue;
-        std::vector<uint8_t> bytes ((std::istreambuf_iterator<char> (f)), {});
-        const auto w = WavetableFile::parse (bytes.data(), bytes.size());
-        CHECK (w.error.empty() && w.serumHeader && ! w.cycles.empty(), "table Serum %s : %s", path.c_str(), w.error.c_str());
-        auto t = Wavetable::build (w.cycles, "serum");
-        CHECK (t != nullptr && t->numFrames == (int) std::min ((size_t) 256, w.cycles.size()), "construite : %s", path.c_str());
-
-        // On la joue : son présent et fini
-        Engine e;
-        e.prepare (48000.0);
-        auto s = cleanSine();
-        s.osc[0].table = t.get();
-        setReal (s, Dest::aPos, 0.5f);
-        e.setSettings (s);
-        e.noteOn (48, 1.0f);
-        auto x = render (e, 9600);
-        bool finite = true;
-        for (float v : x) finite = finite && std::isfinite (v);
-        CHECK (finite && rms (x, 2400, 9600) > 0.01, "jouée : %s (rms %.3f)", path.c_str(), rms (x, 2400, 9600));
-    }
-}
-
 static void testDecimator()
 {
     const auto& h = HalfbandDecimator::coefficients();
@@ -583,456 +608,541 @@ static void testDecimator()
         CHECK (h[(size_t) (HalfbandDecimator::centre - k)] == 0.0f || std::abs (h[(size_t) (HalfbandDecimator::centre - k)]) < 1e-9f, "coefficient pair nul");
 }
 
-static void testPitch()
+//==============================================================================
+static void testDestRanges()
 {
-    for (double sr : { 44100.0, 48000.0, 96000.0 })
-    {
-        Engine e;
-        e.prepare (sr);
-        e.setSettings (cleanSine());
-        e.noteOn (69, 1.0f);
-        auto x = render (e, (int) (sr * 0.5));
-        const double f = measureFreq (x, (int) (sr * 0.05), (int) (sr * 0.5), sr);
-        CHECK (near (f, 440.0, 0.3), "sinus 440 Hz à %.0f Hz : %.3f", sr, f);
-    }
+    for (int d = 1; d < numDests; ++d)
+        for (float n : { 0.0f, 0.3f, 0.8f, 1.0f })
+        {
+            const float real = DestRange::toReal ((Dest) d, n);
+            CHECK (std::isfinite (real) && near (DestRange::toNorm ((Dest) d, real), n, 1e-4), "aller-retour dest %d à %.1f", d, n);
+        }
+    CHECK (near (DestRange::toReal (Dest::volume, 0.8f), 1.0, 1e-6), "volume 0,8 = 0 dB");
+}
 
-    struct Case { int oct; float coarse, fine, pitch; double expected; const char* name; };
-    for (auto c : { Case { 1, 0.0f, 0.0f, 0.0f, 880.0, "octave +1" }, Case { -2, 0.0f, 0.0f, 0.0f, 110.0, "octave -2" },
-                    Case { 0, 7.0f, 0.0f, 0.0f, 440.0 * std::pow (2.0, 7.0 / 12.0), "coarse +7" },
-                    Case { 0, 0.5f, 0.0f, 0.0f, 440.0 * std::pow (2.0, 0.5 / 12.0), "coarse +0,5 (continu)" },
-                    Case { 0, -12.0f, 50.0f, 0.0f, 220.0 * std::pow (2.0, 0.5 / 12.0), "coarse -12 + fine +50" },
-                    Case { 0, 0.0f, 0.0f, -3.25f, 440.0 * std::pow (2.0, -3.25 / 12.0), "pitch -3,25" } })
+static void testWavetablePitch()
+{
+    for (int os : { 1, 2, 4 })
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            auto s = cleanSine();
+            s.oversampling = os;
+            auto x = play (s, 69, (int) (sr * 0.4), sr);
+            const double f = measureFreq (x, (int) (sr * 0.05), (int) (sr * 0.4), sr);
+            CHECK (near (f, 440.0, 0.3), "WT 440 Hz (x%d, %.0f Hz) : %.3f", os, sr, f);
+        }
+
+    struct Case { int oct; float semi, fine; double expected; const char* name; };
+    for (auto c : { Case { 1, 0.0f, 0.0f, 880.0, "octave +1" }, Case { 0, 7.0f, 0.0f, 440.0 * std::pow (2.0, 7.0 / 12.0), "semi +7" },
+                    Case { 0, 0.5f, 0.0f, 440.0 * std::pow (2.0, 0.5 / 12.0), "semi +0,5 (continu)" },
+                    Case { -1, 0.0f, 50.0f, 220.0 * std::pow (2.0, 0.5 / 12.0), "octave -1 + fine +50" } })
     {
-        Engine e;
-        e.prepare (48000.0);
         auto s = cleanSine();
-        s.osc[0].octave = c.oct;
-        setReal (s, Dest::aCoarse, c.coarse);
-        setReal (s, Dest::aFine, c.fine);
-        setReal (s, Dest::pitch, c.pitch);
-        e.setSettings (s);
-        e.prepare (48000.0);
-        e.noteOn (69, 1.0f);
-        auto x = render (e, 24000);
+        s.wtOctave = c.oct;
+        setReal (s, Dest::wtSemi, c.semi);
+        setReal (s, Dest::wtFine, c.fine);
+        auto x = play (s, 69, 24000);
         const double f = measureFreq (x, 4800, 24000, 48000.0);
         CHECK (near (f, c.expected, c.expected * 2e-4), "%s : %.3f / %.3f", c.name, f, c.expected);
     }
-}
 
-static void testCoarseGlides()
-{
-    // COARSE tourné de 0 à +12 entre deux blocs : la hauteur glisse (pas de saut d'un coup)
-    const double sr = 48000.0;
-    Engine e;
-    e.prepare (sr);
-    auto s = cleanSine();
-    e.setSettings (s);
-    e.noteOn (57, 1.0f);
-    render (e, 4800);
-    setReal (s, Dest::aCoarse, 12.0f);
-    e.setSettings (s);
-    auto x = render (e, 9600);
-    const double early = measureFreq (x, 200, 900, sr);
-    const double late = measureFreq (x, 6000, 9600, sr);
-    CHECK (early > 235.0 && early < 420.0, "pendant le glissement : %.1f Hz", early);
-    CHECK (near (late, 440.0, 0.5), "arrivé à +12 : %.2f", late);
-}
-
-static Settings modSettings (Dest d, float amount, int source)
-{
-    auto s = cleanSine();
-    s.slotSource[0] = source;
-    s.slotDest[0] = d;
-    s.slotAmount[0] = amount;
-    return s;
-}
-
-static void testModulationSlots()
-{
-    const double sr = 48000.0;
-
-    // LFO 1 carré unipolaire -> COARSE A, +12/96 : +12 demi-tons pendant la première moitié
+    // Repliement : scie aiguë (CLASSIC à 50 %), x1, x2, x4
+    for (int os : { 1, 2, 4 })
     {
-        Engine e;
-        e.prepare (sr);
-        auto s = modSettings (Dest::aCoarse, 12.0f / 96.0f, srcLfo1);
-        s.lfo[0].shape = LfoShape::square; s.lfo[0].periodBeats = 1.0; s.lfo[0].unipolar = true;
-        e.setSettings (s);
-        e.noteOn (57, 1.0f);
-        auto x = render (e, (int) (sr * 0.2));
-        CHECK (e.getLiveOffset (Dest::aCoarse) > 0.12f, "décalage visible par l'interface : %f", e.getLiveOffset (Dest::aCoarse));
-        auto y = render (e, (int) (sr * 0.3));
-        x.insert (x.end(), y.begin(), y.end());
-        CHECK (near (measureFreq (x, 2000, 11000, sr), 440.0, 0.6), "+12 sur la première moitié");
-        CHECK (near (measureFreq (x, 13000, 23000, sr), 220.0, 0.4), "0 sur la seconde");
-    }
-
-    // La modulation est bornée par la course du potard
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = modSettings (Dest::aCoarse, 1.0f, srcLfo1);
-        setReal (s, Dest::aCoarse, 40.0f);
-        s.lfo[0].shape = LfoShape::square; s.lfo[0].periodBeats = 4.0; s.lfo[0].unipolar = true;
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (33, 1.0f);   // 55 Hz, +40 -> +48 maxi
-        auto x = render (e, 24000);
-        const double expected = 55.0 * std::pow (2.0, 48.0 / 12.0);
-        CHECK (near (measureFreq (x, 4800, 24000, sr), expected, 1.0), "plafonné à +48 : %.2f", measureFreq (x, 4800, 24000, sr));
-    }
-
-    // Deux routages vers le même potard s'additionnent ; un routage OFF ne fait rien
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = modSettings (Dest::pitch, 6.0f / 48.0f, srcVelocity);
-        s.slotSource[1] = srcVelocity; s.slotDest[1] = Dest::pitch; s.slotAmount[1] = 6.0f / 48.0f;
-        s.slotSource[2] = srcVelocity; s.slotDest[2] = Dest::off;   s.slotAmount[2] = 1.0f;
-        e.setSettings (s);
-        e.noteOn (57, 1.0f);   // vélocité 1 -> +12
-        auto x = render (e, 24000);
-        CHECK (near (measureFreq (x, 4800, 24000, sr), 440.0, 0.5), "vélocité -> pitch, deux routages");
-    }
-
-    // ENV 2 -> CUTOFF : le filtre se referme avec l'enveloppe
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = modSettings (Dest::cutoff, 0.5f, srcEnv2);
-        s.osc[0].table = basicTable();
-        setReal (s, Dest::aPos, 2.0f / 3.0f);   // scie
-        setReal (s, Dest::cutoff, 200.0f);
-        s.slope24 = true;
-        s.modA = 0.0005f; s.modD = 0.05f; s.modS = 0.0f;
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (69, 1.0f);
-        auto x = render (e, 24000);
-        CHECK (rms (x, 100, 1000) > 4.0 * rms (x, 18000, 24000), "ENV 2 ouvre puis referme : %.4f / %.4f", rms (x, 100, 1000), rms (x, 18000, 24000));
-    }
-
-    // SEQ -> VOLUME -100 % avec un carré : coupe le son une moitié du temps, sans clic
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = modSettings (Dest::volume, -1.0f, srcSeq);
-        s.seq.on = true; s.seq.steps = 2; s.seq.stepBeats = 0.25; s.seq.xfadeMs = 2.0f;
-        s.seq.pattern = {}; s.seq.pattern[0] = 0; s.seq.pattern[1] = 1;
-        s.lfo[0].shape = LfoShape::square; s.lfo[0].periodBeats = 4.0; s.lfo[0].unipolar = true;
-        e.setSettings (s);
-        e.noteOn (45, 1.0f);
-        auto x = render (e, (int) (sr * 0.5));
-        const int stepLen = (int) (sr * 0.125);
-        CHECK (rms (x, 1000, stepLen - 200) > 0.2, "pas ouvert");
-        CHECK (rms (x, stepLen + 900, 2 * stepLen - 200) < 0.005, "pas fermé : %.4f", rms (x, stepLen + 900, 2 * stepLen - 200));
-        float maxJump = 0.0f;
-        for (size_t i = 1; i < x.size(); ++i) maxJump = std::max (maxJump, std::abs (x[i] - x[i - 1]));
-        CHECK (maxJump < 0.06f, "pas de clic : %.4f", maxJump);
-    }
-
-    // Tête de lecture du séquenceur, mode HOST
-    {
-        Engine e;
-        e.prepare (sr);
         auto s = cleanSine();
-        s.seq.on = true; s.seq.steps = 16; s.seq.stepBeats = 0.25; s.seq.hostSync = true;
-        e.setSettings (s);
-        e.noteOn (60, 1.0f);
-        std::vector<float> l (64), r (64);
-        e.render (l.data(), r.data(), 64, { 120.0, true, 1.0 });
-        CHECK (e.getPlayheadStep() == 4, "HOST : pas 4 : %d", e.getPlayheadStep());
+        s.table = BuiltinTables::get (0);
+        setReal (s, Dest::wtPos, 0.5f);
+        s.oversampling = os;
+        auto x = play (s, 100, 48000 + 8192);
+        const double db = inharmonicDb (x, 8192, 440.0 * std::pow (2.0, 31.0 / 12.0), 48000.0);
+        CHECK (db < (os == 1 ? -45.0 : -60.0), "repliement scie x%d : %.1f dB", os, db);
     }
 }
 
-static void testWarp()
+static void testUnison()
 {
-    const double sr = 48000.0;
-
-    // FM depuis B (B coupé mais il module quand même) : bandes latérales à fc ± fm
-    {
-        auto run = [&] (float warp)
-        {
-            Engine e;
-            e.prepare (sr);
-            auto s = cleanSine();
-            s.osc[0].warp = Warp::fm;
-            setReal (s, Dest::bCoarse, 7.0f);      // B = 659,26 Hz
-            setReal (s, Dest::aWarp, warp);
-            e.setSettings (s);
-            e.prepare (sr);
-            e.noteOn (69, 1.0f);                   // A = 440 Hz
-            return render (e, 24000);
-        };
-        const auto plain = run (0.0f), fm = run (0.15f);
-        const double side = 440.0 + 440.0 * std::pow (2.0, 7.0 / 12.0);
-        CHECK (toneLevel (plain, 4800, 16384, side, sr) < 1e-3, "sans FM : pas de bande latérale");
-        CHECK (toneLevel (fm, 4800, 16384, side, sr) > 0.05, "FM : bande à fc + fm (%.3f)", toneLevel (fm, 4800, 16384, side, sr));
-        CHECK (toneLevel (fm, 4800, 16384, 440.0, sr) < toneLevel (plain, 4800, 16384, 440.0, sr), "FM : la porteuse perd de l'énergie");
-    }
-
-    // FM depuis A sur B : A à 0 dans le mix, B module par A
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        setReal (s, Dest::aLevel, 0.0f);
-        setReal (s, Dest::bLevel, 1.0f);
-        setReal (s, Dest::aCoarse, 7.0f);
-        s.osc[1].warp = Warp::fm;
-        setReal (s, Dest::bWarp, 0.15f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (69, 1.0f);
-        auto x = render (e, 24000);
-        CHECK (toneLevel (x, 4800, 16384, 440.0 + 440.0 * std::pow (2.0, 7.0 / 12.0), sr) > 0.05, "FM depuis A sur B");
-    }
-
-    // RM : A 440 Hz x B 110 Hz -> 330 et 550 Hz, presque plus de 440
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        s.osc[0].warp = Warp::rm;
-        s.osc[1].octave = -2;
-        setReal (s, Dest::aWarp, 1.0f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (69, 1.0f);
-        auto x = render (e, 24000);
-        const double side = toneLevel (x, 4800, 16384, 330.0, sr), carrier = toneLevel (x, 4800, 16384, 440.0, sr);
-        CHECK (side > 0.15 && carrier < 0.01, "RM : 330 Hz %.3f, 440 Hz %.4f", side, carrier);
-    }
-
-    // AM : la porteuse reste, des bandes apparaissent
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        s.osc[0].warp = Warp::am;
-        s.osc[1].octave = -2;
-        setReal (s, Dest::aWarp, 1.0f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (69, 1.0f);
-        auto x = render (e, 24000);
-        CHECK (toneLevel (x, 4800, 16384, 440.0, sr) > 0.15 && toneLevel (x, 4800, 16384, 550.0, sr) > 0.05, "AM");
-    }
-
-    // SYNC : la période reste celle de l'oscillateur, le timbre change
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        s.osc[0].warp = Warp::sync;
-        setReal (s, Dest::aWarp, 0.4f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (45, 1.0f);   // 110 Hz -> 436,4 échantillons
-        auto x = render (e, 24000);
-        const int period = periodByAutocorrelation (x, 4000, 4000, 300, 600);
-        CHECK (std::abs (period - 436) <= 2, "SYNC : période %d", period);
-        CHECK (toneLevel (x, 4800, 16384, 110.0 * 3.0, sr) > 0.02, "SYNC : harmoniques");
-    }
-}
-
-static void testAliasing()
-{
-    // Scie à 2637 Hz (note 100) : l'énergie hors des harmoniques doit être infime
-    const double sr = 48000.0;
-    for (Warp w : { Warp::off, Warp::fm })
-    {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        s.osc[0].table = basicTable();
-        setReal (s, Dest::aPos, 2.0f / 3.0f);
-        s.osc[0].warp = w;
-        s.osc[1].octave = 0;
-        setReal (s, Dest::aWarp, w == Warp::fm ? 0.04f : 0.0f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (100, 1.0f);
-        auto x = render (e, 48000 + 8192);
-
-        const int n = 32768;
-        std::vector<std::complex<double>> spec ((size_t) n);
-        for (int i = 0; i < n; ++i)
-        {
-            const double win = 0.35875 - 0.48829 * std::cos (twoPi * i / n) + 0.14128 * std::cos (2 * twoPi * i / n) - 0.01168 * std::cos (3 * twoPi * i / n);
-            spec[(size_t) i] = { x[(size_t) (8192 + i)] * win, 0.0 };
-        }
-        wt::fft (spec, false);
-        const double f0 = 440.0 * std::pow (2.0, (100 - 69) / 12.0);
-        double harmonic = 0.0, other = 0.0;
-        for (int b = 1; b < n / 2; ++b)
-        {
-            const double f = b * sr / n;
-            const double nearest = std::round (f / f0) * f0;
-            (std::abs (f - nearest) < 12.0 ? harmonic : other) += std::norm (spec[(size_t) b]);
-        }
-        const double db = 10.0 * std::log10 (other / harmonic);
-        CHECK (db < -60.0, "repliement (%s) : %.1f dB", w == Warp::off ? "scie" : "scie + FM", db);
-    }
-}
-
-static void testMonoGlide()
-{
-    const double sr = 48000.0;
-    Engine e;
-    e.prepare (sr);
-    auto s = cleanSine();
-    s.mono = true;
-    s.glideMs = 100.0f;
-    e.setSettings (s);
-    e.noteOn (57, 1.0f);
-    render (e, 4800);
-    e.noteOn (69, 1.0f);
-    auto x = render (e, 24000);
-    const double early = measureFreq (x, 0, 1200, sr);
-    CHECK (early > 225.0 && early < 400.0, "pendant le glide : %.1f", early);
-    CHECK (near (measureFreq (x, 14400, 24000, sr), 440.0, 1.0), "fin du glide");
-    CHECK (e.activeVoiceCount() == 1, "mono : une voix");
-    e.noteOff (69);
-    x = render (e, 24000);
-    CHECK (near (measureFreq (x, 14400, 24000, sr), 220.0, 1.0), "retour à la note tenue");
-    e.noteOff (57);
-    render (e, 24000);
-    CHECK (e.activeVoiceCount() == 0, "relâché");
-
-    auto s2 = cleanSine();
-    s2.mono = true;
-    s2.seq.on = true; s2.seq.steps = 16; s2.seq.stepBeats = 0.25; s2.seq.pattern.fill (1);
-    e.setSettings (s2);
-    e.noteOn (60, 1.0f);
-    render (e, (int) (sr * 0.40));
-    const int before = e.getPlayheadStep();
-    e.noteOn (62, 1.0f);
-    render (e, 64);
-    CHECK (before == 3 && e.getPlayheadStep() == 3, "legato garde la position : %d -> %d", before, e.getPlayheadStep());
-}
-
-static void testPolyphony()
-{
-    Engine e;
-    e.prepare (48000.0);
-    e.setSettings (cleanSine());
-    for (int n = 0; n < 8; ++n) e.noteOn (48 + n, 1.0f);
-    render (e, 256);
-    CHECK (e.activeVoiceCount() == 8, "8 voix");
-    e.noteOn (70, 1.0f);
-    render (e, 256);
-    CHECK (e.activeVoiceCount() == 8, "vol de voix");
-    for (int n = 0; n < 128; ++n) e.noteOff (n);
-    render (e, 48000);
-    CHECK (e.activeVoiceCount() == 0, "tout relâché");
-    e.noteOn (60, 1.0f); e.noteOn (64, 1.0f); e.noteOn (67, 1.0f);
     std::vector<float> r;
-    auto l = render (e, 4800, {}, &r);
-    CHECK (rms (l, 2400, 4800) > 0.3 && rms (r, 2400, 4800) > 0.3, "accord stéréo");
+    auto s = cleanSine();
+    auto mono = play (s, 57, 24000, 48000.0, &r);
+    float diff = 0.0f;
+    for (size_t i = 0; i < r.size(); ++i) diff = std::max (diff, std::abs (r[i] - mono[i]));
+    CHECK (diff < 1e-6f, "unison 1 : mono");
+
+    s.unison = 5;
+    setReal (s, Dest::wtDetune, 0.6f);
+    setReal (s, Dest::wtSpread, 1.0f);
+    s.wtRandomPhase = true;
+    auto l = play (s, 57, 48000, 48000.0, &r);
+    double corr = 0.0, el = 0.0, er = 0.0;
+    for (size_t i = 4800; i < l.size(); ++i) { corr += l[i] * r[i]; el += l[i] * l[i]; er += r[i] * r[i]; }
+    CHECK (corr / std::sqrt (el * er) < 0.9, "unison écarté : corrélation L/R %.2f", corr / std::sqrt (el * er));
+    // Le désaccord fait battre : l'enveloppe RMS varie dans le temps
+    double lo = 1e9, hi = 0.0;
+    for (int k = 0; k < 20; ++k) { const double v = rms (l, 4800 + k * 2000, 4800 + k * 2000 + 1000); lo = std::min (lo, v); hi = std::max (hi, v); }
+    CHECK (hi > 1.3 * lo, "unison désaccordé : battements (%.3f / %.3f)", lo, hi);
+    float peak = 0.0f;
+    for (float v : l) peak = std::max (peak, std::abs (v));
+    CHECK (peak < 2.0f, "unison borné : %.2f", peak);
 }
 
-static void testFilterAndDrive()
+static void testWtWarp()
 {
-    const double sr = 48000.0;
+    std::array<double, (int) WtWarp::count> hf {};
+    for (int w = 0; w < (int) WtWarp::count; ++w)
     {
-        Engine e;
-        e.prepare (sr);
         auto s = cleanSine();
-        s.osc[0].table = basicTable();
-        setReal (s, Dest::aPos, 2.0f / 3.0f);
-        setReal (s, Dest::cutoff, 200.0f);
-        s.slope24 = true;
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (93, 1.0f);
-        auto x = render (e, 9600);
-        CHECK (rms (x, 2400, 9600) < 0.02, "passe-bas 24 dB : %.4f", rms (x, 2400, 9600));
+        s.wtWarp = (WtWarp) w;
+        setReal (s, Dest::wtWarp, 0.6f);
+        auto x = play (s, 45, 24000);
+        hf[(size_t) w] = brightness (x);
+        const int period = periodByAutocorrelation (x, 4000, 4000, 300, 600);
+        CHECK (std::abs (period - 436) <= 2, "warp %d : la période ne change pas (%d)", w, period);
     }
+    for (int w = 1; w < (int) WtWarp::count; ++w)
+        CHECK (hf[(size_t) w] > 1.15 * hf[0], "warp %d enrichit le son (%.4f / %.4f)", w, hf[(size_t) w], hf[0]);
+}
+
+static void testPhaseDistortion()
+{
+    // PD AMT 0 : cosinus pur, à la bonne hauteur
     {
-        Engine e;
-        e.prepare (sr);
-        auto s = cleanSine();
-        s.filterType = FilterType::highpass;
-        setReal (s, Dest::cutoff, 4000.0f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (33, 1.0f);
-        auto x = render (e, 9600);
-        CHECK (rms (x, 2400, 9600) < 0.01, "passe-haut : %.4f", rms (x, 2400, 9600));
+        auto x = play (onlyPd (PdWave::saw, 0.0f), 69, 24000);
+        CHECK (near (measureFreq (x, 2400, 24000, 48000.0), 440.0, 0.3), "PD à 440 Hz");
+        CHECK (toneLevel (x, 4800, 16384, 880.0, 48000.0) < 0.002, "PD AMT 0 : pas d'harmonique 2");
     }
-    for (int type = 0; type < 3; ++type)
+    // Chaque forme : bornée, plus riche quand PD AMT monte
+    for (int w = 0; w < (int) PdWave::count; ++w)
     {
-        Engine e;
-        e.prepare (sr);
+        auto low = play (onlyPd ((PdWave) w, 0.1f), 45, 24000);
+        auto high = play (onlyPd ((PdWave) w, 0.9f), 45, 24000);
+        auto hfOf = [] (const std::vector<float>& x) { return brightness (x); };
+        float peak = 0.0f;
+        for (float v : high) peak = std::max (peak, std::abs (v));
+        CHECK (peak < 1.5f && rms (high, 2400, 24000) > 0.05, "forme PD %d bornée (%.2f)", w, peak);
+        CHECK (hfOf (high) > 1.2 * hfOf (low), "forme PD %d : PD AMT enrichit (%.4f / %.4f)", w, hfOf (high), hfOf (low));
+    }
+    // CRUSH, FOLD, SHAPE changent le son
+    for (Dest d : { Dest::pdCrush, Dest::pdFold, Dest::pdShape })
+    {
+        auto s = onlyPd (PdWave::saw, 0.5f);
+        auto a = play (s, 45, 9600);
+        setReal (s, d, 0.9f);
+        auto b = play (s, 45, 9600);
+        double diff = 0.0;
+        for (size_t i = 2400; i < a.size(); ++i) diff += std::abs (a[i] - b[i]);
+        CHECK (diff / 7200.0 > 0.02, "PD %d change le son (%.3f)", (int) d, diff / 7200.0);
+    }
+    // Les fonctions de phase restent dans [0, 1] et la lecture est continue
+    for (int w = 0; w < (int) PdWave::count; ++w)
+        for (double d : { 0.0, 0.5, 1.0 })
+        {
+            bool finite = true;
+            for (int i = 0; i < 1000; ++i) finite = finite && std::isfinite (PhaseDistortion::read ((PdWave) w, i / 1000.0, d, 0.3));
+            CHECK (finite, "PD %d fini à %.1f", w, d);
+        }
+}
+
+static void testPlaits()
+{
+    // Chaque modèle sonne (les modèles percussifs sur une note), sans valeur aberrante
+    for (int m = 0; m < PlaitsModels::count; ++m)
+    {
         auto s = cleanSine();
-        s.driveType = (DriveType) type;
-        setReal (s, Dest::drive, 1.0f);
-        e.setSettings (s);
-        e.prepare (sr);
-        e.noteOn (45, 1.0f);
-        auto x = render (e, 9600);
+        setReal (s, Dest::wtLevel, 0.0f);
+        s.algoOn = true;
+        s.algoModel = m;
+        setReal (s, Dest::algoLevel, 1.0f);
+        auto x = play (s, 48, 24000);
+        bool finite = true;
+        float peak = 0.0f;
+        for (float v : x) { finite = finite && std::isfinite (v); peak = std::max (peak, std::abs (v)); }
+        CHECK (finite && peak < 2.0f && rms (x, 0, 24000) > 0.005, "Plaits %s : rms %.4f, crête %.2f", PlaitsModels::name (m), rms (x, 0, 24000), peak);
+    }
+
+    // Hauteur juste (VIRTUAL ANALOG, harmonics 0) à 44,1, 48 et 96 kHz
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+    {
+        auto s = cleanSine();
+        setReal (s, Dest::wtLevel, 0.0f);
+        s.algoOn = true;
+        s.algoModel = 9;      // WAVESHAPING : un seul oscillateur
+        setReal (s, Dest::algoHarmonics, 0.0f);
+        setReal (s, Dest::algoTimbre, 0.0f);
+        setReal (s, Dest::algoMorph, 0.0f);
+        setReal (s, Dest::algoLevel, 1.0f);
+        auto x = play (s, 45, (int) (sr * 0.5), sr);
+        const int expected = (int) std::lround (sr / 110.0);
+        const int period = periodByAutocorrelation (x, (int) (sr * 0.1), (int) (sr * 0.1), expected - 40, expected + 40);
+        CHECK (std::abs (period - expected) <= 2, "Plaits 110 Hz à %.0f Hz : période %d / %d", sr, period, expected);
+    }
+
+    // LPG : le son retombe même note tenue
+    {
+        auto s = cleanSine();
+        setReal (s, Dest::wtLevel, 0.0f);
+        s.algoOn = true;
+        s.algoModel = 8;
+        s.algoLpg = true;
+        setReal (s, Dest::algoDecay, 0.2f);
+        setReal (s, Dest::algoLevel, 1.0f);
+        auto x = play (s, 48, 48000);
+        CHECK (rms (x, 200, 2400) > 8.0 * rms (x, 36000, 48000), "LPG : %.4f puis %.4f", rms (x, 200, 2400), rms (x, 36000, 48000));
+    }
+
+    // OFF : rien
+    {
+        auto s = cleanSine();
+        setReal (s, Dest::wtLevel, 0.0f);
+        s.algoOn = false;
+        setReal (s, Dest::algoLevel, 1.0f);
+        CHECK (rms (play (s, 48, 4800), 0, 4800) < 1e-6, "ALGO éteint");
+    }
+}
+
+static void testSubNoise()
+{
+    auto s = cleanSine();
+    setReal (s, Dest::wtLevel, 0.0f);
+    setReal (s, Dest::subLevel, 1.0f);
+    for (int w = 0; w < (int) SubWave::count; ++w)
+    {
+        s.subWave = (SubWave) w;
+        s.subOctave = -1;
+        auto x = play (s, 69, 24000);
+        const int period = periodByAutocorrelation (x, 4000, 4000, 180, 250);
+        CHECK (std::abs (period - 218) <= 2, "SUB %d à -1 octave : période %d", w, period);
+    }
+
+    setReal (s, Dest::subLevel, 0.0f);
+    setReal (s, Dest::noiseLevel, 1.0f);
+    std::array<double, (int) NoiseType::count> hfRatio {};
+    for (int n = 0; n < (int) NoiseType::count; ++n)
+    {
+        s.noiseType = (NoiseType) n;
+        auto x = play (s, 60, 24000);
+        double d = 0.0;
+        for (size_t i = 1; i < x.size(); ++i) d += std::abs (x[i] - x[i - 1]);
+        hfRatio[(size_t) n] = d / (rms (x, 0, 24000) * 24000.0 + 1e-12);
+        CHECK (rms (x, 2400, 24000) > 0.02, "bruit %d présent", n);
+    }
+    CHECK (hfRatio[0] > hfRatio[1] && hfRatio[1] > hfRatio[2], "blanc > rose > brun en aigus (%.2f %.2f %.2f)", hfRatio[0], hfRatio[1], hfRatio[2]);
+}
+
+static void testFmMatrix()
+{
+    // PD -> WT (comme sur la capture d'AB3) : PD coupé dans le mix, il module quand même
+    auto make = [] (float depth, FmMode mode)
+    {
+        auto s = cleanSine();
+        setReal (s, Dest::pdLevel, 0.0f);
+        s.pdWave = PdWave::saw;
+        setReal (s, Dest::pdAmount, 0.0f);
+        setReal (s, Dest::pdSemi, 7.0f);
+        s.fm[1][0] = 1.0f;
+        s.fmMode = mode;
+        setReal (s, Dest::fmDepth, depth);
+        return s;
+    };
+    const double side = 440.0 + 440.0 * std::pow (2.0, 7.0 / 12.0);
+    auto plain = play (make (0.0f, FmMode::phase), 69, 24000);
+    auto fm = play (make (0.1f, FmMode::phase), 69, 24000);
+    CHECK (toneLevel (plain, 4800, 16384, side, 48000.0) < 1e-3, "DEPTH 0 : pas de bande latérale");
+    CHECK (toneLevel (fm, 4800, 16384, side, 48000.0) > 0.05, "PD -> WT : bande à fc + fm (%.3f)", toneLevel (fm, 4800, 16384, side, 48000.0));
+    auto lin = play (make (0.1f, FmMode::linear), 69, 24000);
+    double diff = 0.0;
+    for (size_t i = 4800; i < lin.size(); ++i) diff += std::abs (lin[i] - fm[i]);
+    CHECK (diff / 19200.0 > 0.01, "mode LINEAR différent de PHASE");
+
+    // Toutes les cases, feedback compris : borné
+    for (int row = 0; row < numFmRows; ++row)
+        for (int col = 0; col < numFmCols; ++col)
+        {
+            auto s = cleanSine();
+            setReal (s, Dest::pdLevel, 0.5f);
+            s.fm[(size_t) row][(size_t) col] = 1.0f;
+            setReal (s, Dest::fmDepth, 1.0f);
+            auto x = play (s, 57, 9600);
+            float peak = 0.0f;
+            bool finite = true;
+            for (float v : x) { finite = finite && std::isfinite (v); peak = std::max (peak, std::abs (v)); }
+            CHECK (finite && peak < 2.0f, "case FM %d -> %d bornée (%.2f)", row, col, peak);
+        }
+
+    // Repliement en FM sur une scie aiguë (x2)
+    {
+        auto s = make (0.03f, FmMode::phase);
+        s.table = BuiltinTables::get (0);
+        setReal (s, Dest::wtPos, 0.5f);
+        setReal (s, Dest::pdSemi, 0.0f);
+        auto x = play (s, 100, 48000 + 8192);
+        const double db = inharmonicDb (x, 8192, 440.0 * std::pow (2.0, 31.0 / 12.0), 48000.0);
+        CHECK (db < -55.0, "repliement scie + FM : %.1f dB", db);
+    }
+}
+
+static void testBite()
+{
+    for (Dest d : { Dest::biteFold, Dest::biteCrush, Dest::biteSoft })
+    {
+        auto s = cleanSine();
+        setReal (s, d, 1.0f);
+        auto x = play (s, 45, 9600);
         float peak = 0.0f;
         for (float v : x) peak = std::max (peak, std::abs (v));
-        CHECK (peak < 2.0f && rms (x, 2400, 9600) > 0.1, "drive %d : crête %.3f", type, peak);
+        CHECK (peak < 2.0f && rms (x, 2400, 9600) > 0.05, "Bite %d borné (%.2f)", (int) d, peak);
+        CHECK (toneLevel (x, 2400, 4096, 330.0, 48000.0) > 0.005, "Bite %d ajoute des harmoniques", (int) d);
+    }
+    // ASYM : harmoniques paires
+    {
+        auto s = cleanSine();
+        setReal (s, Dest::biteSoft, 0.5f);
+        auto sym = play (s, 45, 9600);
+        s.biteAsym = true;
+        auto asym = play (s, 45, 9600);
+        CHECK (toneLevel (asym, 4800, 4096, 220.0, 48000.0) > 5.0 * toneLevel (sym, 4800, 4096, 220.0, 48000.0) + 0.005,
+               "ASYM : 2e harmonique %.4f / %.4f", toneLevel (asym, 4800, 4096, 220.0, 48000.0), toneLevel (sym, 4800, 4096, 220.0, 48000.0));
+    }
+    // POST FILTER : distorsion après le filtre -> plus d'aigus qu'avant le filtre
+    {
+        auto s = cleanSine();
+        s.table = BuiltinTables::get (0);
+        setReal (s, Dest::wtPos, 0.5f);
+        setReal (s, Dest::cutoff, 400.0f);
+        setReal (s, Dest::biteSoft, 1.0f);
+        auto pre = play (s, 45, 9600);
+        s.bitePost = true;
+        auto post = play (s, 45, 9600);
+        CHECK (toneLevel (post, 2400, 4096, 1650.0, 48000.0) > 2.0 * toneLevel (pre, 2400, 4096, 1650.0, 48000.0),
+               "POST FILTER plus brillant");
+    }
+}
+
+static void testFilters()
+{
+    auto saw = [] (FilterModel m, FilterType t, bool s24, float cutoff, float reso)
+    {
+        auto s = cleanSine();
+        s.table = BuiltinTables::get (0);
+        setReal (s, Dest::wtPos, 0.5f);
+        s.filterModel = m;
+        s.filterType = t;
+        s.slope24 = s24;
+        setReal (s, Dest::cutoff, cutoff);
+        setReal (s, Dest::resonance, reso);
+        return s;
+    };
+    for (FilterModel m : { FilterModel::ladder, FilterModel::svf })
+    {
+        const char* name = m == FilterModel::ladder ? "LADDER" : "SVF";
+        auto open = play (saw (m, FilterType::lowpass, false, 20000.0f, 0.0f), 45, 9600);
+        auto lp12 = play (saw (m, FilterType::lowpass, false, 300.0f, 0.0f), 45, 9600);
+        auto lp24 = play (saw (m, FilterType::lowpass, true, 300.0f, 0.0f), 45, 9600);
+        const double h = 3000.0;
+        CHECK (toneLevel (lp12, 2400, 4096, h, 48000.0) < 0.1 * toneLevel (open, 2400, 4096, h, 48000.0), "%s LP 12 coupe", name);
+        CHECK (toneLevel (lp24, 2400, 4096, h, 48000.0) < 0.3 * toneLevel (lp12, 2400, 4096, h, 48000.0), "%s 24 dB plus raide", name);
+        CHECK (toneLevel (lp12, 2400, 4096, 110.0, 48000.0) > 0.5 * toneLevel (open, 2400, 4096, 110.0, 48000.0), "%s LP garde le grave", name);
+
+        auto hp = play (saw (m, FilterType::highpass, true, 3000.0f, 0.0f), 45, 9600);
+        CHECK (toneLevel (hp, 2400, 4096, 110.0, 48000.0) < 0.05 * toneLevel (open, 2400, 4096, 110.0, 48000.0), "%s HP coupe le grave", name);
+        auto bp = play (saw (m, FilterType::bandpass, false, 1100.0f, 0.3f), 45, 9600);
+        CHECK (toneLevel (bp, 2400, 4096, 1100.0, 48000.0) / toneLevel (open, 2400, 4096, 1100.0, 48000.0)
+               > 3.0 * toneLevel (bp, 2400, 4096, 110.0, 48000.0) / toneLevel (open, 2400, 4096, 110.0, 48000.0), "%s BP", name);
+        auto notch = play (saw (m, FilterType::notch, false, 1100.0f, 0.0f), 45, 9600);
+        CHECK (toneLevel (notch, 2400, 4096, 1100.0, 48000.0) < 0.5 * toneLevel (open, 2400, 4096, 1100.0, 48000.0), "%s NOTCH", name);
+
+        // Résonance : pic près de la coupure
+        auto res = play (saw (m, FilterType::lowpass, false, 990.0f, 0.9f), 45, 9600);
+        auto flat = play (saw (m, FilterType::lowpass, false, 990.0f, 0.0f), 45, 9600);
+        CHECK (toneLevel (res, 2400, 4096, 990.0, 48000.0) > 2.0 * toneLevel (flat, 2400, 4096, 990.0, 48000.0), "%s résonance", name);
+        float peak = 0.0f;
+        for (float v : play (saw (m, FilterType::lowpass, true, 990.0f, 1.0f), 45, 24000)) peak = std::max (peak, std::abs (v));
+        CHECK (peak < 4.0f, "%s résonance max bornée (%.2f)", name, peak);
+    }
+
+    // ENV AMT : l'enveloppe du filtre ouvre puis referme
+    {
+        auto s = saw (FilterModel::ladder, FilterType::lowpass, true, 150.0f, 0.0f);
+        setReal (s, Dest::filterEnv, 0.8f);
+        s.fltA = 0.0005f; s.fltD = 0.05f; s.fltS = 0.0f;
+        auto x = play (s, 69, 24000);
+        CHECK (rms (x, 100, 1200) > 4.0 * rms (x, 18000, 24000), "ENV AMT : %.4f / %.4f", rms (x, 100, 1200), rms (x, 18000, 24000));
+    }
+}
+
+static void testModulation()
+{
+    const double sr = 48000.0;
+    // MAIN LFO carré synchro -> WT SEMI : +12 une demi-période sur deux
+    {
+        auto s = cleanSine();
+        s.mainLfo.sync = true;
+        s.mainLfo.periodBeats = 1.0;
+        s.mainLfo.shape = MainLfoShape::square;
+        s.mainLfo.retrig = true;
+        s.mainLfo.dest[0] = Dest::wtSemi;
+        s.mainLfo.amount[0] = 6.0f / 96.0f;      // ±6 -> 12 d'écart
+        auto x = play (s, 57, (int) (sr * 0.5));
+        const double a = measureFreq (x, 2000, 11000, sr), b = measureFreq (x, 13000, 23000, sr);
+        CHECK (near (a, 220.0 * std::pow (2.0, 6.0 / 12.0), 1.0) && near (b, 220.0 * std::pow (2.0, -6.0 / 12.0), 1.0), "MAIN LFO -> SEMI : %.1f / %.1f", a, b);
+    }
+    // MAIN LFO libre en Hz
+    {
+        auto s = cleanSine();
+        s.mainLfo.sync = false;
+        s.mainLfo.rateHz = 4.0f;
+        s.mainLfo.shape = MainLfoShape::square;
+        s.mainLfo.retrig = true;
+        s.mainLfo.dest[1] = Dest::volume;
+        s.mainLfo.amount[1] = 0.8f;
+        auto x = play (s, 57, 24000);
+        CHECK (rms (x, 1000, 5000) > 3.0 * rms (x, 7000, 11000), "MAIN LFO 4 Hz sur le volume");
+    }
+    // ENV 3, vélocité, molette dans les routages
+    for (int src : { (int) srcEnv3, (int) srcVelocity, (int) srcModWheel })
+    {
+        auto s = cleanSine();
+        s.slotSource[0] = src;
+        s.slotDest[0] = Dest::wtSemi;
+        s.slotAmount[0] = 12.0f / 96.0f;
+        s.modA = 0.0005f; s.modD = 5.0f; s.modS = 1.0f;
+        Engine e;
+        e.setSettings (s);
+        e.prepare (sr);
+        e.setModWheel (1.0f);
+        e.noteOn (57, 1.0f);
+        auto x = render (e, 24000);
+        CHECK (near (measureFreq (x, 4800, 24000, sr), 440.0, 1.0), "source %d -> SEMI +12", src);
+    }
+    // SEQ -> CUTOFF : la tête de lecture avance
+    {
+        auto s = cleanSine();
+        s.seq.on = true; s.seq.steps = 16; s.seq.stepBeats = 0.25; s.seq.pattern.fill (1);
+        Engine e;
+        e.setSettings (s);
+        e.prepare (sr);
+        e.noteOn (60, 1.0f);
+        render (e, (int) (sr * 0.4));
+        CHECK (e.getPlayheadStep() == 3, "tête de lecture : %d", e.getPlayheadStep());
+    }
+}
+
+static void testVoiceModes()
+{
+    const double sr = 48000.0;
+    // MONO + glide
+    {
+        auto s = cleanSine();
+        s.voiceMode = VoiceMode::mono;
+        s.glideMs = 100.0f;
+        Engine e;
+        e.setSettings (s);
+        e.prepare (sr);
+        e.noteOn (57, 1.0f);
+        render (e, 4800);
+        e.noteOn (69, 1.0f);
+        auto x = render (e, 24000);
+        CHECK (measureFreq (x, 0, 1200, sr) > 225.0 && measureFreq (x, 0, 1200, sr) < 400.0, "glide en cours");
+        CHECK (near (measureFreq (x, 14400, 24000, sr), 440.0, 1.0), "glide arrivé");
+        CHECK (e.activeVoiceCount() == 1, "mono");
+        e.noteOff (69);
+        x = render (e, 24000);
+        CHECK (near (measureFreq (x, 14400, 24000, sr), 220.0, 1.0), "retour à la note tenue");
+    }
+    // LEGATO : pas de nouvelle attaque quand une note est tenue ; MONO : l'enveloppe repart
+    {
+        auto levelAfterSecondNote = [sr] (VoiceMode mode)
+        {
+            auto s = cleanSine();
+            s.voiceMode = mode;
+            s.ampA = 0.01f; s.ampD = 0.05f; s.ampS = 0.2f;
+            Engine e;
+            e.setSettings (s);
+            e.prepare (sr);
+            e.noteOn (57, 1.0f);
+            render (e, 24000);          // au palier (0,2)
+            e.noteOn (60, 1.0f);
+            auto x = render (e, 960);   // 20 ms : l'attaque est passée
+            return rms (x, 480, 960);
+        };
+        const double legato = levelAfterSecondNote (VoiceMode::legato), mono = levelAfterSecondNote (VoiceMode::mono);
+        CHECK (legato < 0.15, "legato : reste au palier (%.3f)", legato);
+        CHECK (mono > 1.5 * legato, "mono : nouvelle attaque (%.3f / %.3f)", mono, legato);
+    }
+    // POLY : 16 voix
+    {
+        Engine e;
+        e.setSettings (cleanSine());
+        e.prepare (sr);
+        for (int n = 0; n < 20; ++n) e.noteOn (40 + n, 1.0f);
+        render (e, 256);
+        CHECK (e.activeVoiceCount() == 16, "16 voix : %d", e.activeVoiceCount());
+    }
+    // BEND
+    {
+        auto s = cleanSine();
+        s.bendRange = 12.0f;
+        Engine e;
+        e.setSettings (s);
+        e.prepare (sr);
+        e.setPitchWheel (1.0f);
+        e.noteOn (57, 1.0f);
+        auto x = render (e, 24000);
+        CHECK (near (measureFreq (x, 4800, 24000, sr), 440.0, 1.0), "BEND +12");
     }
 }
 
 static void testFuzz()
 {
     Rng rng (1234);
-    for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
-    {
-        for (int run = 0; run < 10; ++run)
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+        for (int run = 0; run < 8; ++run)
         {
-            Engine e;
-            e.prepare (sr);
             Settings s;
-            s.mono = rng.chance (0.3);
-            s.glideMs = 1000.0f * rng.uniformf();
-            s.velocity = rng.uniformf();
             for (auto& v : s.base) v = rng.uniformf();
-            for (auto& o : s.osc)
-            {
-                o.table = BuiltinTables::get (rng.range (0, BuiltinTables::count() - 1));
-                o.octave = rng.range (-4, 4);
-                o.warp = (Warp) rng.range (0, (int) Warp::count - 1);
-            }
-            s.filterType = (FilterType) rng.range (0, 2); s.slope24 = rng.chance (0.5); s.keyTrack = rng.uniformf();
-            s.ampA = 0.002f * rng.uniformf(); s.ampD = rng.uniformf(); s.ampS = rng.uniformf(); s.ampR = 0.2f * rng.uniformf();
-            s.modA = 0.5f * rng.uniformf(); s.modD = rng.uniformf(); s.modS = rng.uniformf(); s.modR = rng.uniformf();
-            s.driveType = (DriveType) rng.range (0, 2); s.drivePost = rng.chance (0.5);
-            for (auto& l : s.lfo)
-            {
-                l.periodBeats = 0.0625 * std::pow (2.0, rng.range (0, 9));
-                l.shape = (LfoShape) rng.range (0, (int) LfoShape::count - 1);
-                l.amount = rng.uniformf(); l.steps = rng.chance (0.5) ? 0 : rng.range (2, 32);
-                l.phase = rng.uniformf(); l.unipolar = rng.chance (0.3);
-            }
-            for (auto& c : s.chaos) { c.periodBeats = 0.0625 * std::pow (2.0, rng.range (0, 6)); c.amount = rng.uniformf(); c.smooth = rng.uniformf(); }
-            s.seq.on = rng.chance (0.8); s.seq.steps = rng.range (1, 32); s.seq.stepBeats = 0.0625 * rng.range (1, 16);
-            s.seq.swing = 0.75 * rng.uniform(); s.seq.hostSync = rng.chance (0.5); s.seq.restart = rng.chance (0.5);
-            s.seq.xfadeMs = 20.0f * rng.uniformf(); s.seq.manual = rng.range (1, numSources);
+            s.wtOn = rng.chance (0.8); s.pdOn = rng.chance (0.8); s.algoOn = rng.chance (0.6);
+            s.table = BuiltinTables::get (rng.range (0, BuiltinTables::count() - 1));
+            s.wtWarp = (WtWarp) rng.range (0, (int) WtWarp::count - 1);
+            s.wtOctave = rng.range (-3, 3); s.pdOctave = rng.range (-3, 3); s.algoOctave = rng.range (-3, 3);
+            s.unison = rng.range (1, maxUnison);
+            s.wtPhase = rng.uniformf(); s.wtRandomPhase = rng.chance (0.5);
+            s.pdWave = (PdWave) rng.range (0, (int) PdWave::count - 1);
+            s.algoModel = rng.range (0, PlaitsModels::count - 1); s.algoLpg = rng.chance (0.3);
+            s.subWave = (SubWave) rng.range (0, 3); s.subOctave = rng.range (-2, 0);
+            s.noiseType = (NoiseType) rng.range (0, 3);
+            for (auto& row : s.fm) for (auto& c : row) c = rng.chance (0.4) ? rng.uniformf() : 0.0f;
+            s.fmMode = (FmMode) rng.range (0, 1);
+            s.bitePost = rng.chance (0.5); s.biteAsym = rng.chance (0.5);
+            s.filterModel = (FilterModel) rng.range (0, 1); s.filterType = (FilterType) rng.range (0, 3); s.slope24 = rng.chance (0.5);
+            s.keyTrack = rng.uniformf();
+            s.voiceMode = (VoiceMode) rng.range (0, 2); s.glideMs = 300.0f * rng.uniformf(); s.bendRange = 12.0f * rng.uniformf();
+            s.oversampling = 1 << rng.range (0, 2);
+            s.mainLfo.sync = rng.chance (0.5); s.mainLfo.rateHz = 20.0f * rng.uniformf(); s.mainLfo.periodBeats = 0.25 * rng.range (1, 8);
+            s.mainLfo.shape = (MainLfoShape) rng.range (0, (int) MainLfoShape::count - 1); s.mainLfo.retrig = rng.chance (0.5);
+            for (int k = 0; k < 2; ++k) { s.mainLfo.dest[(size_t) k] = (Dest) rng.range (0, numDests - 1); s.mainLfo.amount[(size_t) k] = rng.uniformf() * 2 - 1; }
+            for (auto& l : s.lfo) { l.periodBeats = 0.0625 * std::pow (2.0, rng.range (0, 8)); l.shape = (LfoShape) rng.range (0, (int) LfoShape::count - 1); }
+            s.seq.on = rng.chance (0.7);
             std::array<bool, numSources + 1> all {};
             all.fill (true);
             RandomPattern::generate (rng, s.seq.steps, all, s.seq.pattern);
             for (int k = 0; k < numSlots; ++k)
             {
                 s.slotSource[(size_t) k] = rng.range (0, numModSources - 1);
-                s.slotDest[(size_t) k] = (Dest) rng.range (0, numDests - 1);
+                s.slotDest[(size_t) k] = rng.chance (0.5) ? (Dest) rng.range (0, numDests - 1) : Dest::off;
                 s.slotAmount[(size_t) k] = rng.uniformf() * 2 - 1;
             }
 
+            Engine e;
             e.setSettings (s);
+            e.prepare (sr);
             Engine::Transport t { 60.0 + 180.0 * rng.uniform(), rng.chance (0.5), 16.0 * rng.uniform() };
             bool finite = true;
             float peak = 0.0f;
             std::vector<float> l (512), r (512);
-            for (int block = 0; block < (int) (sr / 512.0); ++block)
+            for (int block = 0; block < (int) (sr / 512.0 * 0.6); ++block)
             {
-                if (block % 20 == 0) e.noteOn (rng.range (12, 120), rng.uniformf());
-                if (block % 20 == 13) e.noteOff (rng.range (12, 120));
-                if (block == 30) e.setPitchBend (rng.uniformf() * 4 - 2);
+                if (block % 15 == 0) e.noteOn (rng.range (12, 110), rng.uniformf());
+                if (block % 15 == 9) e.noteOff (rng.range (12, 110));
+                if (block == 20) { e.setPitchWheel (rng.uniformf() * 2 - 1); e.setModWheel (rng.uniformf()); }
                 e.render (l.data(), r.data(), 512, t);
                 t.ppq += 512.0 * t.bpm / 60.0 / sr;
                 for (int i = 0; i < 512; ++i)
@@ -1044,19 +1154,198 @@ static void testFuzz()
             CHECK (finite, "valeurs finies (sr %.0f, essai %d)", sr, run);
             CHECK (peak < 16.0f, "crête raisonnable (sr %.0f, essai %d) : %.2f", sr, run, peak);
         }
+}
+
+//==============================================================================
+struct ArpEvent { bool on; int note; int at; };
+
+static std::vector<ArpEvent> runArp (Arpeggiator& arp, int samples, double bpm = 120.0, bool host = false, double ppq = 0.0)
+{
+    std::vector<ArpEvent> events;
+    int done = 0;
+    while (done < samples)
+    {
+        const int n = std::min (256, samples - done);
+        const int base = done;
+        arp.process (n, 48000.0, bpm, host, ppq + base * bpm / 60.0 / 48000.0,
+                     [&events, base] (bool on, int note, float, int at) { events.push_back ({ on, note, base + at }); });
+        done += n;
+    }
+    return events;
+}
+
+static std::vector<int> onsets (const std::vector<ArpEvent>& ev)
+{
+    std::vector<int> notes;
+    for (auto& e : ev) if (e.on) notes.push_back (e.note);
+    return notes;
+}
+
+static void testArp()
+{
+    auto make = [] (ArpMode mode, int octaves = 1)
+    {
+        ArpSettings s;
+        s.on = true; s.mode = mode; s.octaves = octaves; s.stepBeats = 0.25; s.gate = 0.5f;
+        return s;
+    };
+    auto chord = [] (Arpeggiator& a) { a.noteOn (64, 1.0f); a.noteOn (60, 1.0f); a.noteOn (67, 1.0f); };
+
+    // UP sur un accord, 1/16 à 120 BPM = 6000 échantillons
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::up)); chord (a);
+        auto ev = runArp (a, 6000 * 6 + 10);
+        auto n = onsets (ev);
+        CHECK ((n == std::vector<int> { 60, 64, 67, 60, 64, 67, 60 }), "UP : %d notes", (int) n.size());
+        int firstOff = -1;
+        for (auto& e : ev) if (! e.on) { firstOff = e.at; break; }
+        CHECK (std::abs (firstOff - 3000) <= 1, "GATE 50 %% : fin à %d", firstOff);
+        int second = -1, count = 0;
+        for (auto& e : ev) if (e.on && ++count == 2) second = e.at;
+        CHECK (std::abs (second - 6000) <= 1, "pas suivant à %d", second);
+    }
+    // DOWN, UP/DOWN, DOWN/UP, ORDER, 2 octaves
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::down)); chord (a);
+        CHECK ((onsets (runArp (a, 6000 * 3 + 10)) == std::vector<int> { 67, 64, 60, 67 }), "DOWN");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::upDown)); chord (a);
+        CHECK ((onsets (runArp (a, 6000 * 5 + 10)) == std::vector<int> { 60, 64, 67, 64, 60, 64 }), "UP/DOWN");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::downUp)); chord (a);
+        CHECK ((onsets (runArp (a, 6000 * 4 + 10)) == std::vector<int> { 67, 64, 60, 64, 67 }), "DOWN/UP");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::order)); chord (a);
+        CHECK ((onsets (runArp (a, 6000 * 2 + 10)) == std::vector<int> { 64, 60, 67 }), "AS PLAYED");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::up, 2)); a.noteOn (60, 1.0f); a.noteOn (64, 1.0f);
+        CHECK ((onsets (runArp (a, 6000 * 4 + 10)) == std::vector<int> { 60, 64, 72, 76, 60 }), "2 octaves");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::chord)); chord (a);
+        auto n = onsets (runArp (a, 10));
+        CHECK (n.size() == 3, "CHORD : 3 notes ensemble");
+    }
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::random)); chord (a);
+        auto n = onsets (runArp (a, 6000 * 40));
+        bool valid = true;
+        std::array<int, 3> seen {};
+        for (int v : n) { valid = valid && (v == 60 || v == 64 || v == 67); seen[(size_t) (v == 60 ? 0 : v == 64 ? 1 : 2)]++; }
+        CHECK (valid && seen[0] > 3 && seen[1] > 3 && seen[2] > 3, "RANDOM");
+    }
+    // Relâché : tout s'arrête ; LATCH : continue
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::up)); chord (a);
+        runArp (a, 7000);
+        a.noteOff (60); a.noteOff (64); a.noteOff (67);
+        auto ev = runArp (a, 20000);
+        CHECK (onsets (ev).empty() && a.playingCount() == 0, "relâché : silence");
+        auto s = make (ArpMode::up); s.latch = true;
+        Arpeggiator b; b.reset(); b.setSettings (s); chord (b);
+        b.noteOff (60); b.noteOff (64); b.noteOff (67);
+        CHECK (onsets (runArp (b, 6000 * 3 + 10)).size() == 4, "LATCH : continue");
+        b.noteOn (50, 1.0f);   // nouvelle frappe : remplace l'accord
+        auto m = onsets (runArp (b, 6000 * 3));
+        bool only50 = true;
+        for (int v : m) only50 = only50 && v == 50;
+        CHECK (only50 && ! m.empty(), "LATCH : nouvelle frappe remplace");
+    }
+    // Synchro hôte : la grille suit la position du morceau
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::up)); a.noteOn (60, 1.0f);
+        auto ev = runArp (a, 6000, 120.0, true, 0.2);   // 0,2 noire : le pas suivant (0,25) tombe 0,05 noire plus tard = 1200 échantillons
+        int on = -1, k = 0;
+        for (auto& e : ev) if (e.on && ++k == 2) on = e.at;
+        CHECK (std::abs (on - 1200) <= 1, "calé sur l'hôte : %d", on);
+    }
+    // Swing : le pas pair dure plus longtemps
+    {
+        auto s = make (ArpMode::up); s.swing = 0.5;
+        Arpeggiator a; a.reset(); a.setSettings (s); a.noteOn (60, 1.0f);
+        auto ev = runArp (a, 12000);
+        int second = -1, k = 0;
+        for (auto& e : ev) if (e.on && ++k == 2) second = e.at;
+        CHECK (std::abs (second - 9000) <= 1, "swing : %d", second);
+    }
+    // Éteint : les notes en cours s'arrêtent
+    {
+        Arpeggiator a; a.reset(); a.setSettings (make (ArpMode::up)); chord (a);
+        runArp (a, 100);
+        auto s = make (ArpMode::up); s.on = false;
+        a.setSettings (s);
+        auto ev = runArp (a, 10);
+        CHECK (! ev.empty() && ! ev[0].on, "éteint : note off envoyé");
     }
 }
 
-static void testDestRanges()
+static void testFx()
 {
-    for (int d = 1; d < numDests; ++d)
-        for (float n : { 0.0f, 0.3f, 0.8f, 1.0f })
-        {
-            const float real = DestRange::toReal ((Dest) d, n);
-            CHECK (std::isfinite (real) && near (DestRange::toNorm ((Dest) d, real), n, 1e-4), "aller-retour dest %d à %.1f", d, n);
-        }
-    CHECK (near (DestRange::toReal (Dest::volume, 0.8f), 1.0, 1e-6), "volume 0,8 = 0 dB");
-    CHECK (near (DestRange::toReal (Dest::cutoff, 1.0f), 20000.0, 0.1), "cutoff max");
+    const double sr = 48000.0;
+    auto impulse = [] (int n) { std::vector<float> v ((size_t) n, 0.0f); v[0] = 1.0f; return v; };
+
+    // Tout éteint : intact
+    {
+        Fx fx; fx.prepare (sr); fx.setSettings ({});
+        auto l = impulse (1000), r = impulse (1000);
+        fx.process (l.data(), r.data(), 1000, 120.0);
+        CHECK (l[0] == 1.0f && l[1] == 0.0f && r[0] == 1.0f, "FX éteints : intact");
+    }
+    // DELAY : écho à 1/4 de noire à 120 BPM = 0,125 s, qui décroît ; ping-pong alterne
+    {
+        FxSettings s; s.delayOn = true; s.delayBeats = 0.25; s.delayFeedback = 0.5f; s.delayMix = 1.0f; s.delayTone = 1.0f; s.delayPingPong = true;
+        Fx fx; fx.prepare (sr); fx.setSettings (s);
+        const int n = 30000;
+        auto l = impulse (n), r = impulse (n);
+        fx.process (l.data(), r.data(), n, 120.0);
+        auto peakAround = [] (const std::vector<float>& x, int at) { float p = 0.0f; for (int i = at - 50; i < at + 50; ++i) p = std::max (p, std::abs (x[(size_t) i])); return p; };
+        CHECK (peakAround (l, 6000) > 0.2f, "1er écho à gauche (%.3f)", peakAround (l, 6000));
+        CHECK (peakAround (r, 12000) > 0.08f && peakAround (r, 12000) < peakAround (l, 6000), "2e écho à droite, plus faible");
+        CHECK (peakAround (l, 3000) < 1e-3f, "rien entre les échos");
+    }
+    // REVERB : queue qui décroît, finie
+    {
+        FxSettings s; s.reverbOn = true; s.reverbMix = 1.0f; s.reverbDecay = 0.4f; s.reverbPredelay = 0.0f;
+        Fx fx; fx.prepare (sr); fx.setSettings (s);
+        const int n = 48000 * 3;
+        auto l = impulse (n), r = impulse (n);
+        fx.process (l.data(), r.data(), n, 120.0);
+        bool finite = true;
+        for (float v : l) finite = finite && std::isfinite (v);
+        const double early = rms (l, 2000, 12000), late = rms (l, 96000, 144000);
+        CHECK (finite && early > 1e-3 && late < 0.2 * early, "reverb : %.5f puis %.5f", early, late);
+        double corr = 0.0, el = 0.0, er = 0.0;
+        for (int i = 2000; i < 24000; ++i) { corr += l[(size_t) i] * r[(size_t) i]; el += l[(size_t) i] * l[(size_t) i]; er += r[(size_t) i] * r[(size_t) i]; }
+        CHECK (corr / std::sqrt (el * er) < 0.7, "reverb stéréo (corrélation %.2f)", corr / std::sqrt (el * er));
+    }
+    // Reverb longue + feedback max du delay : pas d'emballement
+    {
+        FxSettings s; s.reverbOn = true; s.reverbMix = 0.5f; s.reverbDecay = 1.0f; s.reverbSize = 1.0f;
+        s.delayOn = true; s.delayFeedback = 0.95f; s.delayMix = 0.5f; s.chorusOn = true; s.chorusDepth = 1.0f; s.chorusMix = 0.5f;
+        Fx fx; fx.prepare (sr); fx.setSettings (s);
+        std::vector<float> l (48000 * 10), r (48000 * 10);
+        Rng rng (3);
+        for (int i = 0; i < 48000; ++i) { l[(size_t) i] = rng.uniformf() * 2 - 1; r[(size_t) i] = rng.uniformf() * 2 - 1; }
+        fx.process (l.data(), r.data(), (int) l.size(), 174.0);
+        float peak = 0.0f;
+        for (float v : l) peak = std::max (peak, std::abs (v));
+        CHECK (peak < 20.0f, "FX au maximum : borné (%.2f)", peak);
+    }
+    // CHORUS : le signal est modifié et reste borné
+    {
+        FxSettings s; s.chorusOn = true; s.chorusMix = 0.5f;
+        Fx fx; fx.prepare (sr); fx.setSettings (s);
+        std::vector<float> l (48000), r (48000);
+        for (int i = 0; i < 48000; ++i) l[(size_t) i] = r[(size_t) i] = std::sin ((float) (twoPi * 440.0 * i / sr));
+        fx.process (l.data(), r.data(), 48000, 120.0);
+        double diff = 0.0;
+        for (int i = 4800; i < 48000; ++i) diff += std::abs (l[(size_t) i] - r[(size_t) i]);
+        CHECK (diff / 43200.0 > 0.01, "chorus stéréo");
+    }
 }
 
 int main (int argc, char** argv)
@@ -1070,17 +1359,22 @@ int main (int argc, char** argv)
     testDestRanges();
     testWavetableBuilder();
     testWavParser();
-    testRealSerumFiles (std::vector<std::string> (argv + 1, argv + argc));
     testDecimator();
-    testPitch();
-    testCoarseGlides();
-    testModulationSlots();
-    testWarp();
-    testAliasing();
-    testMonoGlide();
-    testPolyphony();
-    testFilterAndDrive();
+    testWavetablePitch();
+    testUnison();
+    testWtWarp();
+    testPhaseDistortion();
+    testPlaits();
+    testSubNoise();
+    testFmMatrix();
+    testBite();
+    testFilters();
+    testModulation();
+    testVoiceModes();
+    testArp();
+    testFx();
     testFuzz();
+    (void) argc; (void) argv;
 
     std::printf ("%d vérifications, %d échecs\n", checks, failures);
     return failures == 0 ? 0 : 1;

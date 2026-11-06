@@ -435,8 +435,8 @@ void ui::SourceChip::paint (juce::Graphics& g)
     g.fillRoundedRectangle (juce::Rectangle<float> (9.0f, 9.0f).withCentre ({ area.getX() + 9.0f, area.getCentreY() }), 2.0f);
 
     g.setColour (Palette::ink());
-    g.setFont (font (10.5f, true, 0.18f));
-    g.drawText (text, area.withTrimmedLeft (18.0f).withTrimmedRight (14.0f), juce::Justification::centredLeft, false);
+    g.setFont (font (10.0f, true, 0.1f));
+    g.drawText (text, area.withTrimmedLeft (17.0f).withTrimmedRight (12.0f), juce::Justification::centredLeft, false);
 
     // Poignée
     g.setColour (over ? colour : Palette::faint());
@@ -604,7 +604,7 @@ void ui::ModKnob::itemDropped (const SourceDetails& details)
     {
         juce::PopupMenu menu;
         menu.setLookAndFeel (&getLookAndFeel());
-        menu.addItem (1, "ALL 16 MODULATION SLOTS ARE IN USE", false);
+        menu.addItem (1, "ALL 24 MODULATION SLOTS ARE IN USE", false);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this));
     }
     repaint();
@@ -671,11 +671,11 @@ int ui::ModList::idealHeight() const
     return juce::jmax (1, (int) rows().size()) * rowHeight;
 }
 
-juce::Rectangle<float> ui::ModList::sourceArea (int row) const  { return { 0.0f, (float) (row * rowHeight), 84.0f, (float) rowHeight }; }
-juce::Rectangle<float> ui::ModList::destArea (int row) const    { return { 98.0f, (float) (row * rowHeight), 84.0f, (float) rowHeight }; }
+juce::Rectangle<float> ui::ModList::sourceArea (int row) const  { return { 4.0f, (float) (row * rowHeight), 92.0f, (float) rowHeight }; }
+juce::Rectangle<float> ui::ModList::destArea (int row) const    { return { 112.0f, (float) (row * rowHeight), 104.0f, (float) rowHeight }; }
 juce::Rectangle<float> ui::ModList::amountArea (int row) const
 {
-    return { 188.0f, (float) (row * rowHeight) + 3.0f, (float) getWidth() - 188.0f - 26.0f, (float) rowHeight - 6.0f };
+    return { 222.0f, (float) (row * rowHeight) + 4.0f, (float) getWidth() - 222.0f - 26.0f, (float) rowHeight - 8.0f };
 }
 juce::Rectangle<float> ui::ModList::removeArea (int row) const  { return { (float) getWidth() - 22.0f, (float) (row * rowHeight), 22.0f, (float) rowHeight }; }
 
@@ -710,7 +710,7 @@ void ui::ModList::paint (juce::Graphics& g)
         g.drawText (SequencesAudioProcessor::modSourceNames()[source], src.withTrimmedLeft (14.0f), juce::Justification::centredLeft, false);
 
         g.setColour (Palette::dim());
-        g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x86\x92")), juce::Rectangle<float> (84.0f, src.getY(), 14.0f, src.getHeight()),
+        g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x86\x92")), juce::Rectangle<float> (96.0f, src.getY(), 14.0f, src.getHeight()),
                     juce::Justification::centred, false);
         g.setColour (Palette::ink());
         g.drawText (SequencesAudioProcessor::destinationNames()[(int) processor.getModulationDest (k)], destArea (r),
@@ -845,9 +845,23 @@ namespace
     }
 
     juce::File lastTableFolder;
+
+    float paramValue (SequencesAudioProcessor& p, const juce::String& id)
+    {
+        auto* param = p.apvts.getParameter (id);
+        return param != nullptr ? param->convertFrom0to1 (param->getValue()) : 0.0f;
+    }
+
+    void drawPlotBackground (juce::Graphics& g, juce::Rectangle<float> area)
+    {
+        g.setColour (juce::Colours::white);
+        g.fillRoundedRectangle (area, 3.0f);
+        g.setColour (Palette::stepOff());
+        g.fillRect (area.getX(), area.getCentreY(), area.getWidth(), 1.0f);
+    }
 }
 
-ui::WavetableView::WavetableView (SequencesAudioProcessor& p, int o) : processor (p), osc (o)
+ui::WavetableView::WavetableView (SequencesAudioProcessor& p) : processor (p)
 {
     prev.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x97\x80")));
     next.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x96\xb6")));
@@ -878,7 +892,7 @@ void ui::WavetableView::resized()
 
 void ui::WavetableView::paint (juce::Graphics& g)
 {
-    const auto info = processor.getTableInfo (osc);
+    const auto info = processor.getTableInfo();
     if (name.getButtonText() != info.name)
         name.setButtonText (info.name);
 
@@ -886,14 +900,14 @@ void ui::WavetableView::paint (juce::Graphics& g)
     g.setColour (juce::Colours::white);
     g.fillRoundedRectangle (area, 4.0f);
 
-    const auto* table = processor.getTable (osc);
+    const auto* table = processor.getTable();
     if (table != nullptr && table->numFrames > 0)
     {
         // Pile de frames en perspective, la frame jouée par-dessus
         const auto plot = area.reduced (10.0f, 12.0f).withTrimmedBottom (12.0f);
         const float depthX = plot.getWidth() * 0.22f, depthY = plot.getHeight() * 0.32f;
         const auto front = plot.withTrimmedRight (depthX).withTrimmedTop (depthY);
-        const int level = 4;   // 64 harmoniques suffisent pour dessiner
+        const int level = 4;
         const int shown = juce::jmin (table->numFrames, 28);
 
         auto drawFrame = [&] (double framePos, juce::Point<float> offset, juce::Colour colour, float thickness)
@@ -915,14 +929,12 @@ void ui::WavetableView::paint (juce::Graphics& g)
         for (int k = shown - 1; k >= 0; --k)
         {
             const float t = shown > 1 ? (float) k / (float) (shown - 1) : 0.0f;
-            const double framePos = (double) t * (table->numFrames - 1);
-            drawFrame (framePos, { depthX * t, -depthY * t }, Palette::faint().withAlpha (0.55f), 1.0f);
+            drawFrame ((double) t * (table->numFrames - 1), { depthX * t, -depthY * t }, Palette::faint().withAlpha (0.55f), 1.0f);
         }
 
-        const auto posDest = osc == 0 ? seqs::Dest::aPos : seqs::Dest::bPos;
-        const auto* posParam = processor.apvts.getParameter (SequencesAudioProcessor::paramForDest (posDest));
+        const auto* posParam = processor.apvts.getParameter ("wtPos");
         const float pos = juce::jlimit (0.0f, 1.0f, posParam->getValue()
-                                                   + (processor.getPlayheadBeats() >= 0.0 ? processor.getLiveOffset (posDest) : 0.0f));
+                                                   + (processor.getPlayheadBeats() >= 0.0 ? processor.getLiveOffset (seqs::Dest::wtPos) : 0.0f));
         drawFrame ((double) pos * (table->numFrames - 1), { depthX * pos, -depthY * pos }, Palette::accent(), 2.0f);
 
         g.setColour (Palette::dim());
@@ -971,7 +983,7 @@ void ui::WavetableView::filesDropped (const juce::StringArray& files, int, int)
 
 void ui::WavetableView::load (const juce::File& file)
 {
-    error = processor.loadTableFile (osc, file);
+    error = processor.loadTableFile (file);
     errorTime = juce::Time::getMillisecondCounter();
     if (error.isEmpty())
         lastTableFolder = file.getParentDirectory();
@@ -980,11 +992,11 @@ void ui::WavetableView::load (const juce::File& file)
 
 void ui::WavetableView::step (int delta)
 {
-    const auto info = processor.getTableInfo (osc);
+    const auto info = processor.getTableInfo();
     if (info.builtin >= 0)
     {
         const int n = seqs::BuiltinTables::count();
-        processor.setBuiltinTable (osc, ((info.builtin + delta) % n + n) % n);
+        processor.setBuiltinTable (((info.builtin + delta) % n + n) % n);
         error = {};
     }
     else if (info.file.existsAsFile())
@@ -1002,7 +1014,15 @@ void ui::WavetableView::step (int delta)
     repaint();
 }
 
-void ui::WavetableView::openChooser (const juce::File& folder)
+void ui::WavetableView::openChooser()
+{
+    const auto serum = serumTableFolders();
+    openChooserAt (lastTableFolder.isDirectory() ? lastTableFolder
+                   : ! serum.isEmpty() ? serum[0]
+                   : juce::File::getSpecialLocation (juce::File::userHomeDirectory));
+}
+
+void ui::WavetableView::openChooserAt (const juce::File& folder)
 {
     chooser = std::make_unique<juce::FileChooser> ("Load a wavetable", folder, "*.wav");
     juce::Component::SafePointer<WavetableView> safe (this);
@@ -1016,7 +1036,7 @@ void ui::WavetableView::openChooser (const juce::File& folder)
 
 void ui::WavetableView::showMenu()
 {
-    const auto info = processor.getTableInfo (osc);
+    const auto info = processor.getTableInfo();
     const auto serum = serumTableFolders();
 
     juce::PopupMenu menu;
@@ -1041,22 +1061,245 @@ void ui::WavetableView::showMenu()
                                 return;
                             if (result <= seqs::BuiltinTables::count())
                             {
-                                safe->processor.setBuiltinTable (safe->osc, result - 1);
+                                safe->processor.setBuiltinTable (result - 1);
                                 safe->error = {};
                             }
                             else if (result == 500)
-                            {
-                                auto folder = lastTableFolder.isDirectory() ? lastTableFolder
-                                            : ! serum.isEmpty() ? serum[0]
-                                            : juce::File::getSpecialLocation (juce::File::userHomeDirectory);
-                                safe->openChooser (folder);
-                            }
+                                safe->openChooser();
                             else if (result >= 600 && result < 700)
-                                safe->openChooser (serum[result - 600]);
+                                safe->openChooserAt (serum[result - 600]);
                             else if (result == 700)
                                 info.file.revealToUser();
                             safe->repaint();
                         });
+}
+
+//==============================================================================
+void ui::PdView::paint (juce::Graphics& g)
+{
+    processor.readSettings (settings);
+    const bool live = processor.getPlayheadBeats() >= 0.0;
+    auto norm = [&] (seqs::Dest d) { return juce::jlimit (0.0f, 1.0f, settings.base[(size_t) d] + (live ? processor.getLiveOffset (d) : 0.0f)); };
+    const double amount = norm (seqs::Dest::pdAmount), shape = norm (seqs::Dest::pdShape);
+
+    const auto area = getLocalBounds().toFloat().reduced (0.5f);
+    drawPlotBackground (g, area);
+    juce::Path path;
+    const int n = juce::roundToInt (area.getWidth());
+    for (int i = 0; i <= n; ++i)
+    {
+        const double ph = 2.0 * (double) i / (double) n;      // deux cycles
+        const float v = seqs::PhaseDistortion::read (settings.pdWave, ph - std::floor (ph), amount, shape);
+        const juce::Point<float> pt (area.getX() + (float) i, area.getCentreY() - juce::jlimit (-1.2f, 1.2f, v) * area.getHeight() * 0.42f);
+        if (i == 0) path.startNewSubPath (pt); else path.lineTo (pt);
+    }
+    g.setColour (settings.pdOn ? Palette::accent() : Palette::faint());
+    g.strokePath (path, juce::PathStrokeType (1.6f));
+    g.setColour (Palette::panelLine());
+    g.drawRoundedRectangle (area, 3.0f, 1.0f);
+}
+
+void ui::EnvView::paint (juce::Graphics& g)
+{
+    const float a = paramValue (processor, id + "Attack"), d = paramValue (processor, id + "Decay");
+    const float s = 0.01f * paramValue (processor, id + "Sustain"), r = paramValue (processor, id + "Release");
+    const auto area = getLocalBounds().toFloat().reduced (0.5f);
+    g.setColour (juce::Colours::white);
+    g.fillRoundedRectangle (area, 3.0f);
+
+    // Largeurs à la racine du temps : les segments courts restent visibles
+    const float wa = std::sqrt (a), wd = std::sqrt (d), wr = std::sqrt (r), hold = std::sqrt (300.0f);
+    const auto plot = area.reduced (6.0f, 6.0f);
+    const float scale = plot.getWidth() / (wa + wd + hold + wr);
+    const float x0 = plot.getX(), x1 = x0 + wa * scale, x2 = x1 + wd * scale, x3 = x2 + hold * scale, x4 = x3 + wr * scale;
+    auto y = [&plot] (float v) { return plot.getBottom() - v * plot.getHeight(); };
+
+    juce::Path path;
+    path.startNewSubPath (x0, y (0.0f));
+    path.quadraticTo (x0 + (x1 - x0) * 0.3f, y (0.7f), x1, y (1.0f));
+    path.quadraticTo (x1 + (x2 - x1) * 0.15f, y (s), x2, y (s));
+    path.lineTo (x3, y (s));
+    path.quadraticTo (x3 + (x4 - x3) * 0.15f, y (0.0f), x4, y (0.0f));
+
+    juce::Path fill (path);
+    fill.lineTo (x4, plot.getBottom());
+    fill.lineTo (x0, plot.getBottom());
+    fill.closeSubPath();
+    g.setColour (colour.withAlpha (0.12f));
+    g.fillPath (fill);
+    g.setColour (colour);
+    g.strokePath (path, juce::PathStrokeType (1.6f));
+    g.setColour (Palette::panelLine());
+    g.drawRoundedRectangle (area, 3.0f, 1.0f);
+}
+
+void ui::MainLfoView::paint (juce::Graphics& g)
+{
+    processor.readSettings (settings);
+    const auto area = getLocalBounds().toFloat().reduced (0.5f);
+    drawPlotBackground (g, area);
+    juce::Path path;
+    const int n = juce::roundToInt (area.getWidth());
+    for (int i = 0; i <= n; ++i)
+    {
+        const double cycles = 2.0 * (double) i / (double) n * 0.9999;
+        const float v = seqs::mainLfoValue (settings.mainLfo.shape, cycles, 0x1234ull);
+        const juce::Point<float> pt (area.getX() + (float) i, area.getCentreY() - v * area.getHeight() * 0.4f);
+        if (i == 0) path.startNewSubPath (pt); else path.lineTo (pt);
+    }
+    g.setColour (Palette::modSource (seqs::srcMainLfo));
+    g.strokePath (path, juce::PathStrokeType (1.6f));
+    g.setColour (Palette::panelLine());
+    g.drawRoundedRectangle (area, 3.0f, 1.0f);
+}
+
+//==============================================================================
+ui::FmCell::FmCell (SequencesAudioProcessor& p, int r, int c) : processor (p), row (r), col (c)
+{
+    param = processor.apvts.getParameter (SequencesAudioProcessor::fmId (r, c));
+    setComponentID (SequencesAudioProcessor::fmId (r, c));
+    setTitle ("FM " + juce::String (r) + " to " + juce::String (c));
+    setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+}
+
+float ui::FmCell::getValue() const     { return param != nullptr ? param->getValue() : 0.0f; }
+
+void ui::FmCell::setValue (float v)
+{
+    if (param != nullptr)
+        param->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, v));
+    repaint();
+}
+
+void ui::FmCell::paint (juce::Graphics& g)
+{
+    const auto area = getLocalBounds().toFloat().reduced (1.0f);
+    const float v = getValue();
+    const bool feedback = row == col;
+    g.setColour (juce::Colours::white);
+    g.fillRoundedRectangle (area, 3.0f);
+    if (v > 0.0f)
+    {
+        g.setColour (Palette::accent().withAlpha (0.2f + 0.6f * v));
+        g.fillRoundedRectangle (area.withWidth (juce::jmax (3.0f, area.getWidth() * v)), 3.0f);
+    }
+    g.setColour (isMouseOverOrDragging() ? Palette::ink() : Palette::panelLine());
+    g.drawRoundedRectangle (area, 3.0f, 1.0f);
+    g.setColour (v > 0.0f ? Palette::ink() : Palette::faint());
+    g.setFont (font (11.0f, true, 0.04f));
+    g.drawText (v > 0.0f ? juce::String (juce::roundToInt (v * 100.0f)) + " %" : (feedback ? "FB" : juce::String (juce::CharPointer_UTF8 ("\xc2\xb7"))),
+                area, juce::Justification::centred, false);
+}
+
+void ui::FmCell::mouseDown (const juce::MouseEvent&)
+{
+    startValue = getValue();
+    dragged = false;
+    if (param != nullptr)
+        param->beginChangeGesture();
+}
+
+void ui::FmCell::mouseDrag (const juce::MouseEvent& e)
+{
+    const float pixels = (float) (e.getDistanceFromDragStartX() - e.getDistanceFromDragStartY());
+    dragged = dragged || std::abs (pixels) > 2.0f;
+    setValue (startValue + pixels / (e.mods.isShiftDown() ? 600.0f : 150.0f));
+}
+
+void ui::FmCell::mouseUp (const juce::MouseEvent& e)
+{
+    juce::ignoreUnused (e);
+    if (! dragged)
+        setValue (getValue() > 0.0f ? 0.0f : 1.0f);   // clic : tout ou rien
+    if (param != nullptr)
+        param->endChangeGesture();
+}
+
+void ui::FmCell::mouseDoubleClick (const juce::MouseEvent&)
+{
+    if (param != nullptr)
+    {
+        param->beginChangeGesture();
+        setValue (0.0f);
+        param->endChangeGesture();
+    }
+}
+
+//==============================================================================
+void ui::Scope::paint (juce::Graphics& g)
+{
+    const auto area = getLocalBounds().toFloat().reduced (0.5f);
+    g.setColour (Palette::ink());
+    g.fillRoundedRectangle (area, 3.0f);
+
+    processor.copyScope (data);
+    const auto plot = area.reduced (4.0f, 3.0f).withTrimmedRight (10.0f);
+
+    // Déclenchement sur un passage par zéro montant, pour une image stable
+    const int window = 700;
+    int start = SequencesAudioProcessor::scopeSize - window - 1;
+    for (int i = SequencesAudioProcessor::scopeSize - window - 1; i > 1; --i)
+        if (data[(size_t) i - 1] <= 0.0f && data[(size_t) i] > 0.0f)
+        {
+            start = i;
+            break;
+        }
+
+    float peak = 0.05f;
+    for (int i = start; i < start + window; ++i)
+        peak = juce::jmax (peak, std::abs (data[(size_t) i]));
+
+    juce::Path path;
+    for (int i = 0; i < window; ++i)
+    {
+        const float x = plot.getX() + plot.getWidth() * (float) i / (float) (window - 1);
+        const float y = plot.getCentreY() - data[(size_t) (start + i)] / peak * plot.getHeight() * 0.48f;
+        if (i == 0) path.startNewSubPath (x, y); else path.lineTo (x, y);
+    }
+    g.setColour (Palette::accent());
+    g.strokePath (path, juce::PathStrokeType (1.2f));
+
+    // Crête de sortie (rouge au-delà de 0 dB)
+    const float level = processor.getOutputPeak();
+    const float db = level > 1.0e-5f ? 20.0f * std::log10 (level) : -100.0f;
+    const float h = juce::jlimit (0.0f, 1.0f, (db + 48.0f) / 54.0f);
+    auto meter = area.reduced (3.0f).removeFromRight (5.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.15f));
+    g.fillRect (meter);
+    g.setColour (db > 0.0f ? juce::Colour (0xffff3b30) : juce::Colour (0xff4cd964));
+    g.fillRect (meter.removeFromBottom (meter.getHeight() * h));
+}
+
+//==============================================================================
+void ui::Page::paint (juce::Graphics& g)
+{
+    for (const auto& p : panels)
+    {
+        const auto r = p.bounds.toFloat();
+        g.setColour (Palette::panel());
+        g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (Palette::panelLine());
+        g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (Palette::ink());
+        g.setFont (font (11.0f, true, 0.28f));
+        g.drawText (p.title, p.bounds.withTrimmedLeft (12).withTrimmedTop (8).withHeight (16), juce::Justification::centredLeft, false);
+        if (p.note.isNotEmpty())
+        {
+            g.setColour (Palette::dim());
+            g.setFont (font (9.0f, true, 0.12f));
+            g.drawText (p.note, p.bounds.withTrimmedLeft (12).withTrimmedTop (24).withHeight (12), juce::Justification::centredLeft, false);
+        }
+    }
+
+    g.setFont (font (9.5f, true, 0.16f));
+    g.setColour (Palette::dim());
+    for (const auto& [text, r] : captions)
+        g.drawText (text, r, juce::Justification::centred, false);
+    for (const auto& [text, r] : leftCaptions)
+        g.drawText (text, r, juce::Justification::centredLeft, false);
+    g.setFont (font (10.5f, false, 0.02f));
+    for (const auto& [text, r] : notes)
+        g.drawFittedText (text, r, juce::Justification::topLeft, 12);
 }
 
 //==============================================================================
@@ -1067,106 +1310,48 @@ SequencesFacade::SequencesFacade (SequencesAudioProcessor& p)
     setLookAndFeel (&lookAndFeel);
     setSize (width, height);
 
-    constexpr int margin = 16, gap = 12, pad = 12, titleHeight = 24, cellHeight = 112;
-
-    // --- Rangée 1 : OSC A, OSC B ---
+    // --- Onglets ---
+    const char* tabNames[] = { "MAIN", "SEQ", "MATRIX", "ARP", "FX" };
+    for (int t = 0; t < numTabs; ++t)
     {
-        const int w = (width - 2 * margin - gap) / 2;
-        buildOsc (0, { margin, 56, w, 172 });
-        buildOsc (1, { margin + w + gap, 56, w, 172 });
+        auto& b = tabButtons[(size_t) t];
+        b.setButtonText (tabNames[t]);
+        b.setClickingTogglesState (false);
+        b.setWantsKeyboardFocus (false);
+        b.setTitle (juce::String (tabNames[t]) + " tab");
+        b.setBounds (16 + t * 92, 54, 86, 26);
+        b.onClick = [this, t] { showTab (t); };
+        addAndMakeVisible (b);
+
+        pages[(size_t) t].setBounds (16, 120, width - 32, height - 120 - 12);
+        addChildComponent (pages[(size_t) t]);
     }
 
-    // --- Rangée 2 : VOICE, FILTER, DRIVE, ENV 1, ENV 2 ---
+    scope = std::make_unique<ui::Scope> (audioProcessor);
+    scope->setBounds (width - 16 - 220, 52, 220, 30);
+    addAndMakeVisible (*scope);
+    headerInfo = { scope->getX() - 150, 52, 140, 30 };
+
+    // --- Sources de modulation (toujours visibles) ---
     {
-        // Largeur de chaque colonne : les menus prennent plus de place que les potards
-        constexpr int menuWidth = 74;
-        const std::vector<std::pair<const char*, std::vector<bool>>> layout {
-            { "VOICE",  { true, false, false, false, false, false, false } },
-            { "FILTER", { true, false, false, false } },
-            { "DRIVE",  { true, false } },
-            { "ENV 1",  { false, false, false, false } },
-            { "",       { false, false, false, false } } };
-
-        int knobCells = 0, menuCells = 0;
-        for (auto& l : layout) for (bool isMenu : l.second) (isMenu ? menuCells : knobCells) += 1;
-        const int n = (int) layout.size();
-        const int cell = (width - 2 * margin - n * 2 * pad - (n - 1) * gap - menuCells * menuWidth) / knobCells;
-
-        std::vector<std::vector<juce::Rectangle<int>>> cellsOf;
-        std::vector<juce::Rectangle<int>> r;
-        int x = margin;
-        for (auto& [name, columns] : layout)
-        {
-            int w = 0;
-            for (bool isMenu : columns) w += isMenu ? menuWidth : cell;
-            const juce::Rectangle<int> rect (x, 236, w + 2 * pad, 150);
-            panels.push_back ({ name, rect });
-            r.push_back (rect);
-
-            std::vector<juce::Rectangle<int>> cs;
-            int cx = rect.getX() + pad;
-            for (bool isMenu : columns)
-            {
-                const int cw = isMenu ? menuWidth : cell;
-                cs.push_back ({ cx, rect.getY() + titleHeight + 6, cw, cellHeight });
-                cx += cw;
-            }
-            cellsOf.push_back (cs);
-            x += rect.getWidth() + gap;
-        }
-        // Le dernier panneau prend le reste de la largeur (arrondis de la division)
-        panels.back().bounds.setRight (width - margin);
-        r.back().setRight (width - margin);
-        auto at = [&] (int panel, int i) { return cellsOf[(size_t) panel][(size_t) i]; };
-
-        auto stacked = [&] (juce::Rectangle<int> c, const char* firstLabel, const char* firstId, const char* secondLabel, const char* secondId)
-        {
-            captions.push_back ({ firstLabel, c.withHeight (14) });
-            addInlineChoice (firstId, c.withTrimmedTop (18).withHeight (26).reduced (4, 0));
-            captions.push_back ({ secondLabel, c.withTrimmedTop (56).withHeight (14) });
-            addInlineChoice (secondId, c.withTrimmedTop (74).withHeight (26).reduced (4, 0));
-        };
-
-        captions.push_back ({ "MODE", at (0, 0).withHeight (14) });
-        addInlineChoice ("voiceMode", at (0, 0).withTrimmedTop (34).withHeight (26).reduced (4, 0));
-        addKnob ("glide", "GLIDE", at (0, 1));
-        addKnob ("velocity", "VELO", at (0, 2));
-        addKnob ("pitch", "PITCH", at (0, 3), true);
-        addKnob ("noise", "NOISE", at (0, 4));
-        addKnob ("pan", "PAN", at (0, 5), true);
-        addKnob ("volume", "VOLUME", at (0, 6));
-        addChip (seqs::srcVelocity, "VELO", { r[0].getRight() - 12 - 78, r[0].getY() + 6, 78, 20 });
-
-        stacked (at (1, 0), "TYPE", "filterType", "SLOPE", "filterSlope");
-        addKnob ("cutoff", "CUTOFF", at (1, 1));
-        addKnob ("resonance", "RESO", at (1, 2));
-        addKnob ("keyTrack", "KEY TRK", at (1, 3));
-
-        stacked (at (2, 0), "TYPE", "driveType", "POS", "drivePos");
-        addKnob ("drive", "AMOUNT", at (2, 1));
-
-        addKnob ("ampAttack", "ATK", at (3, 0));
-        addKnob ("ampDecay", "DEC", at (3, 1));
-        addKnob ("ampSustain", "SUS", at (3, 2));
-        addKnob ("ampRelease", "REL", at (3, 3));
-
-        addChip (seqs::srcEnv2, "ENV 2", { r[4].getX() + 10, r[4].getY() + 6, 82, 20 });
-        addKnob ("modAttack", "ATK", at (4, 0));
-        addKnob ("modDecay", "DEC", at (4, 1));
-        addKnob ("modSustain", "SUS", at (4, 2));
-        addKnob ("modRelease", "REL", at (4, 3));
+        const juce::StringArray names { "SEQ", "LFO 1", "LFO 2", "LFO 3", "LFO 4", "LFO 5", "LFO 6", "CH 1", "CH 2",
+                                        "ENV 2", "ENV 3", "VELO", "M.LFO", "WHEEL" };
+        const int x0 = 16 + 128, w = (width - 16 - x0) / seqs::numModSources;
+        for (int s = 0; s < seqs::numModSources; ++s)
+            addChip (s, names[s], { x0 + s * w, 88, w - 6, 24 });
     }
 
-    bankPanel = { margin, 394, width - 2 * margin, 208 };
-    seqPanel = { margin, 610, width - 2 * margin, 282 };
-    buildBank (bankPanel);
-    buildSequencer (seqPanel);
+    buildMain();
+    buildSeq();
+    buildMatrix();
+    buildArp();
+    buildFx();
 
     addAndMakeVisible (presetBar);
     presetBar.setBounds (width - 96 - phragma::PresetBar::idealWidth, 14, phragma::PresetBar::idealWidth, 28);
     presetBar.attachSavePanelTo (*this);
 
-    // Les enfants ont été créés avant d'être posés sur la façade : on leur applique son look
+    showTab (tabMain);
     sendLookAndFeelChange();
     startTimerHz (30);
 }
@@ -1175,6 +1360,16 @@ SequencesFacade::~SequencesFacade()
 {
     stopTimer();
     setLookAndFeel (nullptr);
+}
+
+void SequencesFacade::showTab (int tab)
+{
+    currentTab = juce::jlimit (0, numTabs - 1, tab);
+    for (int t = 0; t < numTabs; ++t)
+    {
+        pages[(size_t) t].setVisible (t == currentTab);
+        tabButtons[(size_t) t].setToggleState (t == currentTab, juce::dontSendNotification);
+    }
 }
 
 ui::ModKnob* SequencesFacade::getModKnob (seqs::Dest d)
@@ -1193,105 +1388,272 @@ ui::SourceChip* SequencesFacade::getChip (int source)
     return nullptr;
 }
 
-void SequencesFacade::buildOsc (int osc, juce::Rectangle<int> area)
+ui::FmCell* SequencesFacade::getFmCell (int row, int col)
 {
-    panels.push_back ({ osc == 0 ? "OSC A" : "OSC B", area });
-
-    addLabelledChoice (SequencesAudioProcessor::oscId (osc, "WarpMode"), "WARP", { area.getRight() - 12 - 186, area.getY() + 6, 186, 22 }, 44);
-
-    tableViews[(size_t) osc] = std::make_unique<ui::WavetableView> (audioProcessor, osc);
-    tableViews[(size_t) osc]->setBounds (area.getX() + 12, area.getY() + 34, 232, area.getHeight() - 44);
-    addAndMakeVisible (*tableViews[(size_t) osc]);
-
-    const int x0 = area.getX() + 12 + 232 + 10;
-    const int cell = (area.getRight() - 12 - x0) / 6;
-    auto at = [&] (int i) { return juce::Rectangle<int> (x0 + i * cell, area.getY() + 40, cell, 120); };
-
-    addKnob (SequencesAudioProcessor::oscId (osc, "Level"), "LEVEL", at (0));
-    addKnob (SequencesAudioProcessor::oscId (osc, "Pos"), "POS", at (1));
-    addKnob (SequencesAudioProcessor::oscId (osc, "Oct"), "OCT", at (2), true);
-    addKnob (SequencesAudioProcessor::oscId (osc, "Coarse"), "COARSE", at (3), true);
-    addKnob (SequencesAudioProcessor::oscId (osc, "Fine"), "FINE", at (4), true);
-    addKnob (SequencesAudioProcessor::oscId (osc, "Warp"), "WARP", at (5));
+    for (auto* c : fmCells)
+        if (c->getComponentID() == SequencesAudioProcessor::fmId (row, col))
+            return c;
+    return nullptr;
 }
 
-void SequencesFacade::buildBank (juce::Rectangle<int> area)
+juce::Component* SequencesFacade::findById (const juce::String& id)
 {
-    const int columns = seqs::numSources;
-    const int colWidth = (area.getWidth() - 24) / columns;
-    const int y0 = area.getY() + 30;
-
-    for (int c = 0; c < columns; ++c)
+    std::function<juce::Component* (juce::Component&)> search = [&] (juce::Component& c) -> juce::Component*
     {
-        const int x = area.getX() + 12 + c * colWidth;
-        const int w = colWidth - 12;
-        const bool isLfo = c < seqs::numLfos;
-        addChip (c + 1, SequencesAudioProcessor::sourceNames()[c + 1], { x, y0 - 2, isLfo ? w - 74 : w, 22 });
-
-        if (isLfo)
+        for (auto* child : c.getChildren())
         {
-            auto preview = std::make_unique<ui::LfoPreview> (audioProcessor, c);
-            preview->setBounds (x + w - 70, y0, 70, 18);
-            addAndMakeVisible (*preview);
-            previews.push_back (std::move (preview));
+            if (child->getComponentID() == id)
+                return child;
+            if (auto* found = search (*child))
+                return found;
+        }
+        return nullptr;
+    };
+    return search (*this);
+}
 
-            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Rate"), "RATE", { x, y0 + 26, w, 22 }, 40);
-            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Shape"), "SHAPE", { x, y0 + 52, w, 22 }, 40);
-            addLabelledChoice (SequencesAudioProcessor::lfoId (c, "Step"), "STEP", { x, y0 + 78, w / 2 + 14, 22 }, 40);
-            addInlineChoice (SequencesAudioProcessor::lfoId (c, "Pol"), { x + w / 2 + 18, y0 + 78, w - w / 2 - 18, 22 });
-            addKnob (SequencesAudioProcessor::lfoId (c, "Amt"), "AMT", { x, y0 + 104, w / 2, 70 }, false, true);
-            addKnob (SequencesAudioProcessor::lfoId (c, "Phase"), "PHASE", { x + w / 2, y0 + 104, w - w / 2, 70 }, false, true);
-        }
-        else
-        {
-            const int k = c - seqs::numLfos;
-            addLabelledChoice (SequencesAudioProcessor::chaosId (k, "Rate"), "RATE", { x, y0 + 26, w, 22 }, 40);
-            addKnob (SequencesAudioProcessor::chaosId (k, "Amt"), "AMT", { x, y0 + 62, w / 2, 112 });
-            addKnob (SequencesAudioProcessor::chaosId (k, "Smooth"), "SMOOTH", { x + w / 2, y0 + 62, w - w / 2, 112 });
-        }
+//==============================================================================
+juce::Rectangle<int> SequencesFacade::panel (ui::Page& page, const juce::String& title, juce::Rectangle<int> bounds, const juce::String& note)
+{
+    page.panels.push_back ({ title, bounds, note });
+    return bounds;
+}
+
+void SequencesFacade::knobRow (ui::Page& page, juce::Rectangle<int> area, std::initializer_list<K> list, bool small)
+{
+    const int n = (int) list.size();
+    int i = 0;
+    for (const auto& k : list)
+    {
+        const int x0 = area.getX() + area.getWidth() * i / n, x1 = area.getX() + area.getWidth() * (i + 1) / n;
+        addKnob (page, k.id, k.label, { x0, area.getY(), x1 - x0, area.getHeight() }, k.bipolar, small);
+        ++i;
     }
 }
 
-void SequencesFacade::buildSequencer (juce::Rectangle<int> area)
+void SequencesFacade::buildMain()
 {
-    const int top = area.getY() + 10, h = 24;
-    addChip (seqs::srcSeq, "SEQ", { area.getX() + 12, top, 92, h });
-    int x = area.getX() + 116;
+    auto& page = pages[tabMain];
+    const int g = 12;
 
-    addToggle ("seqOn", "ON", { x, top, 44, h });                                   x += 44 + 8;
-    addBar ("seqSteps", "STEPS", { x, top, 112, h }, false);                       x += 112 + 8;
-    addLabelledChoice ("seqDiv", "DIV", { x, top, 92, h }, 30);                    x += 92 + 8;
-    addInlineChoice ("seqFeel", { x, top, 94, h });                                x += 94 + 8;
-    addLabelledChoice ("seqSync", "SYNC", { x, top, 106, h }, 36);                 x += 106 + 8;
-    addBar ("seqSwing", "SWING", { x, top, 112, h }, false);                       x += 112 + 8;
-    addToggle ("seqRestart", "RESTART", { x, top, 76, h });                         x += 76 + 8;
-    addBar ("seqXfade", "XFADE", { x, top, 124, h }, false);                        x += 124 + 8;
-    addLabelledChoice ("seqManual", "LFO SWITCH", { x, top, area.getRight() - 12 - x, h }, 76);
+    // --- Rangée 1 : WAVETABLE, PHASE DISTORTION, ALGORITHMIC ---
+    {
+        const auto r = panel (page, "WAVETABLE", { 0, 0, 560, 262 });
+        int x = r.getRight() - 12;
+        auto right = [&x, &r] (int w) { x -= w; const juce::Rectangle<int> b (x, r.getY() + 6, w, 22); x -= 6; return b; };
+        addButton (page, loadButton, "LOAD", "Load a wavetable file", right (52));
+        addToggle (page, "wtRandPhase", "RND", right (44));
+        addInlineChoice (page, "wtWarpMode", right (96));
+        page.leftCaptions.push_back ({ "WARP", right (36) });
+        addToggle (page, "wtOn", "ON", right (40));
 
-    const int gridWidth = ui::StepMatrix::labelWidth + SequencesAudioProcessor::numSteps * 25;
+        tableView = std::make_unique<ui::WavetableView> (audioProcessor);
+        tableView->setBounds (r.getX() + 12, r.getY() + 34, 212, 218);
+        page.addAndMakeVisible (*tableView);
+        loadButton.onClick = [this] { tableView->openChooser(); };
+
+        const juce::Rectangle<int> knobArea (r.getX() + 236, r.getY() + 34, r.getWidth() - 248, 216);
+        knobRow (page, knobArea.withHeight (108), { { "wtPos", "POS" }, { "wtWarp", "WARP" }, { "wtOct", "OCT", true },
+                                                 { "wtSemi", "SEMI", true }, { "wtFine", "FINE", true }, { "wtLevel", "LEVEL" } });
+        knobRow (page, knobArea.withTrimmedTop (110), { { "unison", "UNISON" }, { "wtDetune", "DETUNE" }, { "wtSpread", "SPREAD" },
+                                                     { "wtPan", "PAN", true }, { "wtPhase", "PHASE" } });
+    }
+    {
+        const auto r = panel (page, "PHASE DISTORTION", { 560 + g, 0, 330, 262 });
+        addInlineChoice (page, "pdWave", { r.getRight() - 12 - 108, r.getY() + 6, 108, 22 });
+        addToggle (page, "pdOn", "ON", { r.getRight() - 12 - 108 - 6 - 40, r.getY() + 6, 40, 22 });
+        auto view = std::make_unique<ui::PdView> (audioProcessor);
+        view->setBounds (r.getX() + 12, r.getY() + 34, r.getWidth() - 24, 44);
+        page.addAndMakeVisible (*view);
+        owned.push_back (std::move (view));
+        knobRow (page, { r.getX() + 8, r.getY() + 82, r.getWidth() - 16, 88 },
+                 { { "pdAmount", "PD AMT" }, { "pdShape", "SHAPE" }, { "pdCrush", "CRUSH" }, { "pdFold", "FOLD" } }, true);
+        knobRow (page, { r.getX() + 8, r.getY() + 172, r.getWidth() - 16, 88 },
+                 { { "pdLevel", "LEVEL" }, { "pdOct", "OCT", true }, { "pdSemi", "SEMI", true }, { "pdFine", "FINE", true } }, true);
+    }
+    {
+        const auto r = panel (page, "ALGORITHMIC (PLAITS)", { 560 + 330 + 2 * g, 0, 374, 262 });
+        addToggle (page, "algoLpg", "LPG", { r.getRight() - 12 - 44, r.getY() + 6, 44, 22 });
+        addToggle (page, "algoOn", "ON", { r.getRight() - 12 - 44 - 6 - 40, r.getY() + 6, 40, 22 });
+        addLabelledChoice (page, "algoModel", "MODEL", { r.getX() + 12, r.getY() + 34, r.getWidth() - 24, 22 }, 50);
+        knobRow (page, { r.getX() + 6, r.getY() + 60, r.getWidth() - 12, 100 },
+                 { { "algoHarmonics", "HARM" }, { "algoTimbre", "TIMBRE" }, { "algoMorph", "MORPH" },
+                   { "algoDecay", "DECAY" }, { "algoColour", "COLOUR" }, { "algoAux", "AUX" } });
+        knobRow (page, { r.getX() + 6, r.getY() + 160, r.getWidth() - 12, 100 },
+                 { { "algoOct", "OCT", true }, { "algoSemi", "SEMI", true }, { "algoFine", "FINE", true },
+                   { "algoLevel", "LEVEL" }, { "algoPan", "PAN", true } });
+    }
+
+    // --- Rangée 2 : SUB + NOISE, FM MATRIX, BITE!, FILTER ---
+    const int y2 = 262 + g;
+    {
+        const auto r = panel (page, "SUB + NOISE", { 0, y2, 230, 214 });
+        page.leftCaptions.push_back ({ "SUB", { r.getX() + 12, r.getY() + 44, 80, 14 } });
+        addInlineChoice (page, "subWave", { r.getX() + 12, r.getY() + 62, 84, 22 });
+        knobRow (page, { r.getX() + 102, r.getY() + 30, r.getWidth() - 110, 88 }, { { "subOct", "OCT" }, { "subLevel", "LEVEL" } }, true);
+        page.leftCaptions.push_back ({ "NOISE", { r.getX() + 12, r.getY() + 136, 80, 14 } });
+        addInlineChoice (page, "noiseType", { r.getX() + 12, r.getY() + 154, 84, 22 });
+        knobRow (page, { r.getX() + 102 + (r.getWidth() - 110) / 2, r.getY() + 122, (r.getWidth() - 110) / 2, 88 },
+                 { { "noiseLevel", "LEVEL" } }, true);
+    }
+    {
+        const auto r = panel (page, "FM MATRIX", { 230 + g, y2, 300, 214 }, "ROW MODULATES COLUMN, DIAGONAL = FEEDBACK");
+        const char* rows[] = { "WT", "PD", "NOISE" };
+        const char* cols[] = { "TO WT", "TO PD" };
+        for (int c = 0; c < seqs::numFmCols; ++c)
+            page.captions.push_back ({ cols[c], { r.getX() + 62 + c * 76, r.getY() + 44, 70, 14 } });
+        for (int row = 0; row < seqs::numFmRows; ++row)
+        {
+            page.leftCaptions.push_back ({ rows[row], { r.getX() + 12, r.getY() + 62 + row * 38, 48, 32 } });
+            for (int c = 0; c < seqs::numFmCols; ++c)
+            {
+                auto cell = std::make_unique<ui::FmCell> (audioProcessor, row, c);
+                cell->setBounds (r.getX() + 62 + c * 76, r.getY() + 62 + row * 38, 70, 32);
+                page.addAndMakeVisible (*cell);
+                fmCells.push_back (cell.get());
+                owned.push_back (std::move (cell));
+            }
+        }
+        addKnob (page, "fmDepth", "DEPTH", { r.getRight() - 12 - 70, r.getY() + 40, 70, 104 });
+        addCaptionedChoice (page, "fmMode", "MODE", { r.getRight() - 12 - 74, r.getY() + 150, 74, 44 });
+    }
+    {
+        const auto r = panel (page, "BITE!", { 230 + 300 + 2 * g, y2, 250, 214 });
+        knobRow (page, { r.getX() + 8, r.getY() + 34, r.getWidth() - 16, 112 }, { { "biteFold", "FOLD" }, { "biteCrush", "CRUSH" }, { "biteSoft", "SOFT" } });
+        addToggle (page, "bitePost", "POST FILTER", { r.getX() + 12, r.getY() + 166, 120, 26 });
+        addToggle (page, "biteAsym", "ASYM", { r.getX() + 140, r.getY() + 166, r.getWidth() - 152, 26 });
+    }
+    {
+        const auto r = panel (page, "FILTER", { 230 + 300 + 250 + 3 * g, y2, 1288 - (230 + 300 + 250 + 3 * g), 214 });
+        int x = r.getRight() - 12;
+        auto right = [&x, &r] (int w) { x -= w; const juce::Rectangle<int> b (x, r.getY() + 6, w, 22); x -= 6; return b; };
+        addInlineChoice (page, "filterSlope", right (74));
+        addInlineChoice (page, "filterType", right (74));
+        addInlineChoice (page, "filterModel", right (90));
+        knobRow (page, { r.getX() + 8, r.getY() + 44, r.getWidth() - 16, 140 },
+                 { { "cutoff", "CUTOFF" }, { "resonance", "RESO" }, { "keyTrack", "KEY TRK" }, { "filterDrive", "DRIVE" }, { "filterEnv", "ENV AMT", true } });
+    }
+
+    // --- Rangée 3 : enveloppes, MAIN LFO, VOICE ---
+    const int y3 = y2 + 214 + g, h3 = 770 - y3 - 4;
+    {
+        struct E { const char* title; const char* id; int source; };
+        const E envs[] = { { "AMP ENV", "amp", -1 }, { "FILTER ENV  (ENV 2)", "flt", seqs::srcEnv2 }, { "MOD ENV  (ENV 3)", "mod", seqs::srcEnv3 } };
+        for (int i = 0; i < 3; ++i)
+        {
+            const auto r = panel (page, envs[i].title, { i * (236 + g), y3, 236, h3 });
+            auto view = std::make_unique<ui::EnvView> (audioProcessor, envs[i].id,
+                                                       envs[i].source < 0 ? Palette::ink() : Palette::modSource (envs[i].source));
+            view->setBounds (r.getX() + 12, r.getY() + 34, r.getWidth() - 24, 72);
+            page.addAndMakeVisible (*view);
+            owned.push_back (std::move (view));
+            const juce::String id (envs[i].id);
+            knobRow (page, { r.getX() + 6, r.getY() + 112, r.getWidth() - 12, juce::jmin (110, h3 - 116) },
+                     { { id + "Attack", "ATK" }, { id + "Decay", "DEC" }, { id + "Sustain", "SUS" }, { id + "Release", "REL" } }, true);
+        }
+    }
+    {
+        const auto r = panel (page, "MAIN LFO", { 3 * (236 + g), y3, 300, h3 });
+        addToggle (page, "mlRetrig", "RETRIG", { r.getRight() - 12 - 64, r.getY() + 6, 64, 22 });
+        addToggle (page, "mlSync", "SYNC", { r.getRight() - 12 - 64 - 6 - 54, r.getY() + 6, 54, 22 });
+        auto view = std::make_unique<ui::MainLfoView> (audioProcessor);
+        view->setBounds (r.getX() + 12, r.getY() + 34, r.getWidth() - 24, 46);
+        page.addAndMakeVisible (*view);
+        owned.push_back (std::move (view));
+        addLabelledChoice (page, "mlShape", "SHAPE", { r.getX() + 12, r.getY() + 88, 140, 22 }, 44);
+        addLabelledChoice (page, "mlRate", "RATE", { r.getX() + 160, r.getY() + 88, r.getWidth() - 172, 22 }, 38);
+        mlRateBox = &choices.back()->box;
+        addInlineChoice (page, "mlDest1", { r.getX() + 12, r.getY() + 118, 132, 22 });
+        addBar (page, "mlAmt1", "AMT", { r.getX() + 150, r.getY() + 118, r.getWidth() - 162, 22 }, true);
+        addInlineChoice (page, "mlDest2", { r.getX() + 12, r.getY() + 146, 132, 22 });
+        addBar (page, "mlAmt2", "AMT", { r.getX() + 150, r.getY() + 146, r.getWidth() - 162, 22 }, true);
+        mlHzKnob = &addKnob (page, "mlHz", "FREE RATE", { r.getX() + 12, r.getY() + 172, 90, juce::jmin (84, h3 - 176) }, false, true);
+        page.notes.push_back ({ "DRAG THE MAIN LFO CHIP ONTO ANY KNOB FOR MORE DESTINATIONS.", { r.getX() + 112, r.getY() + 186, r.getWidth() - 124, 60 } });
+    }
+    {
+        const int x = 3 * (236 + g) + 300 + g;
+        const auto r = panel (page, "VOICE", { x, y3, 1288 - x, h3 });
+        addCaptionedChoice (page, "voiceMode", "MODE", { r.getX() + 12, r.getY() + 32, (r.getWidth() - 30) / 2, 44 });
+        addCaptionedChoice (page, "oversampling", "QUALITY", { r.getX() + 18 + (r.getWidth() - 30) / 2, r.getY() + 32, (r.getWidth() - 30) / 2, 44 });
+        knobRow (page, { r.getX() + 6, r.getY() + 84, r.getWidth() - 12, juce::jmin (100, h3 - 88) },
+                 { { "glide", "GLIDE" }, { "bend", "BEND" }, { "velocity", "VELO" }, { "volume", "VOLUME" } }, true);
+    }
+}
+
+void SequencesFacade::buildSeq()
+{
+    auto& page = pages[tabSeq];
+
+    // --- Banque de LFO ---
+    {
+        const auto area = panel (page, "LFO BANK", { 0, 0, 1288, 236 });
+        const int columns = seqs::numSources;
+        const int colWidth = (area.getWidth() - 24) / columns;
+        const int y0 = area.getY() + 34;
+
+        for (int c = 0; c < columns; ++c)
+        {
+            const int x = area.getX() + 12 + c * colWidth;
+            const int w = colWidth - 12;
+            const bool isLfo = c < seqs::numLfos;
+            page.leftCaptions.push_back ({ SequencesAudioProcessor::sourceNames()[c + 1], { x, y0 - 2, 70, 20 } });
+
+            if (isLfo)
+            {
+                auto preview = std::make_unique<ui::LfoPreview> (audioProcessor, c);
+                preview->setBounds (x + w - 80, y0, 80, 18);
+                page.addAndMakeVisible (*preview);
+                previews.push_back (preview.get());
+                owned.push_back (std::move (preview));
+
+                addLabelledChoice (page, SequencesAudioProcessor::lfoId (c, "Rate"), "RATE", { x, y0 + 26, w, 22 }, 40);
+                addLabelledChoice (page, SequencesAudioProcessor::lfoId (c, "Shape"), "SHAPE", { x, y0 + 52, w, 22 }, 40);
+                addLabelledChoice (page, SequencesAudioProcessor::lfoId (c, "Step"), "STEP", { x, y0 + 78, w / 2 + 14, 22 }, 40);
+                addInlineChoice (page, SequencesAudioProcessor::lfoId (c, "Pol"), { x + w / 2 + 18, y0 + 78, w - w / 2 - 18, 22 });
+                addKnob (page, SequencesAudioProcessor::lfoId (c, "Amt"), "AMT", { x, y0 + 106, w / 2, 86 }, false, true);
+                addKnob (page, SequencesAudioProcessor::lfoId (c, "Phase"), "PHASE", { x + w / 2, y0 + 106, w - w / 2, 86 }, false, true);
+            }
+            else
+            {
+                const int k = c - seqs::numLfos;
+                addLabelledChoice (page, SequencesAudioProcessor::chaosId (k, "Rate"), "RATE", { x, y0 + 26, w, 22 }, 40);
+                addKnob (page, SequencesAudioProcessor::chaosId (k, "Amt"), "AMT", { x, y0 + 62, w / 2, 120 });
+                addKnob (page, SequencesAudioProcessor::chaosId (k, "Smooth"), "SMOOTH", { x + w / 2, y0 + 62, w - w / 2, 120 });
+            }
+        }
+    }
+
+    // --- Séquenceur ---
+    const auto area = panel (page, "SEQUENCER", { 0, 248, 1288, 770 - 248 - 4 }, "EACH STEP PICKS WHICH LFO THE SEQ CHIP OUTPUTS");
+    const int top = area.getY() + 40, h = 24;
+    int x = area.getX() + 12;
+    addToggle (page, "seqOn", "ON", { x, top, 44, h });                                   x += 44 + 8;
+    addBar (page, "seqSteps", "STEPS", { x, top, 112, h }, false);                       x += 112 + 8;
+    addLabelledChoice (page, "seqDiv", "DIV", { x, top, 92, h }, 30);                    x += 92 + 8;
+    addInlineChoice (page, "seqFeel", { x, top, 94, h });                                x += 94 + 8;
+    addLabelledChoice (page, "seqSync", "SYNC", { x, top, 106, h }, 36);                 x += 106 + 8;
+    addBar (page, "seqSwing", "SWING", { x, top, 112, h }, false);                       x += 112 + 8;
+    addToggle (page, "seqRestart", "RESTART", { x, top, 76, h });                         x += 76 + 8;
+    addBar (page, "seqXfade", "XFADE", { x, top, 124, h }, false);                        x += 124 + 8;
+    addLabelledChoice (page, "seqManual", "WHEN OFF", { x, top, area.getRight() - 12 - x, h }, 66);
+
+    const int gridWidth = ui::StepMatrix::labelWidth + SequencesAudioProcessor::numSteps * 26;
     matrix = std::make_unique<ui::StepMatrix> (audioProcessor);
-    matrix->setBounds (area.getX() + 12, area.getY() + 44, gridWidth, ui::StepMatrix::numRows * 14);
-    addAndMakeVisible (*matrix);
+    matrix->setBounds (area.getX() + 12, top + 36, gridWidth, ui::StepMatrix::numRows * 22);
+    page.addAndMakeVisible (*matrix);
 
     circuit = std::make_unique<ui::CircuitView> (audioProcessor);
-    circuit->setBounds (area.getX() + 12, matrix->getBottom() + 8, gridWidth, area.getBottom() - 10 - (matrix->getBottom() + 8));
-    addAndMakeVisible (*circuit);
+    circuit->setBounds (area.getX() + 12, matrix->getBottom() + 10, gridWidth, area.getBottom() - 12 - (matrix->getBottom() + 10));
+    page.addAndMakeVisible (*circuit);
 
     const int rx = matrix->getRight() + 16, rw = area.getRight() - 12 - rx;
-    int bx = area.getRight() - 12;
-    auto placeRight = [&] (juce::TextButton& b, const juce::String& text, const juce::String& title, int w)
-    {
-        bx -= w;
-        addButton (b, text, title, { bx, area.getY() + 44, w, 24 });
-        bx -= 6;
-    };
     randomAllButton.setComponentID ("random");
     randomButton.setComponentID ("random");
-    placeRight (randomAllButton, "RANDOM ALL", "Random LFO bank and pattern", 100);
-    placeRight (randomButton, "RANDOM", "Random pattern", 84);
-    placeRight (clearButton, "CLEAR", "Clear pattern", 58);
-    placeRight (rightButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x96\xb6")), "Shift right", 28);
-    placeRight (leftButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x97\x80")), "Shift left", 28);
+    addButton (page, randomButton, "RANDOM", "Random pattern", { rx, top + 36, (rw - 6) / 2, 30 });
+    addButton (page, randomAllButton, "RANDOM ALL", "Random LFO bank and pattern", { rx + (rw - 6) / 2 + 6, top + 36, rw - (rw - 6) / 2 - 6, 30 });
+    addButton (page, leftButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x97\x80")), "Shift left", { rx, top + 72, 40, 24 });
+    addButton (page, rightButton, juce::String (juce::CharPointer_UTF8 ("\xe2\x96\xb6")), "Shift right", { rx + 46, top + 72, 40, 24 });
+    addButton (page, clearButton, "CLEAR", "Clear pattern", { rx + 92, top + 72, rw - 92, 24 });
 
     randomButton.onClick = [this] { audioProcessor.randomizePattern(); repaint(); };
     randomAllButton.onClick = [this] { audioProcessor.randomizeAll(); repaint(); };
@@ -1299,18 +1661,97 @@ void SequencesFacade::buildSequencer (juce::Rectangle<int> area)
     leftButton.onClick = [this] { audioProcessor.rotatePattern (-1); repaint(); };
     rightButton.onClick = [this] { audioProcessor.rotatePattern (+1); repaint(); };
 
-    // Liste des modulations
-    modListArea = { rx, area.getY() + 78, rw, area.getBottom() - 10 - (area.getY() + 78) };
+    seqModListArea = { rx, top + 108, rw, area.getBottom() - 12 - (top + 108) };
+    page.leftCaptions.push_back ({ "MODULATIONS", seqModListArea.withHeight (14) });
+    seqModList = std::make_unique<ui::ModList> (audioProcessor);
+    seqModViewport.setViewedComponent (seqModList.get(), false);
+    seqModViewport.setScrollBarsShown (true, false);
+    seqModViewport.setScrollBarThickness (6);
+    seqModViewport.setBounds (seqModListArea.withTrimmedTop (18));
+    seqModList->setBounds (0, 0, seqModViewport.getMaximumVisibleWidth(), seqModList->idealHeight());
+    page.addAndMakeVisible (seqModViewport);
+}
+
+void SequencesFacade::buildMatrix()
+{
+    auto& page = pages[tabMatrix];
+    const auto area = panel (page, "MODULATION MATRIX", { 0, 0, 1288, 766 },
+                             "DRAG A SOURCE CHIP ONTO A KNOB, OR ADD A ROUTING HERE. CLICK A NAME TO CHANGE IT, DRAG THE BAR FOR DEPTH.");
+    addButton (page, addModButton, "+ ADD ROUTING", "Add a modulation routing", { area.getRight() - 12 - 140, area.getY() + 8, 140, 24 });
+    addModButton.onClick = [this]
+    {
+        juce::PopupMenu menu;
+        menu.setLookAndFeel (&lookAndFeel);
+        const auto& sources = SequencesAudioProcessor::modSourceNames();
+        const auto& dests = SequencesAudioProcessor::destinationNames();
+        for (int s = 0; s < sources.size(); ++s)
+        {
+            juce::PopupMenu sub;
+            for (int d = 1; d < dests.size(); ++d)
+                sub.addItem (1 + s * 100 + d, dests[d]);
+            menu.addSubMenu (sources[s], sub);
+        }
+        juce::Component::SafePointer<SequencesFacade> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&addModButton), [safe] (int result)
+        {
+            if (safe == nullptr || result <= 0)
+                return;
+            safe->audioProcessor.addModulation ((result - 1) / 100, (seqs::Dest) ((result - 1) % 100));
+        });
+    };
+
+    modListArea = area.withTrimmedTop (48).reduced (12, 0).withTrimmedBottom (12);
     modList = std::make_unique<ui::ModList> (audioProcessor);
     modViewport.setViewedComponent (modList.get(), false);
     modViewport.setScrollBarsShown (true, false);
     modViewport.setScrollBarThickness (6);
-    modViewport.setBounds (modListArea.withTrimmedTop (18));
+    modViewport.setBounds (modListArea);
     modList->setBounds (0, 0, modViewport.getMaximumVisibleWidth(), modList->idealHeight());
-    addAndMakeVisible (modViewport);
+    page.addAndMakeVisible (modViewport);
 }
 
-juce::Slider& SequencesFacade::addKnob (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar, bool small)
+void SequencesFacade::buildArp()
+{
+    auto& page = pages[tabArp];
+    const auto r = panel (page, "ARPEGGIATOR", { 0, 0, 760, 250 }, "PLAYS THE HELD NOTES ONE BY ONE, LOCKED TO THE TEMPO");
+    addToggle (page, "arpLatch", "LATCH", { r.getRight() - 12 - 64, r.getY() + 8, 64, 24 });
+    addToggle (page, "arpOn", "ON", { r.getRight() - 12 - 64 - 6 - 48, r.getY() + 8, 48, 24 });
+    addCaptionedChoice (page, "arpMode", "MODE", { r.getX() + 12, r.getY() + 60, 130, 44 });
+    addCaptionedChoice (page, "arpRate", "RATE", { r.getX() + 150, r.getY() + 60, 100, 44 });
+    knobRow (page, { r.getX() + 270, r.getY() + 44, r.getWidth() - 282, 130 },
+             { { "arpOct", "OCTAVES" }, { "arpGate", "GATE" }, { "arpSwing", "SWING" } });
+    page.notes.push_back ({ "MODES : UP, DOWN, UP/DOWN, DOWN/UP, RANDOM, AS PLAYED (in the order the keys were pressed), CHORD (all notes each step). "
+                            "LATCH keeps the chord after you let go ; a new chord replaces it. "
+                            "When the host plays, steps line up with the song position.",
+                            { r.getX() + 12, r.getY() + 186, r.getWidth() - 24, 56 } });
+}
+
+void SequencesFacade::buildFx()
+{
+    auto& page = pages[tabFx];
+    {
+        const auto r = panel (page, "CHORUS", { 0, 0, 300, 250 });
+        addToggle (page, "chorusOn", "ON", { r.getRight() - 12 - 48, r.getY() + 8, 48, 24 });
+        knobRow (page, { r.getX() + 8, r.getY() + 50, r.getWidth() - 16, 140 }, { { "chorusRate", "RATE" }, { "chorusDepth", "DEPTH" }, { "chorusMix", "MIX" } });
+    }
+    {
+        const auto r = panel (page, "DELAY", { 312, 0, 480, 250 }, "SYNCED TO THE TEMPO");
+        addToggle (page, "delayPingPong", "PING-PONG", { r.getRight() - 12 - 96, r.getY() + 8, 96, 24 });
+        addToggle (page, "delayOn", "ON", { r.getRight() - 12 - 96 - 6 - 48, r.getY() + 8, 48, 24 });
+        addCaptionedChoice (page, "delayTime", "TIME", { r.getX() + 12, r.getY() + 70, 90, 44 });
+        knobRow (page, { r.getX() + 110, r.getY() + 50, r.getWidth() - 122, 140 }, { { "delayFeedback", "FEEDBACK" }, { "delayTone", "TONE" }, { "delayMix", "MIX" } });
+    }
+    {
+        const auto r = panel (page, "REVERB", { 804, 0, 484, 250 });
+        addToggle (page, "reverbOn", "ON", { r.getRight() - 12 - 48, r.getY() + 8, 48, 24 });
+        knobRow (page, { r.getX() + 8, r.getY() + 50, r.getWidth() - 16, 140 },
+                 { { "reverbSize", "SIZE" }, { "reverbDecay", "DECAY" }, { "reverbDamping", "DAMP" }, { "reverbPredelay", "PRE" }, { "reverbMix", "MIX" } });
+    }
+    page.notes.push_back ({ "CHAIN : SYNTH -> CHORUS -> DELAY -> REVERB -> OUT", { 12, 266, 600, 20 } });
+}
+
+//==============================================================================
+juce::Slider& SequencesFacade::addKnob (ui::Page& page, const juce::String& id, const juce::String& label, juce::Rectangle<int> cell, bool bipolar, bool small)
 {
     auto k = std::make_unique<Knob>();
     const auto dest = SequencesAudioProcessor::destForParam (id);
@@ -1324,7 +1765,7 @@ juce::Slider& SequencesFacade::addKnob (const juce::String& id, const juce::Stri
         k->slider = std::make_unique<juce::Slider>();
 
     auto& s = *k->slider;
-    const int captionHeight = small ? 12 : 16;
+    const int captionHeight = small ? 13 : 16;
     s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
     s.setRotaryParameters (juce::degreesToRadians (225.0f), juce::degreesToRadians (495.0f), true);
     s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, cell.getWidth(), small ? 14 : 18);
@@ -1334,18 +1775,18 @@ juce::Slider& SequencesFacade::addKnob (const juce::String& id, const juce::Stri
     s.setTitle (label);
     s.setComponentID (id);
     s.setBounds (cell.withTrimmedTop (captionHeight));
-    addAndMakeVisible (s);
+    page.addAndMakeVisible (s);
     k->attachment = std::make_unique<SliderAttachment> (audioProcessor.apvts, id, s);
 
     if (auto* param = audioProcessor.apvts.getParameter (id))
         s.setDoubleClickReturnValue (true, param->convertFrom0to1 (param->getDefaultValue()));
 
-    captions.push_back ({ label, cell.withHeight (captionHeight - 2) });
+    page.captions.push_back ({ label, cell.withHeight (captionHeight - 2) });
     knobs.push_back (std::move (k));
     return *knobs.back()->slider;
 }
 
-void SequencesFacade::addBar (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar)
+void SequencesFacade::addBar (ui::Page& page, const juce::String& id, const juce::String& label, juce::Rectangle<int> area, bool bipolar)
 {
     auto k = std::make_unique<Knob>();
     k->slider = std::make_unique<juce::Slider>();
@@ -1358,7 +1799,7 @@ void SequencesFacade::addBar (const juce::String& id, const juce::String& label,
     s.setTitle (label);
     s.setComponentID (id);
     s.setBounds (area);
-    addAndMakeVisible (s);
+    page.addAndMakeVisible (s);
     k->attachment = std::make_unique<SliderAttachment> (audioProcessor.apvts, id, s);
 
     if (auto* param = audioProcessor.apvts.getParameter (id))
@@ -1375,7 +1816,7 @@ ui::SourceChip& SequencesFacade::addChip (int source, const juce::String& text, 
     return *chips.back();
 }
 
-juce::ComboBox& SequencesFacade::addInlineChoice (const juce::String& id, juce::Rectangle<int> area)
+juce::ComboBox& SequencesFacade::addInlineChoice (ui::Page& page, const juce::String& id, juce::Rectangle<int> area)
 {
     auto c = std::make_unique<Choice>();
     if (auto* param = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (id)))
@@ -1383,25 +1824,25 @@ juce::ComboBox& SequencesFacade::addInlineChoice (const juce::String& id, juce::
     c->box.setTitle (id);
     c->box.setComponentID (id);
     c->box.setBounds (area);
-    addAndMakeVisible (c->box);
+    page.addAndMakeVisible (c->box);
     c->attachment = std::make_unique<ComboAttachment> (audioProcessor.apvts, id, c->box);
     choices.push_back (std::move (c));
     return choices.back()->box;
 }
 
-void SequencesFacade::addChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> cell)
+void SequencesFacade::addCaptionedChoice (ui::Page& page, const juce::String& id, const juce::String& label, juce::Rectangle<int> area)
 {
-    captions.push_back ({ label, cell.withHeight (14) });
-    addInlineChoice (id, cell.withTrimmedTop (34).withHeight (26).reduced (2, 0));
+    page.captions.push_back ({ label, area.withHeight (14) });
+    addInlineChoice (page, id, area.withTrimmedTop (18).withHeight (24));
 }
 
-void SequencesFacade::addLabelledChoice (const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth)
+void SequencesFacade::addLabelledChoice (ui::Page& page, const juce::String& id, const juce::String& label, juce::Rectangle<int> area, int labelWidth)
 {
-    leftCaptions.push_back ({ label, area.withWidth (labelWidth) });
-    addInlineChoice (id, area.withTrimmedLeft (labelWidth));
+    page.leftCaptions.push_back ({ label, area.withWidth (labelWidth) });
+    addInlineChoice (page, id, area.withTrimmedLeft (labelWidth));
 }
 
-void SequencesFacade::addToggle (const juce::String& id, const juce::String& text, juce::Rectangle<int> area)
+juce::TextButton& SequencesFacade::addToggle (ui::Page& page, const juce::String& id, const juce::String& text, juce::Rectangle<int> area)
 {
     auto t = std::make_unique<Toggle>();
     t->button.setButtonText (text);
@@ -1410,18 +1851,19 @@ void SequencesFacade::addToggle (const juce::String& id, const juce::String& tex
     t->button.setComponentID (id);
     t->button.setWantsKeyboardFocus (false);
     t->button.setBounds (area);
-    addAndMakeVisible (t->button);
+    page.addAndMakeVisible (t->button);
     t->attachment = std::make_unique<ButtonAttachment> (audioProcessor.apvts, id, t->button);
     toggles.push_back (std::move (t));
+    return toggles.back()->button;
 }
 
-void SequencesFacade::addButton (juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area)
+void SequencesFacade::addButton (juce::Component& parent, juce::TextButton& b, const juce::String& text, const juce::String& title, juce::Rectangle<int> area)
 {
     b.setButtonText (text);
     b.setTitle (title);
     b.setWantsKeyboardFocus (false);
     b.setBounds (area);
-    addAndMakeVisible (b);
+    parent.addAndMakeVisible (b);
 }
 
 void SequencesFacade::timerCallback()
@@ -1429,20 +1871,46 @@ void SequencesFacade::timerCallback()
     ++tick;
     const bool playing = audioProcessor.getPlayheadBeats() >= 0.0;
 
-    const int step = audioProcessor.getPlayheadStep();
-    if (step != shownStep || matrix->isMouseButtonDown())
+    scope->repaint();
+    const int voices = audioProcessor.getActiveVoices();
+    if (voices != shownVoices)
     {
-        shownStep = step;
-        matrix->repaint();
+        shownVoices = voices;
+        repaint (headerInfo);
     }
 
-    if (playing || tick % 6 == 0)
+    // RATE (synchro) ou FREE RATE (Hz) : celui qui ne sert pas est grisé
+    const bool sync = audioProcessor.apvts.getRawParameterValue ("mlSync")->load() > 0.5f;
+    if (mlHzKnob != nullptr) mlHzKnob->setAlpha (sync ? 0.35f : 1.0f);
+    if (mlRateBox != nullptr) mlRateBox->setAlpha (sync ? 1.0f : 0.35f);
+
+    if (currentTab == tabMain && (playing || tick % 6 == 0))
     {
-        circuit->repaint();
         for (auto* k : modKnobs)
-            k->repaint();
-        for (auto& t : tableViews)
-            t->repaint();
+            if (k->isShowing())
+                k->repaint();
+        tableView->repaint();
+        for (auto& o : owned)
+            if (o->isShowing())
+                o->repaint();
+    }
+
+    if (currentTab == tabSeq)
+    {
+        const int step = audioProcessor.getPlayheadStep();
+        if (step != shownStep || matrix->isMouseButtonDown())
+        {
+            shownStep = step;
+            matrix->repaint();
+        }
+        if (playing || tick % 6 == 0)
+            circuit->repaint();
+        if (tick % 6 == 0)
+            for (auto* p : previews)
+                p->repaint();
+        for (auto* k : modKnobs)
+            if (k->isShowing() && (playing || tick % 6 == 0))
+                k->repaint();
     }
 
     if (tick % 3 == 0)
@@ -1452,14 +1920,12 @@ void SequencesFacade::timerCallback()
         {
             shownRows = rows;
             modList->setBounds (0, 0, modViewport.getMaximumVisibleWidth(), modList->idealHeight());
-            repaint (modListArea);
+            seqModList->setBounds (0, 0, seqModViewport.getMaximumVisibleWidth(), seqModList->idealHeight());
+            repaint();
         }
-        modList->repaint();
+        if (currentTab == tabMatrix) modList->repaint();
+        if (currentTab == tabSeq)    seqModList->repaint();
     }
-
-    if (tick % 6 == 0)
-        for (auto& p : previews)
-            p->repaint();
 }
 
 void SequencesFacade::paint (juce::Graphics& g)
@@ -1475,45 +1941,14 @@ void SequencesFacade::paint (juce::Graphics& g)
     g.drawText ("BY PHRAGMA", juce::Rectangle<int> (232, 10, 140, 36), juce::Justification::centredLeft, false);
     g.drawText ("V" SEQUENCES_VERSION, juce::Rectangle<int> (width - 86, 10, 70, 36), juce::Justification::centredRight, false);
 
-    auto drawPanel = [&g] (juce::Rectangle<int> r, const juce::String& title)
-    {
-        g.setColour (Palette::panel());
-        g.fillRoundedRectangle (r.toFloat(), 6.0f);
-        g.setColour (Palette::panelLine());
-        g.drawRoundedRectangle (r.toFloat().reduced (0.5f), 6.0f, 1.0f);
-        g.setColour (Palette::ink());
-        g.setFont (ui::font (11.0f, true, 0.28f));
-        g.drawText (title, r.withTrimmedLeft (12).withTrimmedTop (8).withHeight (16), juce::Justification::centredLeft, false);
-    };
+    g.setFont (ui::font (10.0f, true, 0.16f));
+    g.drawText ("VOICES " + juce::String (juce::jmax (0, shownVoices)) + " / " + juce::String (seqs::maxVoices)
+                    + "    MOD " + juce::String (audioProcessor.usedSlotCount()) + " / " + juce::String (seqs::numSlots),
+                headerInfo, juce::Justification::centredRight, false);
 
-    for (const auto& p : panels)
-        drawPanel (p.bounds, p.title);
-    drawPanel (bankPanel, "LFO BANK");
-    drawPanel (seqPanel, "");
-
-    g.setColour (Palette::dim());
-    g.setFont (ui::font (9.5f, true, 0.16f));
-    g.drawText ("DRAG A SOURCE ONTO A KNOB TO MODULATE IT", bankPanel.withTrimmedRight (14).withTrimmedTop (8).withHeight (16),
-                juce::Justification::centredRight, false);
-
-    // Séparateurs de colonnes de la banque
-    g.setColour (Palette::panelLine());
-    const int colWidth = (bankPanel.getWidth() - 24) / seqs::numSources;
-    for (int c = 1; c < seqs::numSources; ++c)
-        g.fillRect (bankPanel.getX() + 12 + c * colWidth - 6, bankPanel.getY() + 30, 1, bankPanel.getHeight() - 40);
-
-    // En-tête de la liste des modulations
     g.setColour (Palette::ink());
-    g.setFont (ui::font (10.0f, true, 0.22f));
-    g.drawText ("MODULATION  " + juce::String (audioProcessor.usedSlotCount()) + " / " + juce::String (seqs::numSlots),
-                modListArea.withHeight (14), juce::Justification::centredLeft, false);
-
     g.setFont (ui::font (9.5f, true, 0.16f));
-    g.setColour (Palette::dim());
-    for (const auto& [text, r] : captions)
-        g.drawText (text, r, juce::Justification::centred, false);
-    for (const auto& [text, r] : leftCaptions)
-        g.drawText (text, r, juce::Justification::centredLeft, false);
+    g.drawText ("DRAG TO MODULATE", juce::Rectangle<int> (16, 88, 124, 24), juce::Justification::centredLeft, false);
 }
 
 //==============================================================================
@@ -1523,7 +1958,7 @@ SequencesAudioProcessorEditor::SequencesAudioProcessorEditor (SequencesAudioProc
     addAndMakeVisible (facade);
 
     // Taille gardée avec le projet (lue avant de régler les limites : les régler redimensionne déjà la fenêtre).
-    const int savedWidth = (int) audioProcessor.apvts.state.getProperty ("editorWidth", SequencesFacade::width);
+    const int savedWidth = (int) audioProcessor.apvts.state.getProperty ("editorWidth", juce::roundToInt (SequencesFacade::width * 0.9));
 
     setResizable (true, true);
     setResizeLimits (juce::roundToInt (SequencesFacade::width * 0.6), juce::roundToInt (SequencesFacade::height * 0.6),

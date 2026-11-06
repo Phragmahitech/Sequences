@@ -375,7 +375,7 @@ struct BuiltinTables
 {
     static const std::vector<std::string>& names()
     {
-        static const std::vector<std::string> n { "BASIC SHAPES", "PWM", "RESO SAW", "RESO TRI", "RESO TRAP",
+        static const std::vector<std::string> n { "CLASSIC", "BASIC SHAPES", "PWM", "RESO SAW", "RESO TRI", "RESO TRAP",
                                                   "SAW-PULSE", "HARMONICS", "DBL SINE", "SINE" };
         return n;
     }
@@ -426,34 +426,51 @@ struct BuiltinTables
 
         switch (index)
         {
-            case 0:   // sinus -> triangle -> scie -> carré
+            case 0:   // CLASSIC : sinus -> triangle -> scie -> carré -> impulsion, en fondu continu (64 frames)
+                make (64, [&] (double p, double x)
+                {
+                    const double pos = x * 4.0;
+                    const int k = std::min (3, (int) pos);
+                    const double t = pos - k;
+                    auto shape = [&] (int s, double ph)
+                    {
+                        if (s == 0) return sine (ph);
+                        if (s == 1) return tri (ph);
+                        if (s == 2) return saw (ph);
+                        if (s == 3) return square (ph);
+                        return ph < 0.12 ? 1.0 : -1.0;
+                    };
+                    return shape (k, p) * (1.0 - t) + shape (k + 1, p) * t;
+                });
+                break;
+            case 1:   // sinus -> triangle -> scie -> carré
                 make (4, [&] (double p, double x)
                 {
                     const int k = (int) std::lround (x * 3.0);
                     return k == 0 ? sine (p) : k == 1 ? tri (p) : k == 2 ? saw (p) : square (p);
                 });
                 break;
-            case 1:   // largeur d'impulsion 50 % -> 2 %
+            case 2:   // largeur d'impulsion 50 % -> 2 %
                 make (32, [] (double p, double x) { return p < 0.5 - 0.48 * x ? 1.0 : -1.0; });
                 break;
-            case 2: case 3: case 4:   // résonance façon Casio CZ, la position déplace la résonance
+            case 3: case 4: case 5:   // résonance façon Casio CZ, la position déplace la résonance
                 make (64, [index, tp] (double p, double x)
                 {
                     const double r = 1.0 + 15.0 * x;
                     double window = 1.0 - p;
-                    if (index == 3) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;
-                    if (index == 4) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;
+                    if (index == 4) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;
+                    if (index == 5) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;
                     return std::cos (tp * r * p) * window;
                 });
                 break;
-            case 5:   // scie-impulsion, la position ouvre la partie scie
+            case 6:   // scie-impulsion, la position ouvre la partie scie
                 make (32, [] (double p, double x)
                 {
                     const double w = 0.1 + 0.8 * x;
                     return p < w ? 2.0 * p / w - 1.0 : -1.0;
                 });
                 break;
-            case 6:   // additif : on ajoute les harmoniques une à une
+            case 7:   // additif : on ajoute les harmoniques une à une
                 make (32, [tp] (double p, double x)
                 {
                     const int count = 1 + (int) std::lround (x * 31.0);
@@ -463,10 +480,10 @@ struct BuiltinTables
                     return v;
                 });
                 break;
-            case 7:   // double sinus, la position monte le second
+            case 8:   // double sinus, la position monte le second
                 make (16, [tp] (double p, double x) { return std::sin (tp * p) + x * std::sin (2.0 * tp * p); });
                 break;
-            case 8:
+            case 9:
             default:
                 make (1, [&] (double p, double) { return sine (p); });
                 break;

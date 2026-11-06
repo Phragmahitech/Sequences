@@ -69,6 +69,24 @@ static void renderTo (SequencesAudioProcessor& p, const juce::File& file, double
     std::printf ("%s : crête %.3f\n", file.getFileName().toRawUTF8(), out.getMagnitude (0, total));
 }
 
+static void snapshot (SequencesAudioProcessor& p, const juce::File& file, int tab)
+{
+    std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+    if (auto* e = dynamic_cast<SequencesAudioProcessorEditor*> (editor.get()))
+    {
+        e->setUiScale (1.0f);
+        e->getFacade().showTab (tab);
+    }
+    juce::Image image (juce::Image::ARGB, editor->getWidth(), editor->getHeight(), true);
+    juce::Graphics g (image);
+    editor->paintEntireComponent (g, false);
+    juce::PNGImageFormat png;
+    file.deleteFile();
+    if (auto stream = file.createOutputStream())
+        png.writeImageToStream (image, *stream);
+    std::printf ("%s\n", file.getFileName().toRawUTF8());
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI gui;
@@ -76,82 +94,62 @@ int main (int argc, char** argv)
     const juce::File serumTable (argc > 2 ? juce::String (argv[2]) : juce::String());
     dir.createDirectory();
 
-    // 1. Réglages par défaut, une note tenue (A sinus en FM depuis B, ENV 2 + SEQ sur la coupure et le warp)
+    // Basse psytrance : 3 doubles-croches sur 4 (la grosse caisse prend la première), 4 mesures
+    std::vector<Note> roll;
+    for (int beat = 0; beat < 16; ++beat)
+        for (int k = 1; k < 4; ++k)
+            roll.push_back ({ beat >= 12 ? 43 : 45, beat + k * 0.25, 0.2 });
+    const std::vector<Note> held { { 45, 0.0, 15.0 } };
+    const std::vector<Note> chord { { 57, 0.0, 14.0 }, { 60, 0.0, 14.0 }, { 64, 0.0, 14.0 } };
+
+    // Chaque preset d'usine
+    for (int i = 0; i < SequencesAudioProcessor::numFactoryPresets(); ++i)
     {
         SequencesAudioProcessor p;
-        renderTo (p, dir.getChildFile ("01-default.wav"), 16.0, { { 45, 0.0, 15.0 } });
+        p.presets.loadFactory (i);
+        const auto name = SequencesAudioProcessor::factoryPresetName (i);
+        const bool poly = p.apvts.getRawParameterValue ("voiceMode")->load() < 0.5f;
+        const auto& notes = name.contains ("SAW") || name.contains ("PLUCK") ? chord : name.contains ("SUB") || name.contains ("ACID") || name.contains ("ZAP") || name.contains ("GROWL") ? roll : held;
+        renderTo (p, dir.getChildFile (juce::String (i + 1).paddedLeft ('0', 2) + "-" + name.replace (" ", "-").toLowerCase() + ".wav"), 16.0,
+                  poly || &notes != &chord ? notes : held);
     }
 
-    // 2. Mono, RANDOM ALL, SEQ -> COARSE A (+12) : séquence hi-tech
+    // Arpégiateur + Plaits : accord tenu
     {
         SequencesAudioProcessor p;
-        p.setRandomSeed (2026);
-        set (p, "voiceMode", 0.0f);
-        set (p, "drive", 30.0f);
-        set (p, "seqDiv", 4.0f);
-        p.randomizeAll();
-        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aCoarse), 12.0f / 96.0f);
-        renderTo (p, dir.getChildFile ("02-mono-random-all.wav"), 16.0, { { 45, 0.0, 8.0 }, { 47, 7.9, 8.0 } });
+        p.presets.loadFactory (3);
+        set (p, "arpOn", 1.0f);
+        set (p, "arpMode", 2.0f);
+        set (p, "arpOct", 2.0f);
+        renderTo (p, dir.getChildFile ("20-arp-plaits.wav"), 16.0, chord);
     }
 
-    // 3. Table Serum importée, SEQ -> POS A
+    // Table Serum importée, SEQ -> POS
     if (serumTable.existsAsFile())
     {
         SequencesAudioProcessor p;
-        std::printf ("import : %s\n", p.loadTableFile (0, serumTable).toRawUTF8());
-        set (p, "aWarpMode", 0.0f);
-        set (p, "cutoff", 6000.0f);
-        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aPos), 0.6f);
-        renderTo (p, dir.getChildFile ("03-serum-table.wav"), 16.0, { { 45, 0.0, 15.0 } });
+        std::printf ("import : %s\n", p.loadTableFile (serumTable).toRawUTF8());
+        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::wtPos), 0.6f);
+        renderTo (p, dir.getChildFile ("21-serum-table.wav"), 16.0, held);
     }
 
-    // 4. FM depuis B, LFO 6 (scie lente) sur le WARP A, B COARSE glissé par LFO 4
+    // Captures de l'interface (preset HITECH ZAPS, une note en cours)
     {
         SequencesAudioProcessor p;
-        for (int k = 0; k < seqs::numSlots; ++k) p.removeModulation (k);
-        set (p, "cutoff", 8000.0f);
-        set (p, "aWarp", 10.0f);
-        p.setModulationAmount (p.addModulation (6, seqs::Dest::aWarp), 0.5f);
-        p.setModulationAmount (p.addModulation (4, seqs::Dest::bCoarse), 7.0f / 96.0f);
-        renderTo (p, dir.getChildFile ("04-fm-sweep.wav"), 16.0, { { 40, 0.0, 15.0 } });
-    }
-
-    // 5. Accord en polyphonique, SEQ -> VOLUME -100 % (gate), table RESO TRI
-    {
-        SequencesAudioProcessor p;
-        p.setBuiltinTable (0, seqs::BuiltinTables::indexOf ("RESO TRI"));
-        set (p, "aWarpMode", 0.0f);
-        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::volume), -1.0f);
-        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aPos), 0.7f);
-        set (p, "ampRelease", 400.0f);
-        renderTo (p, dir.getChildFile ("05-poly-gate-reso.wav"), 16.0, { { 57, 0.0, 14.0 }, { 60, 0.0, 14.0 }, { 64, 0.0, 14.0 } });
-    }
-
-    // Capture de l'interface (une note en cours, pour voir les modulations bouger)
-    {
-        SequencesAudioProcessor p;
+        p.presets.loadFactory (1);
         if (serumTable.existsAsFile())
-            p.loadTableFile (1, serumTable);
-        p.addModulation (2, seqs::Dest::bPos);
-        p.setModulationAmount (p.addModulation (seqs::srcSeq, seqs::Dest::aCoarse), 12.0f / 96.0f);
+            p.loadTableFile (serumTable);
         p.prepareToPlay (48000.0, 256);
         juce::AudioBuffer<float> buffer (2, 256);
-        for (int b = 0; b < 30; ++b)
+        for (int b = 0; b < 40; ++b)
         {
             juce::MidiBuffer midi;
             if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 100), 0);
             p.processBlock (buffer, midi);
         }
-        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
-        juce::Image image (juce::Image::ARGB, editor->getWidth(), editor->getHeight(), true);
-        juce::Graphics g (image);
-        editor->paintEntireComponent (g, false);
-        juce::PNGImageFormat png;
-        auto file = dir.getChildFile ("interface.png");
-        file.deleteFile();
-        if (auto stream = file.createOutputStream())
-            png.writeImageToStream (image, *stream);
-        std::printf ("interface.png\n");
+        const char* names[] = { "main", "seq", "matrix", "arp", "fx" };
+        for (int t = 0; t < SequencesFacade::numTabs; ++t)
+            snapshot (p, dir.getChildFile (juce::String ("interface-") + names[t] + ".png"), t);
     }
     return 0;
 }

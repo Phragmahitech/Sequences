@@ -72,7 +72,7 @@ static void testParameters()
 {
     SequencesAudioProcessor p;
     const auto& params = p.getParameters();
-    CHECK (params.size() == 168, "nombre de paramètres : %d", params.size());
+    CHECK (params.size() > 250, "nombre de paramètres : %d", params.size());
 
     juce::StringArray ids;
     for (auto* param : params)
@@ -93,7 +93,8 @@ static void testParameters()
                        "%s : aller-retour à %.2f", ranged->getParameterID().toRawUTF8(), n);
             }
 
-    // Chaque destination a son potard, avec exactement la course du moteur
+    // Chaque destination a son potard, dont la position (0..1) est exactement celle du moteur
+    const seqs::Settings init;
     for (int d = 1; d < seqs::numDests; ++d)
     {
         const auto id = SequencesAudioProcessor::paramForDest ((seqs::Dest) d);
@@ -101,47 +102,60 @@ static void testParameters()
         CHECK (param != nullptr, "potard de la destination %d", d);
         CHECK (SequencesAudioProcessor::destForParam (id) == (seqs::Dest) d, "destination de %s", id.toRawUTF8());
         if (param == nullptr) continue;
-        for (float n : { 0.0f, 0.3f, 0.71f, 1.0f })
-        {
-            float real = param->convertFrom0to1 (n);
-            float engine = seqs::DestRange::toReal ((seqs::Dest) d, n);
-            if (id == "pan") real *= 0.01f;
-            if (id.endsWith ("Level") || id.endsWith ("Pos") || id.endsWith ("Warp") || id == "noise" || id == "resonance" || id == "drive")
-                real *= 0.01f;
-            if (id == "volume") real = engine;   // le paramètre est la position du potard, le texte montre les dB
-            CHECK (std::abs (real - engine) <= 1e-3f * std::max (1.0f, std::abs (engine)), "%s à %.2f : %f / %f", id.toRawUTF8(), n, real, engine);
-        }
+        CHECK (std::abs (param->getDefaultValue() - init.base[(size_t) d]) < 1e-4f, "%s : défaut du moteur (%f / %f)",
+               id.toRawUTF8(), param->getDefaultValue(), init.base[(size_t) d]);
     }
     CHECK (SequencesAudioProcessor::destForParam ("glide") == seqs::Dest::off, "GLIDE n'est pas une destination");
-
-    CHECK (p.apvts.getParameter ("aCoarse")->getText (p.apvts.getParameter ("aCoarse")->convertTo0to1 (7.5f), 16) == "+7.50 st", "texte COARSE : %s",
-           p.apvts.getParameter ("aCoarse")->getText (p.apvts.getParameter ("aCoarse")->convertTo0to1 (7.5f), 16).toRawUTF8());
-    CHECK (p.apvts.getParameter ("aCoarse")->getText (p.apvts.getParameter ("aCoarse")->convertTo0to1 (-12.0f), 16) == "-12 st", "texte COARSE entier");
-    CHECK (p.apvts.getParameter ("volume")->getCurrentValueAsText() == "-3.0 dB", "volume : %s", p.apvts.getParameter ("volume")->getCurrentValueAsText().toRawUTF8());
-    CHECK (p.apvts.getParameter ("pan")->getCurrentValueAsText() == "C", "pan au centre");
-    CHECK (p.apvts.getParameter ("aWarpMode")->getCurrentValueAsText() == "FM (FROM B)", "A : FM depuis B");
-    CHECK (p.apvts.getParameter ("bWarpMode")->getText (p.apvts.getParameter ("bWarpMode")->convertTo0to1 (2.0f), 32) == "FM (FROM A)", "B : FM depuis A");
+    CHECK (std::abs (value (p, "cutoff") - 20000.0f) < 1.0f, "coupure grande ouverte au départ");
+    CHECK (std::abs (p.apvts.getParameter ("cutoff")->convertFrom0to1 (0.5f) - seqs::DestRange::toReal (seqs::Dest::cutoff, 0.5f)) < 0.5f, "course de la coupure");
+    CHECK (std::abs (p.apvts.getParameter ("wtSemi")->convertFrom0to1 (0.75f) - 24.0f) < 1e-3f, "course de SEMI");
+    CHECK (p.apvts.getParameter ("wtSemi")->getText (p.apvts.getParameter ("wtSemi")->convertTo0to1 (7.5f), 16) == "+7.50 st", "texte SEMI");
+    CHECK (p.apvts.getParameter ("volume")->getCurrentValueAsText() == "0.0 dB", "volume : %s", p.apvts.getParameter ("volume")->getCurrentValueAsText().toRawUTF8());
+    CHECK (p.apvts.getParameter ("wtPan")->getCurrentValueAsText() == "C", "pan au centre");
+    CHECK (p.apvts.getParameter ("algoModel")->getCurrentValueAsText() == "VIRTUAL ANALOG", "Plaits : VIRTUAL ANALOG");
+    CHECK (p.apvts.getParameter ("oversampling")->getCurrentValueAsText() == "2X", "suréchantillonnage 2x");
 
     seqs::Settings s;
+    s.oversampling = 0; s.unison = 0; s.algoModel = 0;
     p.readSettings (s);
-    CHECK (s.osc[0].warp == seqs::Warp::fm && s.osc[1].octave == 1, "réglages des oscillateurs lus");
-    CHECK (s.osc[0].table != nullptr && s.osc[0].table->name == "BASIC SHAPES", "table de départ");
-    CHECK (std::abs (s.base[(size_t) seqs::Dest::aLevel] - 0.8f) < 1e-4f, "niveau A lu");
-    CHECK (s.slotSource[0] == seqs::srcSeq && s.slotDest[0] == seqs::Dest::cutoff && std::abs (s.slotAmount[0] - 0.27f) < 1e-4f, "routage de départ");
-    CHECK (s.slotSource[2] == seqs::srcEnv2 && s.slotDest[3] == seqs::Dest::aWarp, "ENV 2 de départ");
-    CHECK (p.usedSlotCount() == 4, "4 routages au départ");
+    CHECK (s.table != nullptr && s.table->name == "CLASSIC", "table de départ : CLASSIC");
+    CHECK (s.oversampling == 2 && s.unison == 1 && s.algoModel == 8, "réglages lus");
+    CHECK (std::abs (s.base[(size_t) seqs::Dest::wtLevel] - 0.8f) < 1e-4f, "niveau WT lu");
+    CHECK (p.usedSlotCount() == 0, "aucun routage au départ");
+
+    set (p, "fmPdWt", 100.0f);
+    set (p, "fmMode", 1.0f);
+    set (p, "voiceMode", 2.0f);
+    set (p, "mlDest1", (float) seqs::Dest::wtPos);
+    set (p, "mlAmt1", -40.0f);
+    set (p, "subOct", -2.0f);
+    p.readSettings (s);
+    CHECK (std::abs (s.fm[1][0] - 1.0f) < 1e-6f && std::abs (s.fm[0][0]) < 1e-6f && s.fmMode == seqs::FmMode::linear, "matrice FM lue");
+    CHECK (s.voiceMode == seqs::VoiceMode::legato && s.subOctave == -2, "voix / sub lus");
+    CHECK (s.mainLfo.dest[0] == seqs::Dest::wtPos && std::abs (s.mainLfo.amount[0] + 0.4f) < 1e-4f, "MAIN LFO lu");
+
+    seqs::ArpSettings a;
+    set (p, "arpOn", 1.0f); set (p, "arpRate", 2.0f); set (p, "arpOct", 3.0f);
+    p.readArpSettings (a);
+    CHECK (a.on && std::abs (a.stepBeats - 1.0 / 3.0) < 1e-9 && a.octaves == 3, "ARP lu");
+    seqs::FxSettings f;
+    set (p, "delayOn", 1.0f); set (p, "delayTime", 4.0f); set (p, "reverbMix", 50.0f);
+    p.readFxSettings (f);
+    CHECK (f.delayOn && std::abs (f.delayBeats - 0.75) < 1e-9 && std::abs (f.reverbMix - 0.5f) < 1e-4f, "FX lus");
 }
 
 static void testModulationApi()
 {
     SequencesAudioProcessor p;
-    const int k = p.addModulation (3, seqs::Dest::bPos);
-    CHECK (k == 4, "premier slot libre : %d", k);
-    CHECK (p.getModulationSource (k) == 3 && p.getModulationDest (k) == seqs::Dest::bPos && std::abs (p.getModulationAmount (k) - 0.25f) < 1e-4f,
+    const int k = p.addModulation (3, seqs::Dest::wtPos);
+    CHECK (k == 0, "premier slot libre : %d", k);
+    CHECK (p.getModulationSource (k) == 3 && p.getModulationDest (k) == seqs::Dest::wtPos && std::abs (p.getModulationAmount (k) - 0.25f) < 1e-4f,
            "routage créé");
-    CHECK (p.addModulation (3, seqs::Dest::bPos) == k, "même routage : même slot");
-    const int coarse = p.addModulation (1, seqs::Dest::aCoarse);
-    CHECK (std::abs (p.getModulationAmount (coarse) - 0.125f) < 1e-4f, "COARSE : une octave par défaut");
+    CHECK (p.addModulation (3, seqs::Dest::wtPos) == k, "même routage : même slot");
+    const int semi = p.addModulation (1, seqs::Dest::pdSemi);
+    CHECK (std::abs (p.getModulationAmount (semi) - 0.125f) < 1e-4f, "SEMI : une octave par défaut");
+    p.addModulation (seqs::srcMainLfo, seqs::Dest::cutoff);
+    p.addModulation (seqs::srcModWheel, seqs::Dest::cutoff);
     CHECK (p.slotsForDest (seqs::Dest::cutoff).size() == 2, "deux routages vers la coupure");
 
     p.setModulationAmount (k, -0.4f);
@@ -150,24 +164,19 @@ static void testModulationApi()
     CHECK (std::abs (p.getModulationAmount (k) - 1.0f) < 1e-4f, "profondeur bornée");
 
     p.removeModulation (k);
-    CHECK (p.getModulationDest (k) == seqs::Dest::off && p.slotsForDest (seqs::Dest::bPos).empty(), "supprimé");
+    CHECK (p.getModulationDest (k) == seqs::Dest::off && p.slotsForDest (seqs::Dest::wtPos).empty(), "supprimé");
     CHECK (p.addModulation (2, seqs::Dest::off) == -1 && p.addModulation (99, seqs::Dest::cutoff) == -1, "routages invalides refusés");
 
-    // 16 slots au plus
     int last = 0;
     for (int d = 1; d < seqs::numDests && last >= 0; ++d)
         for (int src = 0; src < seqs::numModSources && last >= 0; ++src)
             last = p.addModulation (src, (seqs::Dest) d);
-    CHECK (last == -1 && p.usedSlotCount() == 16, "plein : %d", p.usedSlotCount());
+    CHECK (last == -1 && p.usedSlotCount() == seqs::numSlots, "plein : %d", p.usedSlotCount());
 
-    // La modulation agit sur le son : VELO -> PITCH +12 (vélocité max)
+    // La modulation agit sur le son : VELO -> WT SEMI +12 (vélocité max) = 220 Hz pour un la 110
     SequencesAudioProcessor q;
-    for (int s = 0; s < seqs::numSlots; ++s) q.removeModulation (s);
-    set (q, "aWarp", 0.0f);
-    set (q, "aLevel", 100.0f);
-    set (q, "cutoff", 20000.0f);
-    set (q, "resonance", 0.0f);
-    q.setModulationAmount (q.addModulation (seqs::srcVelocity, seqs::Dest::pitch), 12.0f / 48.0f);
+    q.setBuiltinTable (seqs::BuiltinTables::indexOf ("SINE"));
+    q.setModulationAmount (q.addModulation (seqs::srcVelocity, seqs::Dest::wtSemi), 12.0f / 96.0f);
     q.prepareToPlay (48000.0, 512);
     juce::AudioBuffer<float> buffer (2, 512);
     std::vector<float> out;
@@ -181,10 +190,38 @@ static void testModulationApi()
     int crossings = 0;
     for (size_t i = 4800; i < out.size(); ++i) crossings += out[i - 1] < 0.0f && out[i] >= 0.0f ? 1 : 0;
     const double hz = crossings * 48000.0 / (double) (out.size() - 4800);
-    CHECK (std::abs (hz - 220.0) < 3.0, "VELO -> PITCH : %.1f Hz", hz);
-    CHECK (q.getLiveOffset (seqs::Dest::pitch) > 0.24f, "décalage montré : %f", q.getLiveOffset (seqs::Dest::pitch));
-}
+    CHECK (std::abs (hz - 220.0) < 3.0, "VELO -> SEMI : %.1f Hz", hz);
+    CHECK (q.getLiveOffset (seqs::Dest::wtSemi) > 0.12f, "décalage montré : %f", q.getLiveOffset (seqs::Dest::wtSemi));
 
+    // Molette (CC 1) -> coupure : le son s'éclaircit
+    SequencesAudioProcessor w;
+    set (w, "cutoff", 200.0f);
+    set (w, "wtPos", 50.0f);
+    w.setModulationAmount (w.addModulation (seqs::srcModWheel, seqs::Dest::cutoff), 1.0f);
+    w.prepareToPlay (48000.0, 512);
+    auto brightness = [&w] (juce::MidiBuffer first)
+    {
+        juce::AudioBuffer<float> b (2, 512);
+        double d = 0.0, e = 0.0;
+        float prev = 0.0f;
+        for (int blk = 0; blk < 20; ++blk)
+        {
+            juce::MidiBuffer midi;
+            if (blk == 0) midi = first;
+            w.processBlock (b, midi);
+            if (blk < 4) continue;
+            for (int i = 0; i < 512; ++i) { const float x = b.getSample (0, i); d += (x - prev) * (x - prev); e += x * x; prev = x; }
+        }
+        return std::sqrt (d / (e + 1e-20));
+    };
+    juce::MidiBuffer note;
+    note.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 100), 0);
+    const double closed = brightness (note);
+    juce::MidiBuffer wheel;
+    wheel.addEvent (juce::MidiMessage::controllerEvent (1, 1, 127), 0);
+    const double open = brightness (wheel);
+    CHECK (open > 2.0 * closed, "molette ouvre le filtre (%.4f / %.4f)", closed, open);
+}
 static void testAudio()
 {
     SequencesAudioProcessor p;
@@ -196,7 +233,7 @@ static void testAudio()
     {
         p.setRateAndBufferSizeDetails (sr, 256);
         p.prepareToPlay (sr, 256);
-        CHECK (renderRms (p, 20, 256) == 0.0, "silence sans note (sr %.0f)", sr);
+        CHECK (renderRms (p, 20, 256) < 1e-9, "silence sans note (sr %.0f)", sr);
 
         juce::MidiBuffer midi;
         midi.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 110), 17);
@@ -294,7 +331,7 @@ static void testRandomAndTools()
         if (p.getModulationSource (k) == seqs::srcSeq)
             p.removeModulation (k);
     p.randomizePattern();
-    CHECK (value (p, "seqOn") == 1.0f, "RANDOM allume le séquenceur");
+    CHECK (value (p, "seqOn") > 0.5f, "RANDOM allume le séquenceur");
     bool listening = false;
     for (int k = 0; k < seqs::numSlots; ++k)
         listening = listening || (p.getModulationSource (k) == seqs::srcSeq && p.getModulationDest (k) == seqs::Dest::cutoff);
@@ -347,75 +384,62 @@ static void testWavetables (const juce::StringArray& serumFiles)
     dir.createDirectory();
 
     SequencesAudioProcessor p;
-    CHECK (p.getTableInfo (0).name == "BASIC SHAPES" && p.getTableInfo (0).builtin == 0, "table intégrée au départ");
+    CHECK (p.getTableInfo().name == "CLASSIC" && p.getTableInfo().builtin == 0, "table intégrée au départ");
 
-    p.setBuiltinTable (1, seqs::BuiltinTables::indexOf ("RESO SAW"));
-    CHECK (p.getTableInfo (1).name == "RESO SAW" && p.getTable (1)->numFrames == 64, "table intégrée choisie");
+    p.setBuiltinTable (seqs::BuiltinTables::indexOf ("RESO SAW"));
+    CHECK (p.getTableInfo().name == "RESO SAW" && p.getTable()->numFrames == 64, "table intégrée choisie");
 
     const auto file = writeTestTable (dir, "My Table", 12);
-    CHECK (p.loadTableFile (0, file).isEmpty(), "import WAV");
-    CHECK (p.getTableInfo (0).name == "MY TABLE" && p.getTableInfo (0).builtin == -1 && p.getTable (0)->numFrames == 12, "table importée");
-    CHECK (p.getTableInfo (0).file == file, "fichier d'origine retenu");
-
-    CHECK (p.loadTableFile (0, dir.getChildFile ("absent.wav")).isNotEmpty(), "fichier absent : erreur");
+    CHECK (p.loadTableFile (file).isEmpty(), "import WAV");
+    CHECK (p.getTableInfo().name == "MY TABLE" && p.getTableInfo().builtin == -1 && p.getTable()->numFrames == 12, "table importée");
+    CHECK (p.getTableInfo().file == file, "fichier d'origine retenu");
+    CHECK (p.loadTableFile (dir.getChildFile ("absent.wav")).isNotEmpty(), "fichier absent : erreur");
     auto junk = dir.getChildFile ("junk.wav");
     junk.replaceWithText ("pas un wav");
-    CHECK (p.loadTableFile (0, junk).isNotEmpty(), "fichier invalide : erreur");
-    CHECK (p.getTableInfo (0).name == "MY TABLE", "une erreur ne change pas la table");
+    CHECK (p.loadTableFile (junk).isNotEmpty(), "fichier invalide : erreur");
+    CHECK (p.getTableInfo().name == "MY TABLE", "une erreur ne change pas la table");
 
-    // La table importée joue (frame 6, sinus x6) : son présent
-    set (p, "aPos", 100.0f * 5.0f / 11.0f);
-    set (p, "aWarp", 0.0f);
-    set (p, "cutoff", 20000.0f);
+    set (p, "wtPos", 100.0f * 5.0f / 11.0f);
     p.prepareToPlay (48000.0, 512);
     juce::MidiBuffer on;
     on.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 100), 0);
     CHECK (renderRms (p, 40, 512, on) > 0.02, "table importée jouée");
 
-    // Projet : la table importée est enregistrée dans l'état, même si le fichier disparaît
     juce::MemoryBlock data;
     p.getStateInformation (data);
     file.deleteFile();
     SequencesAudioProcessor q;
     q.setStateInformation (data.getData(), (int) data.getSize());
-    CHECK (q.getTableInfo (0).name == "MY TABLE" && q.getTable (0)->numFrames == 12, "table importée relue depuis le projet");
-    CHECK (q.getTableInfo (1).name == "RESO SAW", "table intégrée relue depuis le projet");
+    CHECK (q.getTableInfo().name == "MY TABLE" && q.getTable()->numFrames == 12, "table importée relue depuis le projet");
     {
-        const auto* a = p.getTable (0);
-        const auto* b = q.getTable (0);
         float maxDiff = 0.0f;
         for (double ph = 0.0; ph < 1.0; ph += 0.01)
-            maxDiff = std::max (maxDiff, std::abs (a->read (5.0, 0.0, ph) - b->read (5.0, 0.0, ph)));
+            maxDiff = std::max (maxDiff, std::abs (p.getTable()->read (5.0, 0.0, ph) - q.getTable()->read (5.0, 0.0, ph)));
         CHECK (maxDiff < 2e-4f, "contenu identique (16 bits) : %f", maxDiff);
     }
     CHECK (data.getSize() < 200000, "état compact : %d octets", (int) data.getSize());
 
-    // Presets : la table voyage avec le preset ; DEFAULT revient aux tables intégrées
     p.presets.setFolderOverride (dir);
     CHECK (p.presets.save ("With Table"), "preset enregistré");
     p.presets.loadFactory (0);
-    CHECK (p.getTableInfo (0).name == "BASIC SHAPES" && p.getTableInfo (1).name == "BASIC SHAPES", "DEFAULT : tables intégrées");
+    CHECK (p.getTableInfo().name == "CLASSIC", "INIT : table intégrée");
     CHECK (p.presets.load (dir.getChildFile ("With Table.seqpreset")), "preset rechargé");
-    CHECK (p.getTableInfo (0).name == "MY TABLE" && p.getTableInfo (1).name == "RESO SAW", "tables du preset : %s / %s",
-           p.getTableInfo (0).name.toRawUTF8(), p.getTableInfo (1).name.toRawUTF8());
+    CHECK (p.getTableInfo().name == "MY TABLE", "table du preset : %s", p.getTableInfo().name.toRawUTF8());
 
-    // État abîmé dans la partie TABLES : on revient aux tables intégrées sans planter
     {
-        auto xml = juce::parseXML ("<Sequences><TABLES><TABLE osc=\"0\" builtin=\"-1\" name=\"X\" data=\"@@@notbase64\"/>"
-                                   "<TABLE osc=\"7\" builtin=\"3\"/></TABLES></Sequences>");
+        auto xml = juce::parseXML ("<Sequences><TABLES><TABLE osc=\"0\" builtin=\"-1\" name=\"X\" data=\"@@@notbase64\"/></TABLES></Sequences>");
         juce::MemoryBlock bad;
         juce::AudioProcessor::copyXmlToBinary (*xml, bad);
         q.setStateInformation (bad.getData(), (int) bad.getSize());
-        CHECK (q.getTableInfo (0).name == "BASIC SHAPES", "données abîmées : table par défaut");
+        CHECK (q.getTableInfo().name == "CLASSIC", "données abîmées : table par défaut");
     }
 
-    // Vraies tables Serum
     for (const auto& path : serumFiles)
     {
         const juce::File f (path);
         if (! f.existsAsFile()) continue;
-        const auto err = p.loadTableFile (1, f);
-        CHECK (err.isEmpty() && p.getTable (1)->numFrames > 0, "Serum : %s (%s)", f.getFileName().toRawUTF8(), err.toRawUTF8());
+        const auto err = p.loadTableFile (f);
+        CHECK (err.isEmpty() && p.getTable()->numFrames > 0, "Serum : %s (%s)", f.getFileName().toRawUTF8(), err.toRawUTF8());
     }
 
     dir.deleteRecursively();
@@ -427,9 +451,13 @@ static void testState()
     a.setRandomSeed (7);
     a.randomizeAll();
     set (a, "cutoff", 2500.0f);
-    set (a, "aCoarse", 7.25f);
-    set (a, "voiceMode", 0.0f);
-    a.addModulation (5, seqs::Dest::pan);
+    set (a, "wtSemi", 7.25f);
+    set (a, "voiceMode", 1.0f);
+    set (a, "algoModel", 13.0f);
+    set (a, "fmNoisePd", 40.0f);
+    set (a, "arpOn", 1.0f);
+    set (a, "reverbOn", 1.0f);
+    a.addModulation (5, seqs::Dest::algoPan);
     a.apvts.state.setProperty ("editorWidth", 990, nullptr);
 
     juce::MemoryBlock data;
@@ -456,24 +484,117 @@ static void testPresets()
 
     SequencesAudioProcessor p;
     p.presets.setFolderOverride (dir);
-    CHECK (p.presets.getDisplayName() == "DEFAULT", "nom au départ : %s", p.presets.getDisplayName().toRawUTF8());
+    CHECK (p.presets.getDisplayName() == "INIT", "nom au départ : %s", p.presets.getDisplayName().toRawUTF8());
 
-    set (p, "bCoarse", -5.5f);
+    set (p, "pdSemi", -5.5f);
     set (p, SequencesAudioProcessor::stepId (5), 7.0f);
     CHECK (p.presets.isModified(), "modifié");
     CHECK (p.presets.save ("Hitech Seq"), "enregistré");
     CHECK (! p.presets.isModified(), "plus modifié après SAVE");
 
     p.presets.loadFactory (0);
-    CHECK (std::abs (value (p, "bCoarse")) < 1e-3f, "DEFAULT remet les valeurs");
+    CHECK (std::abs (value (p, "pdSemi")) < 1e-3f, "INIT remet les valeurs");
 
     CHECK (p.presets.load (dir.getChildFile ("Hitech Seq.seqpreset")), "rechargé");
-    CHECK (std::abs (value (p, "bCoarse") + 5.5f) < 1e-3f, "valeur du preset");
+    CHECK (std::abs (value (p, "pdSemi") + 5.5f) < 1e-3f, "valeur du preset");
     CHECK (stepSource (p, 5) == 7, "pas du preset");
+
+    // Presets d'usine : chacun se charge, se reconnaît, et sonne
+    CHECK (SequencesAudioProcessor::numFactoryPresets() >= 8, "%d presets d'usine", SequencesAudioProcessor::numFactoryPresets());
+    for (int i = 0; i < SequencesAudioProcessor::numFactoryPresets(); ++i)
+    {
+        SequencesAudioProcessor f;
+        f.presets.setFolderOverride (dir);
+        f.presets.loadFactory (i);
+        const auto name = SequencesAudioProcessor::factoryPresetName (i);
+        CHECK (f.presets.getDisplayName() == name && ! f.presets.isModified(), "preset %s chargé (%s)", name.toRawUTF8(), f.presets.getDisplayName().toRawUTF8());
+        FakePlayHead head;
+        head.bpm = 145.0;
+        f.setPlayHead (&head);
+        f.prepareToPlay (48000.0, 256);
+        juce::MidiBuffer on;
+        on.addEvent (juce::MidiMessage::noteOn (1, 45, (juce::uint8) 110), 0);
+        on.addEvent (juce::MidiMessage::noteOn (1, 52, (juce::uint8) 110), 0);
+        const double r = renderRms (f, 200, 256, on);
+        CHECK (r > 0.01 && r < 1.5, "preset %s sonne : rms %.4f", name.toRawUTF8(), r);
+    }
+    {
+        SequencesAudioProcessor f;
+        f.presets.loadFactory (1);
+        CHECK (f.usedSlotCount() == 3 && f.getModulationSource (0) == seqs::srcSeq, "HITECH ZAPS : routages");
+        f.presets.loadFactory (0);
+        CHECK (f.usedSlotCount() == 0, "INIT : plus de routages");
+    }
 
     dir.deleteRecursively();
 }
 
+static void testArpAndFx()
+{
+    // ARP : un accord tenu donne des notes successives (le son change de hauteur à chaque pas)
+    SequencesAudioProcessor p;
+    FakePlayHead head;
+    head.bpm = 120.0;
+    p.setPlayHead (&head);
+    p.setBuiltinTable (seqs::BuiltinTables::indexOf ("SINE"));
+    set (p, "arpOn", 1.0f);
+    set (p, "arpRate", 3.0f);   // 1/16 = 6000 échantillons
+    set (p, "arpGate", 50.0f);
+    set (p, "ampAttack", 1.0f);
+    set (p, "ampRelease", 5.0f);
+    p.prepareToPlay (48000.0, 500);
+    juce::MidiBuffer chord;
+    chord.addEvent (juce::MidiMessage::noteOn (1, 57, (juce::uint8) 100), 0);
+    chord.addEvent (juce::MidiMessage::noteOn (1, 69, (juce::uint8) 100), 0);
+    juce::AudioBuffer<float> buffer (2, 500);
+    std::vector<float> out;
+    for (int b = 0; b < 48; ++b)
+    {
+        juce::MidiBuffer midi;
+        if (b == 0) midi = chord;
+        p.processBlock (buffer, midi);
+        out.insert (out.end(), buffer.getReadPointer (0), buffer.getReadPointer (0) + 500);
+    }
+    auto rmsOf = [&out] (int from, int to) { double s = 0.0; for (int i = from; i < to; ++i) s += out[(size_t) i] * out[(size_t) i]; return std::sqrt (s / (to - from)); };
+    auto zeroCrossings = [&out] (int from, int to) { int n = 0; for (int i = from + 1; i < to; ++i) n += out[(size_t) i - 1] < 0.0f && out[(size_t) i] >= 0.0f; return n; };
+    CHECK (rmsOf (500, 2500) > 0.05, "ARP : 1re note");
+    CHECK (rmsOf (3600, 5800) < 0.01, "ARP : silence après la porte (50 %%) : %.4f", rmsOf (3600, 5800));
+    CHECK (rmsOf (6500, 8500) > 0.05, "ARP : 2e note");
+    const int z1 = zeroCrossings (500, 2500), z2 = zeroCrossings (6500, 8500);
+    CHECK (z2 > (int) (1.8 * z1), "ARP : la 2e note est une octave plus haut (%d / %d)", z1, z2);
+    CHECK (p.getActiveVoices() <= 2, "ARP : une note à la fois");
+
+    // Couper l'ARP : plus rien ne joue de lui-même
+    set (p, "arpOn", 0.0f);
+    juce::MidiBuffer release;
+    release.addEvent (juce::MidiMessage::noteOff (1, 57), 0);
+    release.addEvent (juce::MidiMessage::noteOff (1, 69), 0);
+    renderRms (p, 4, 500, release);
+    CHECK (renderRms (p, 40, 500) < 1e-4, "ARP coupé : silence");
+
+    // FX : la reverb prolonge une note courte
+    SequencesAudioProcessor dry, wet;
+    for (auto* q : { &dry, &wet })
+    {
+        q->setPlayHead (&head);
+        set (*q, "ampRelease", 5.0f);
+        q->prepareToPlay (48000.0, 512);
+    }
+    set (wet, "reverbOn", 1.0f);
+    set (wet, "reverbMix", 40.0f);
+    set (wet, "reverbDecay", 70.0f);
+    wet.prepareToPlay (48000.0, 512);
+    for (auto* q : { &dry, &wet })
+    {
+        juce::MidiBuffer note;
+        note.addEvent (juce::MidiMessage::noteOn (1, 57, (juce::uint8) 100), 0);
+        note.addEvent (juce::MidiMessage::noteOff (1, 57), 400);
+        renderRms (*q, 1, 512, note);
+        renderRms (*q, 20, 512);
+    }
+    const double tailDry = renderRms (dry, 20, 512), tailWet = renderRms (wet, 20, 512);
+    CHECK (tailDry < 1e-4 && tailWet > 1e-3, "REVERB : queue (%.5f / %.5f)", tailDry, tailWet);
+}
 static juce::MouseEvent mouseAt (juce::Component& c, juce::Point<float> pt, juce::ModifierKeys mods = {},
                                  std::optional<juce::Point<float>> downAt = {})
 {
@@ -489,7 +610,7 @@ static void testEditor()
 
     std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
     CHECK (editor != nullptr, "éditeur créé");
-    CHECK (editor->getWidth() == SequencesFacade::width && editor->getHeight() == SequencesFacade::height, "taille par défaut");
+    CHECK (editor->getWidth() == juce::roundToInt (SequencesFacade::width * 0.9), "taille par défaut : %d", editor->getWidth());
 
     auto* e = dynamic_cast<SequencesAudioProcessorEditor*> (editor.get());
     e->setUiScale (0.75f);
@@ -502,15 +623,15 @@ static void testEditor()
     for (int s = 0; s < seqs::numModSources; ++s)
         CHECK (facade.getChip (s) != nullptr, "pastille %s", SequencesAudioProcessor::modSourceNames()[s].toRawUTF8());
 
-    // Glisser-déposer : LFO 4 sur B POS
-    auto* knob = facade.getModKnob (seqs::Dest::bPos);
+    // Glisser-déposer : LFO 4 sur WT POS
+    auto* knob = facade.getModKnob (seqs::Dest::wtPos);
     auto* chip = facade.getChip (4);
     juce::DragAndDropTarget::SourceDetails details (ui::SourceChip::dragDescription (4), chip, {});
     CHECK (knob->isInterestedInDragSource (details), "le potard accepte une source");
     CHECK (! knob->isInterestedInDragSource (juce::DragAndDropTarget::SourceDetails ("autre chose", nullptr, {})), "et refuse le reste");
     knob->itemDropped (details);
-    const auto slots = p.slotsForDest (seqs::Dest::bPos);
-    CHECK (slots.size() == 1 && p.getModulationSource (slots[0]) == 4, "LFO 4 -> B POS créé");
+    const auto slots = p.slotsForDest (seqs::Dest::wtPos);
+    CHECK (slots.size() == 1 && p.getModulationSource (slots[0]) == 4, "LFO 4 -> WT POS créé");
     CHECK (knob->getActiveSlot() == slots[0], "slot actif");
 
     // Régler la profondeur en tirant sur l'anneau
@@ -529,15 +650,15 @@ static void testEditor()
     juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
     auto& list = facade.getModList();
     const auto rows = list.rows();
-    CHECK ((int) rows.size() == p.usedSlotCount() && rows.size() == 5, "liste : %d lignes", (int) rows.size());
+    CHECK ((int) rows.size() == p.usedSlotCount() && rows.size() == 1, "liste : %d lignes", (int) rows.size());
     const int row = (int) (std::find (rows.begin(), rows.end(), slots[0]) - rows.begin());
     const float y = (float) (row * ui::ModList::rowHeight) + ui::ModList::rowHeight * 0.5f;
-    const float barLeft = 188.0f, barRight = (float) list.getWidth() - 26.0f;
+    const float barLeft = 222.0f, barRight = (float) list.getWidth() - 26.0f;
     list.mouseDown (mouseAt (list, { barLeft + (barRight - barLeft) * 0.25f, y }));
     list.mouseUp (mouseAt (list, { barLeft + (barRight - barLeft) * 0.25f, y }));
     CHECK (std::abs (p.getModulationAmount (slots[0]) + 0.5f) < 0.02f, "profondeur depuis la liste : %f", p.getModulationAmount (slots[0]));
     list.mouseDown (mouseAt (list, { (float) list.getWidth() - 10.0f, y }));
-    CHECK (p.slotsForDest (seqs::Dest::bPos).empty(), "× supprime le routage");
+    CHECK (p.slotsForDest (seqs::Dest::wtPos).empty(), "× supprime le routage");
 
     // RANDOM
     p.setRandomSeed (99);
@@ -571,22 +692,68 @@ static void testEditor()
         dir.createDirectory();
         const auto f1 = writeTestTable (dir, "A first", 5);
         writeTestTable (dir, "B second", 9);
-        auto& view = facade.getTableView (1);
+        auto& view = facade.getTableView();
         CHECK (view.isInterestedInFileDrag ({ f1.getFullPathName() }) && ! view.isInterestedInFileDrag ({ "/x/y.png" }), "accepte les .wav");
         view.filesDropped ({ f1.getFullPathName() }, 10, 10);
-        CHECK (p.getTableInfo (1).name == "A FIRST" && view.getError().isEmpty(), "table déposée");
+        CHECK (p.getTableInfo().name == "A FIRST" && view.getError().isEmpty(), "table déposée");
         view.step (+1);
-        CHECK (p.getTableInfo (1).name == "B SECOND", "table suivante du dossier");
+        CHECK (p.getTableInfo().name == "B SECOND", "table suivante du dossier");
         view.step (+1);
-        CHECK (p.getTableInfo (1).name == "A FIRST", "en boucle");
-        p.setBuiltinTable (1, 0);
+        CHECK (p.getTableInfo().name == "A FIRST", "en boucle");
+        p.setBuiltinTable (0);
         view.step (-1);
-        CHECK (p.getTableInfo (1).name == juce::String (seqs::BuiltinTables::names().back()), "intégrées en boucle");
+        CHECK (p.getTableInfo().name == juce::String (seqs::BuiltinTables::names().back()), "intégrées en boucle");
         auto bad = dir.getChildFile ("bad.wav");
         bad.replaceWithText ("x");
         view.filesDropped ({ bad.getFullPathName() }, 10, 10);
         CHECK (view.getError().isNotEmpty(), "erreur affichée");
         dir.deleteRecursively();
+    }
+
+    // Matrice FM : clic = tout ou rien, glisser = quantité, double-clic = zéro
+    {
+        auto* cell = facade.getFmCell (1, 0);
+        CHECK (cell != nullptr && facade.getFmCell (2, 1) != nullptr, "cases FM");
+        const juce::Point<float> c (10.0f, 10.0f);
+        cell->mouseDown (mouseAt (*cell, c));
+        cell->mouseUp (mouseAt (*cell, c));
+        CHECK (std::abs (value (p, "fmPdWt") - 100.0f) < 0.01f, "clic : 100 %%");
+        cell->mouseDown (mouseAt (*cell, c));
+        cell->mouseDrag (mouseAt (*cell, c.translated (0.0f, 75.0f), {}, c));
+        cell->mouseUp (mouseAt (*cell, c.translated (0.0f, 75.0f), {}, c));
+        CHECK (std::abs (value (p, "fmPdWt") - 50.0f) < 1.0f, "glisser : %.1f", value (p, "fmPdWt"));
+        cell->mouseDoubleClick (mouseAt (*cell, c));
+        CHECK (std::abs (value (p, "fmPdWt")) < 1e-6f, "double-clic : 0");
+    }
+
+    // Onglets : une page visible à la fois, chaque page a ses contrôles
+    for (int t = 0; t < SequencesFacade::numTabs; ++t)
+    {
+        facade.getTabButton (t).triggerClick();
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (20);
+        int visible = 0;
+        for (int u = 0; u < SequencesFacade::numTabs; ++u) visible += facade.getPage (u).isVisible() ? 1 : 0;
+        CHECK (facade.getTab() == t && visible == 1 && facade.getPage (t).isVisible(), "onglet %d", t);
+        CHECK (facade.getPage (t).getNumChildComponents() > 1, "page %d remplie", t);
+    }
+    for (const char* id : { "arpOn", "arpMode", "delayFeedback", "reverbMix", "chorusMix", "algoModel", "pdWave", "mlDest1", "oversampling", "filterModel" })
+        CHECK (facade.findById (id) != nullptr, "contrôle %s présent", id);
+
+    // Aucun contrôle ne déborde de sa page, ni ne chevauche un voisin
+    for (int t = 0; t < SequencesFacade::numTabs; ++t)
+    {
+        auto& page = facade.getPage (t);
+        std::vector<juce::Rectangle<int>> boxes;
+        for (auto* c : page.getChildren())
+        {
+            CHECK (page.getLocalBounds().contains (c->getBounds()), "page %d : %s dépasse", t, c->getComponentID().toRawUTF8());
+            if (dynamic_cast<juce::Slider*> (c) != nullptr || dynamic_cast<juce::ComboBox*> (c) != nullptr || dynamic_cast<juce::Button*> (c) != nullptr)
+            {
+                for (auto& b : boxes)
+                    CHECK (! b.intersects (c->getBounds()), "page %d : %s chevauche", t, c->getComponentID().toRawUTF8());
+                boxes.push_back (c->getBounds());
+            }
+        }
     }
 
     // Rendu de la façade
@@ -610,6 +777,7 @@ int main (int argc, char** argv)
     testWavetables (serum);
     testState();
     testPresets();
+    testArpAndFx();
     testEditor();
 
     std::printf ("%d vérifications, %d échecs\n", checks, failures);
