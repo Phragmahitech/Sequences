@@ -25,6 +25,12 @@
 #ifndef STMLIB_STMLIB_H_
 #define STMLIB_STMLIB_H_
 
+// Sequences : compilation MSVC (pas d'attributs GCC)
+#if defined (_MSC_VER) && ! defined (__clang__) && ! defined (__attribute__)
+ #define __attribute__(x)
+#endif
+
+
 #include <inttypes.h>
 #include <stddef.h>
 

@@ -195,6 +195,7 @@ class Algorithms {
   DISALLOW_COPY_AND_ASSIGN(Algorithms);
 };
 
+#if ! defined (_MSC_VER) || defined (__clang__)   // Sequences : MSVC prend ces déclarations pour des définitions
 /* static */
 template<> const uint8_t Algorithms<4>::opcodes_[][4];  // From DX100
 
@@ -206,6 +207,7 @@ template<> const uint8_t Algorithms<6>::opcodes_[][6];  // From DX7
 
 /* static */
 template<> const Algorithms<6>::RendererSpecs Algorithms<6>::renderers_[];
+#endif
 
 }  // namespace fm
 

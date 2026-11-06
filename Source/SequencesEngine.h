@@ -749,6 +749,23 @@ namespace detail
 
     inline double noteToHz (double note)     { return 440.0 * std::exp2 ((note - 69.0) / 12.0); }
 
+    /** cos (2 pi x) par table (4096 points, interpolation linéaire : erreur < 1e-6). */
+    inline float cosCycles (double x)
+    {
+        static constexpr int size = 4096;
+        static const std::array<float, size + 1> table = []
+        {
+            std::array<float, size + 1> t {};
+            for (int i = 0; i <= size; ++i)
+                t[(size_t) i] = (float) std::cos (twoPi * i / size);
+            return t;
+        }();
+        const double pos = (x - std::floor (x)) * size;
+        const int i = std::min ((int) pos, size - 1);
+        const float f = (float) (pos - i);
+        return table[(size_t) i] + (table[(size_t) i + 1] - table[(size_t) i]) * f;
+    }
+
     inline double polyBlep (double t, double dt)
     {
         if (dt <= 0.0) return 0.0;
@@ -804,12 +821,12 @@ struct PhaseDistortion
                 if (wave == PdWave::reso2) window = p < 0.5 ? 2.0 * p : 2.0 - 2.0 * p;
                 if (wave == PdWave::reso3) window = p < 0.75 ? 1.0 : 4.0 - 4.0 * p;
                 window = curve (window, shape);
-                return (float) (std::cos (twoPi * r * p) * window);
+                return (float) (detail::cosCycles (r * p) * window);
             }
             case PdWave::count:
             default: break;
         }
-        return (float) std::cos (twoPi * phase);
+        return detail::cosCycles (phase);
     }
 };
 
@@ -1002,6 +1019,7 @@ public:
             plaits = std::make_unique<PlaitsOsc>();
         plaits->setSampleRate (sr);
         slotCoef = (float) (1.0 - std::exp (-1.0 / (0.0004 * sr)));
+        slotCoefControl = (float) (1.0 - std::exp (-(double) controlInterval / (0.0004 * sr)));
         dcCoef = (float) std::exp (-twoPi * 10.0 / sr);
         reset();
     }
@@ -1056,6 +1074,7 @@ public:
             seconds = 0.0;
             chaosSeed = seed;
             firstSample = true;
+            controlCountdown = 0;
         }
     }
 
@@ -1100,162 +1119,22 @@ public:
         const float fltLevel = fltEnv.next();
         const float modLevel = modEnv.next();
 
-        // --- Modulation ---------------------------------------------------------
-        offsets.fill (0.0f);
+        if (controlCountdown <= 0)
         {
-            const bool host = s.seq.hostSync;
-            const double t = host ? sh.hostBeats : seqBeats;
-            const uint64_t seed = host ? sh.hostChaosSeed : chaosSeed;
-
-            std::array<float, numModSources> value {};
-            {
-                const auto out = Mod::seq (s, t, sh.bpm, seed);
-                value[srcSeq] = out.value;
-                lastStep = out.step;
-            }
-            for (int k = srcLfo1; k < srcEnv2; ++k)
-                if (sh.neededSources & (1u << k))
-                    value[(size_t) k] = Mod::source (s, k, t, t, seed);
-            value[srcEnv2] = fltLevel;
-            value[srcEnv3] = modLevel;
-            value[srcVelocity] = velocity;
-            value[srcModWheel] = sh.modWheel;
-            {
-                const auto& ml = s.mainLfo;
-                const double localTime = ml.sync ? seqBeats : seconds;
-                const double globalTime = ml.sync ? sh.hostBeats : sh.hostSeconds;
-                const double time = ml.retrig ? localTime : globalTime;
-                const double cycles = ml.sync ? time / std::max (1.0e-4, ml.periodBeats) : time * (double) ml.rateHz;
-                value[srcMainLfo] = mainLfoValue (ml.shape, cycles, ml.retrig ? chaosSeed : sh.hostChaosSeed);
-            }
-
-            auto route = [&] (int k, int src, Dest d, float amount)
-            {
-                float& sv = slotValue[(size_t) k];
-                if (d == Dest::off)
-                {
-                    sv = 0.0f;
-                    return;
-                }
-                const float target = amount * value[(size_t) std::clamp (src, 0, numModSources - 1)];
-                sv = firstSample ? target : sv + (target - sv) * slotCoef;
-                offsets[(size_t) d] += sv;
-            };
-
-            for (int k = 0; k < numSlots; ++k)
-                route (k, s.slotSource[(size_t) k], s.slotDest[(size_t) k], s.slotAmount[(size_t) k]);
-            for (int k = 0; k < 2; ++k)
-                route (numSlots + k, srcMainLfo, s.mainLfo.dest[(size_t) k], s.mainLfo.amount[(size_t) k]);
+            controlCountdown = controlInterval;
+            updateControl (s, sm, sh, fltLevel, modLevel);
         }
-
-        firstSample = false;
+        --controlCountdown;
         seqBeats += sh.beatsInc;
         seconds += 1.0 / sampleRate;
 
-        auto norm = [&] (Dest d) { return std::clamp (sm.base[(size_t) d] + offsets[(size_t) d], 0.0f, 1.0f); };
-        auto real = [&] (Dest d) { return DestRange::toReal (d, norm (d)); };
-
-        // --- Réglages de l'échantillon ------------------------------------------------
-        const int os = s.oversampling >= 4 ? 4 : (s.oversampling >= 2 ? 2 : 1);
-        const double osRate = sampleRate * os;
-        const double baseNote = currentNote + sh.pitchBend;
-
-        // WAVETABLE
-        const Wavetable* table = s.table != nullptr ? s.table : BuiltinTables::get (0);
-        const int unison = std::clamp (s.unison, 1, maxUnison);
-        const float wtLevel = s.wtOn ? real (Dest::wtLevel) : 0.0f;
-        const double wtHz = detail::noteToHz (baseNote + 12.0 * s.wtOctave + real (Dest::wtSemi) + 0.01 * real (Dest::wtFine));
-        const float detune = norm (Dest::wtDetune);
-        const float spread = norm (Dest::wtSpread);
-        const float wtPan = real (Dest::wtPan);
-        const float wtWarp = norm (Dest::wtWarp);
-        const double framePos = (double) norm (Dest::wtPos) * (double) (table->numFrames - 1);
-
-        // PHASE DISTORTION
-        const float pdLevel = s.pdOn ? real (Dest::pdLevel) : 0.0f;
-        const double pdHz = std::min (detail::noteToHz (baseNote + 12.0 * s.pdOctave + real (Dest::pdSemi) + 0.01 * real (Dest::pdFine)), osRate * 0.45);
-        const double pdAmount = norm (Dest::pdAmount), pdShape = norm (Dest::pdShape);
-        const float pdCrush = norm (Dest::pdCrush), pdFold = norm (Dest::pdFold);
-
-        // SUB / NOISE
-        const float subLevel = norm (Dest::subLevel);
-        const double subHz = std::min (detail::noteToHz (baseNote + 12.0 * s.subOctave), osRate * 0.45);
-        const float noiseLevel = norm (Dest::noiseLevel);
-
-        // Matrice FM
-        const float depth = norm (Dest::fmDepth);
-        const bool linearFm = s.fmMode == FmMode::linear;
-        const float wtFromWt = depth * s.fm[0][0], wtFromPd = depth * s.fm[1][0], wtFromNoise = depth * s.fm[2][0];
-        const float pdFromWt = depth * s.fm[0][1], pdFromPd = depth * s.fm[1][1], pdFromNoise = depth * s.fm[2][1];
-        constexpr double pmDepth = 2.0;    // excursion de phase (cycles) à 100 %
-        constexpr double linDepth = 4.0;   // FM linéaire : écart de fréquence relatif à 100 %
-
-        // Niveau de mipmap : harmoniques jusqu'à 0,75 fe (le décimateur coupe au-dessus de 0,5 fe) ; sans
-        // suréchantillonnage, un niveau de plus pour rester sous Nyquist
-        double warpFactor = 1.0;
-        if (s.wtWarp == WtWarp::sync)                                 warpFactor = std::exp2 (4.0 * wtWarp);
-        else if (s.wtWarp == WtWarp::bendPlus || s.wtWarp == WtWarp::bendMinus) warpFactor = 1.0 + 3.0 * wtWarp;
-        else if (s.wtWarp == WtWarp::mirror)                          warpFactor = 1.0 + wtWarp;
-        double effective = wtHz * warpFactor;
-        if (linearFm)
-            effective *= 1.0 + linDepth * (wtFromWt + wtFromPd);
-        else
-            effective += twoPi * pmDepth * ((double) wtFromPd * pdHz + (double) wtFromWt * wtHz);
-        const double levelBias = os == 1 ? 1.0 : 0.0;
-        auto levelFor = [&] (double hz)
-        {
-            return std::clamp (std::log2 (std::max (1.0e-9, hz * 1024.0 / (0.75 * sampleRate))) + levelBias, 0.0, (double) (wt::numLevels - 1));
-        };
-        const double levelPos = levelFor (effective);
-
-        // Unison : désaccord et panoramique de chaque voix
-        if (unison != cachedUnison || std::abs (detune - cachedDetune) > 1.0e-5f || std::abs (spread - cachedSpread) > 1.0e-5f
-            || std::abs (wtPan - cachedWtPan) > 1.0e-5f)
-        {
-            cachedUnison = unison; cachedDetune = detune; cachedSpread = spread; cachedWtPan = wtPan;
-            const float norm1 = 1.0f / std::sqrt ((float) unison);
-            for (int u = 0; u < unison; ++u)
-            {
-                const double pos = unison > 1 ? (double) u / (unison - 1) * 2.0 - 1.0 : 0.0;
-                unisonRatio[(size_t) u] = std::exp2 (pos * 100.0 * (double) (detune * detune) / 1200.0);
-                const float pan = std::clamp ((float) pos * spread + wtPan, -1.0f, 1.0f);
-                const float angle = (float) (0.25 * pi) * (pan + 1.0f);
-                unisonL[(size_t) u] = std::cos (angle) * 1.41421356f * norm1;
-                unisonR[(size_t) u] = std::sin (angle) * 1.41421356f * norm1;
-            }
-        }
-
-        // ALGORITHMIC OSC (Plaits, à la fréquence de base, interpolé)
-        float algo = 0.0f;
-        const float algoLevel = s.algoOn ? real (Dest::algoLevel) : 0.0f;
-        if (s.algoOn)
-        {
-            PlaitsOsc::Params p;
-            p.model = s.algoModel;
-            p.note = (float) (baseNote + 12.0 * s.algoOctave + real (Dest::algoSemi) + 0.01 * real (Dest::algoFine));
-            p.harmonics = norm (Dest::algoHarmonics);
-            p.timbre = norm (Dest::algoTimbre);
-            p.morph = norm (Dest::algoMorph);
-            p.decay = norm (Dest::algoDecay);
-            p.colour = norm (Dest::algoColour);
-            p.aux = norm (Dest::algoAux);
-            p.lpg = s.algoLpg;
-            algo = plaits->process (p);
-        }
-        const float algoPan = std::clamp (real (Dest::algoPan), -1.0f, 1.0f);
-        const float algoAngle = (float) (0.25 * pi) * (algoPan + 1.0f);
-        const float algoL = algo * algoLevel * std::cos (algoAngle) * 1.41421356f;
-        const float algoR = algo * algoLevel * std::sin (algoAngle) * 1.41421356f;
-
-        // Bite et filtre
-        const float biteFold = norm (Dest::biteFold), biteCrush = norm (Dest::biteCrush), biteSoft = norm (Dest::biteSoft);
-        const double tracked = (double) real (Dest::cutoff)
-                             * std::exp2 (s.keyTrack * (currentNote - 60.0) / 12.0 + 7.0 * (double) real (Dest::filterEnv) * fltLevel);
-        const double cutoff = std::clamp (tracked, 16.0, std::min (20000.0, osRate * 0.45));
-        const double g = std::tan (pi * cutoff / osRate);
-        const double resonance = norm (Dest::resonance);
-        const double drive = norm (Dest::filterDrive);
-        const bool stereo = sh.stereo;
+        [[maybe_unused]] const auto& [os, osRate, baseNote, table, unison, wtLevel, wtHz, wtWarp, framePos,
+                     pdLevel, pdHz, pdAmount, pdShape, pdCrush, pdFold, subLevel, subHz, noiseLevel,
+                     linearFm, wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise,
+                     warpFactor, levelPos, algoActive, algoParams, algoGainL, algoGainR,
+                     biteFold, biteCrush, biteSoft, g, resonance, drive, stereo, pdActive, wtActive, volume, dcOs] = ctl;
+        const float algo = algoActive ? plaits->process (algoParams) : 0.0f;
+        const float algoL = algo * algoGainL, algoR = algo * algoGainR;
 
         // --- Boucle suréchantillonnée -------------------------------------------------
         std::array<float, 4> subL {}, subR {};
@@ -1303,6 +1182,7 @@ public:
 
             // PHASE DISTORTION
             float pd = 0.0f;
+            if (pdActive)
             {
                 const float mod = pdFromWt * lastWt + pdFromPd * lastPd + pdFromNoise * noise;
                 double p = pdPhase;
@@ -1333,9 +1213,14 @@ public:
                 pdPhase = detail::frac (pdPhase + inc);
                 lastPd = pd;
             }
+            else
+                lastPd = 0.0f;
 
             // WAVETABLE (unison)
             float wtL = 0.0f, wtR = 0.0f, wtMono = 0.0f;
+            if (! wtActive)
+                lastWt = 0.0f;
+            else
             {
                 const float mod = wtFromWt * lastWt + wtFromPd * pd + wtFromNoise * noise;
                 const double baseInc = std::min (wtHz / osRate, 0.45);
@@ -1403,7 +1288,7 @@ public:
                     case SubWave::saw:      sub = (float) (2.0 * subPhase - 1.0 - detail::polyBlep (subPhase, dt)); break;
                     case SubWave::sine:
                     case SubWave::count:
-                    default:                sub = std::sin ((float) (twoPi * subPhase)); break;
+                    default:                sub = detail::cosCycles (subPhase - 0.25); break;
                 }
                 subPhase = detail::frac (subPhase + dt);
             }
@@ -1416,8 +1301,8 @@ public:
             // Bite (avant le filtre)
             if (! s.bitePost)
             {
-                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
-                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcOs);
+                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcOs);
             }
 
             l = (float) filters[0].process (l, g, resonance, drive, s.filterModel, s.filterType, s.slope24);
@@ -1426,8 +1311,8 @@ public:
 
             if (s.bitePost)
             {
-                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
-                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcCoefOs (os));
+                l = bite.process (0, l, biteFold, biteCrush, biteSoft, s.biteAsym, dcOs);
+                if (stereo) r = bite.process (1, r, biteFold, biteCrush, biteSoft, s.biteAsym, dcOs);
             }
 
             subL[(size_t) n] = l;
@@ -1457,12 +1342,186 @@ public:
         }
 
         const float velGain = 1.0f - s.velocity * (1.0f - velocity);
-        const float gain = ampLevel * velGain * real (Dest::volume);
+        const float gain = ampLevel * velGain * volume;
         outL += yl * gain;
         outR += yr * gain;
 
         if (! std::isfinite (yl) || ! std::isfinite (yr))
             reset();
+    }
+
+    struct Control
+    {
+        int os; double osRate, baseNote; const Wavetable* table; int unison; float wtLevel; double wtHz; float wtWarp; double framePos;
+        float pdLevel; double pdHz, pdAmount, pdShape; float pdCrush, pdFold, subLevel; double subHz; float noiseLevel;
+        bool linearFm; float wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise;
+        double warpFactor, levelPos; bool algoActive; PlaitsOsc::Params algoParams; float algoGainL, algoGainR;
+        float biteFold, biteCrush, biteSoft; double g, resonance, drive; bool stereo, pdActive, wtActive; float volume, dcOs;
+    };
+    Control ctl {};
+    int controlCountdown = 0;
+    float slotCoefControl = 0.3f;
+    static constexpr int controlInterval = 8;
+    static constexpr double pmDepth = 2.0;    // excursion de phase (cycles) à 100 %
+    static constexpr double linDepth = 4.0;   // FM linéaire : écart de fréquence relatif à 100 %
+
+    /** Réglages de la voix, recalculés toutes les controlInterval périodes (modulation comprise). */
+    void updateControl (const Settings& s, const Smoothed& sm, const Shared& sh, float fltLevel, float modLevel)
+    {
+        // --- Modulation ---------------------------------------------------------
+        offsets.fill (0.0f);
+        {
+            const bool host = s.seq.hostSync;
+            const double t = host ? sh.hostBeats : seqBeats;
+            const uint64_t seed = host ? sh.hostChaosSeed : chaosSeed;
+
+            std::array<float, numModSources> value {};
+            {
+                const auto out = Mod::seq (s, t, sh.bpm, seed);
+                value[srcSeq] = out.value;
+                lastStep = out.step;
+            }
+            for (int k = srcLfo1; k < srcEnv2; ++k)
+                if (sh.neededSources & (1u << k))
+                    value[(size_t) k] = Mod::source (s, k, t, t, seed);
+            value[srcEnv2] = fltLevel;
+            value[srcEnv3] = modLevel;
+            value[srcVelocity] = velocity;
+            value[srcModWheel] = sh.modWheel;
+            {
+                const auto& ml = s.mainLfo;
+                const double localTime = ml.sync ? seqBeats : seconds;
+                const double globalTime = ml.sync ? sh.hostBeats : sh.hostSeconds;
+                const double time = ml.retrig ? localTime : globalTime;
+                const double cycles = ml.sync ? time / std::max (1.0e-4, ml.periodBeats) : time * (double) ml.rateHz;
+                value[srcMainLfo] = mainLfoValue (ml.shape, cycles, ml.retrig ? chaosSeed : sh.hostChaosSeed);
+            }
+
+            auto route = [&] (int k, int src, Dest d, float amount)
+            {
+                float& sv = slotValue[(size_t) k];
+                if (d == Dest::off)
+                {
+                    sv = 0.0f;
+                    return;
+                }
+                const float target = amount * value[(size_t) std::clamp (src, 0, numModSources - 1)];
+                sv = firstSample ? target : sv + (target - sv) * slotCoefControl;
+                offsets[(size_t) d] += sv;
+            };
+
+            for (int k = 0; k < numSlots; ++k)
+                route (k, s.slotSource[(size_t) k], s.slotDest[(size_t) k], s.slotAmount[(size_t) k]);
+            for (int k = 0; k < 2; ++k)
+                route (numSlots + k, srcMainLfo, s.mainLfo.dest[(size_t) k], s.mainLfo.amount[(size_t) k]);
+        }
+
+        firstSample = false;
+
+        auto norm = [&] (Dest d) { return std::clamp (sm.base[(size_t) d] + offsets[(size_t) d], 0.0f, 1.0f); };
+        auto real = [&] (Dest d) { return DestRange::toReal (d, norm (d)); };
+
+        // --- Réglages de l'échantillon ------------------------------------------------
+        const int os = s.oversampling >= 4 ? 4 : (s.oversampling >= 2 ? 2 : 1);
+        const double osRate = sampleRate * os;
+        const double baseNote = currentNote + sh.pitchBend;
+
+        // WAVETABLE
+        const Wavetable* table = s.table != nullptr ? s.table : BuiltinTables::get (0);
+        const int unison = std::clamp (s.unison, 1, maxUnison);
+        const float wtLevel = s.wtOn ? real (Dest::wtLevel) : 0.0f;
+        const double wtHz = detail::noteToHz (baseNote + 12.0 * s.wtOctave + real (Dest::wtSemi) + 0.01 * real (Dest::wtFine));
+        const float detune = norm (Dest::wtDetune);
+        const float spread = norm (Dest::wtSpread);
+        const float wtPan = real (Dest::wtPan);
+        const float wtWarp = norm (Dest::wtWarp);
+        const double framePos = (double) norm (Dest::wtPos) * (double) (table->numFrames - 1);
+
+        // PHASE DISTORTION
+        const float pdLevel = s.pdOn ? real (Dest::pdLevel) : 0.0f;
+        const double pdHz = std::min (detail::noteToHz (baseNote + 12.0 * s.pdOctave + real (Dest::pdSemi) + 0.01 * real (Dest::pdFine)), osRate * 0.45);
+        const double pdAmount = norm (Dest::pdAmount), pdShape = norm (Dest::pdShape);
+        const float pdCrush = norm (Dest::pdCrush), pdFold = norm (Dest::pdFold);
+
+        // SUB / NOISE
+        const float subLevel = norm (Dest::subLevel);
+        const double subHz = std::min (detail::noteToHz (baseNote + 12.0 * s.subOctave), osRate * 0.45);
+        const float noiseLevel = norm (Dest::noiseLevel);
+
+        // Matrice FM
+        const float depth = norm (Dest::fmDepth);
+        const bool linearFm = s.fmMode == FmMode::linear;
+        const float wtFromWt = depth * s.fm[0][0], wtFromPd = depth * s.fm[1][0], wtFromNoise = depth * s.fm[2][0];
+        const float pdFromWt = depth * s.fm[0][1], pdFromPd = depth * s.fm[1][1], pdFromNoise = depth * s.fm[2][1];
+
+        // Niveau de mipmap : harmoniques jusqu'à 0,75 fe (le décimateur coupe au-dessus de 0,5 fe) ; sans
+        // suréchantillonnage, un niveau de plus pour rester sous Nyquist
+        double warpFactor = 1.0;
+        if (s.wtWarp == WtWarp::sync)                                 warpFactor = std::exp2 (4.0 * wtWarp);
+        else if (s.wtWarp == WtWarp::bendPlus || s.wtWarp == WtWarp::bendMinus) warpFactor = 1.0 + 3.0 * wtWarp;
+        else if (s.wtWarp == WtWarp::mirror)                          warpFactor = 1.0 + wtWarp;
+        double effective = wtHz * warpFactor;
+        if (linearFm)
+            effective *= 1.0 + linDepth * (wtFromWt + wtFromPd);
+        else
+            effective += twoPi * pmDepth * ((double) wtFromPd * pdHz + (double) wtFromWt * wtHz);
+        const double levelBias = os == 1 ? 1.0 : 0.0;
+        auto levelFor = [&] (double hz)
+        {
+            return std::clamp (std::log2 (std::max (1.0e-9, hz * 1024.0 / (0.75 * sampleRate))) + levelBias, 0.0, (double) (wt::numLevels - 1));
+        };
+        const double levelPos = levelFor (effective);
+
+        // Unison : désaccord et panoramique de chaque voix
+        if (unison != cachedUnison || std::abs (detune - cachedDetune) > 1.0e-5f || std::abs (spread - cachedSpread) > 1.0e-5f
+            || std::abs (wtPan - cachedWtPan) > 1.0e-5f)
+        {
+            cachedUnison = unison; cachedDetune = detune; cachedSpread = spread; cachedWtPan = wtPan;
+            const float norm1 = 1.0f / std::sqrt ((float) unison);
+            for (int u = 0; u < unison; ++u)
+            {
+                const double pos = unison > 1 ? (double) u / (unison - 1) * 2.0 - 1.0 : 0.0;
+                unisonRatio[(size_t) u] = std::exp2 (pos * 100.0 * (double) (detune * detune) / 1200.0);
+                const float pan = std::clamp ((float) pos * spread + wtPan, -1.0f, 1.0f);
+                const float angle = (float) (0.25 * pi) * (pan + 1.0f);
+                unisonL[(size_t) u] = std::cos (angle) * 1.41421356f * norm1;
+                unisonR[(size_t) u] = std::sin (angle) * 1.41421356f * norm1;
+            }
+        }
+
+        // ALGORITHMIC OSC (Plaits, à la fréquence de base, interpolé) : réglages
+        const float algoLevel = s.algoOn ? real (Dest::algoLevel) : 0.0f;
+        const bool algoActive = s.algoOn && algoLevel > 0.0f;
+        PlaitsOsc::Params algoParams;
+        algoParams.model = s.algoModel;
+        algoParams.note = (float) (baseNote + 12.0 * s.algoOctave + real (Dest::algoSemi) + 0.01 * real (Dest::algoFine));
+        algoParams.harmonics = norm (Dest::algoHarmonics);
+        algoParams.timbre = norm (Dest::algoTimbre);
+        algoParams.morph = norm (Dest::algoMorph);
+        algoParams.decay = norm (Dest::algoDecay);
+        algoParams.colour = norm (Dest::algoColour);
+        algoParams.aux = norm (Dest::algoAux);
+        algoParams.lpg = s.algoLpg;
+        const float algoPan = std::clamp (real (Dest::algoPan), -1.0f, 1.0f);
+        const float algoAngle = (float) (0.25 * pi) * (algoPan + 1.0f);
+        const float algoGainL = algoLevel * std::cos (algoAngle) * 1.41421356f;
+        const float algoGainR = algoLevel * std::sin (algoAngle) * 1.41421356f;
+
+        // Bite et filtre
+        const float biteFold = norm (Dest::biteFold), biteCrush = norm (Dest::biteCrush), biteSoft = norm (Dest::biteSoft);
+        const double tracked = (double) real (Dest::cutoff)
+                             * std::exp2 (s.keyTrack * (currentNote - 60.0) / 12.0 + 7.0 * (double) real (Dest::filterEnv) * fltLevel);
+        const double cutoff = std::clamp (tracked, 16.0, std::min (20000.0, osRate * 0.45));
+        const double g = std::tan (pi * cutoff / osRate);
+        const double resonance = norm (Dest::resonance);
+        const double drive = norm (Dest::filterDrive);
+        const bool stereo = sh.stereo;
+        const bool pdActive = s.pdOn && (pdLevel > 0.0f || wtFromPd > 0.0f);
+        const bool wtActive = s.wtOn && (wtLevel > 0.0f || pdFromWt > 0.0f);
+        const float volume = real (Dest::volume);
+        const float dcOs = dcCoefOs (os);
+
+        ctl = Control { os, osRate, baseNote, table, unison, wtLevel, wtHz, wtWarp, framePos, pdLevel, pdHz, pdAmount, pdShape, pdCrush, pdFold, subLevel, subHz, noiseLevel, linearFm, wtFromWt, wtFromPd, wtFromNoise, pdFromWt, pdFromPd, pdFromNoise, warpFactor, levelPos, algoActive, algoParams, algoGainL, algoGainR, biteFold, biteCrush, biteSoft, g, resonance, drive, stereo, pdActive, wtActive, volume, dcOs };
     }
 
     int note = -1;
